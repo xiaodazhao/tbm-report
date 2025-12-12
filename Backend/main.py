@@ -39,5 +39,5 @@ prompt = build_prompt(seg_text, stats_text, litho_text, eff_text, gas_text)
 #print(prompt)
 
 # 6) 调用 LLM 生成报告
-#report = call_llm(prompt)
-#print(report)
+report = call_llm(prompt)
+print(report)
