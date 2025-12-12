@@ -1,60 +1,53 @@
 # ========================
-# 1. 隐私与安全 (绝对不能传!)
+# 1. 隐私与安全（必须忽略）
 # ========================
 .env
+.env.*
 .env.local
-.env.*.local
 
 # ========================
-# 2. Python 后端垃圾
+# 2. Python 后端
 # ========================
-# 字节码缓存 (最常见的垃圾)
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 
-# 虚拟环境 (体积很大)
 venv/
 env/
 .venv/
-.env/
 
-# 测试与打包
 .pytest_cache/
-build/
 develop-eggs/
-dist/
 eggs/
 *.egg-info/
 
+# 构建输出
+build/
+dist/
+
 # ========================
-# 3. 前端 Node.js 垃圾
+# 3. 前端 Node.js
 # ========================
-# 依赖包 (体积巨大，几万个文件)
 node_modules/
 Frontend/node_modules/
 
-# 打包输出
-dist/
 Frontend/dist/
-build/
+Frontend/build/
 
-# 日志
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
 # ========================
-# 4. 操作系统与编辑器
+# 4. 操作系统 & 编辑器
 # ========================
-# Mac 系统垃圾
 .DS_Store
-
-# VS Code 配置 (个人设置不用传)
-.vscode/
-!.vscode/extensions.json
-*.code-workspace
-
-# Windows 缩略图
 Thumbs.db
+
+# VS Code（只提交根目录的 extensions.json）
+**/.vscode/*
+!.vscode/
+!.vscode/extensions.json
+
+*.code-workspace
