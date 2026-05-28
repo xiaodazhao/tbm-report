@@ -1,0 +1,73 @@
+:root {
+  font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans SC", system-ui, sans-serif;
+  color: #1e293b;
+  background: #eef3f8;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  min-height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  min-width: 320px;
+  background:
+    radial-gradient(circle at 10% 0%, rgba(56, 189, 248, 0.18), transparent 28%),
+    linear-gradient(180deg, #edf6ff 0%, #f7fafc 48%, #eef2f7 100%);
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button {
+  transition: transform 0.16s ease, box-shadow 0.16s ease, border-color 0.16s ease, background 0.16s ease;
+}
+
+button:not(:disabled):hover {
+  transform: translateY(-1px);
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3 {
+  color: #0f172a;
+}
+
+.markdown-body p,
+.markdown-body li {
+  line-height: 1.8;
+}

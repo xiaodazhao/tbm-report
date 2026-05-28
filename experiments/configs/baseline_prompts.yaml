@@ -1,0 +1,18 @@
+template:
+  description: Deterministic baseline using a fixed report template.
+
+direct_llm:
+  description: Direct LLM baseline using CSV summaries and parsed PDF text without explicit CST alignment.
+  constraints:
+    - Use formal engineering report language.
+    - Do not invent facts.
+    - Do not assume missing spatial alignment.
+
+cst_llm:
+  description: Main method using CST summary, indicators, and state-aware prompt constraints.
+  constraints:
+    - Only describe the specified date or time window.
+    - Separate face observations from forward predictions.
+    - Use cautious wording for risk-related statements.
+    - Avoid unsupported hazards.
+    - Keep key conclusions traceable to CST evidence.

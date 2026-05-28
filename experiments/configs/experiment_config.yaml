@@ -1,0 +1,22 @@
+case_list: experiments/outputs/cases/case_list.csv
+state_dir: experiments/outputs/states
+report_dir: experiments/outputs/reports
+metrics_dir: experiments/outputs/metrics
+tables_dir: experiments/outputs/tables
+
+default_methods:
+  - template
+  - direct_llm
+  - cst_llm
+
+default_metrics:
+  - ICS
+  - FCS
+  - TS
+
+case_types:
+  - normal
+  - geology_attention
+  - response_anomaly
+  - coupled_attention
+  - gas_attention
