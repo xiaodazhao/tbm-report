@@ -139,7 +139,56 @@ METRIC_COLUMNS = [
     "stop_state_ratio",
 ]
 
-
+# ============================================================
+# run_coupling_analysis：地质-施工响应耦合分析总入口
+#
+# 输入：
+#   df_geo：
+#       带地质融合字段的逐记录 TBM 数据。
+#   base_segment_df：
+#       前面 run_segment_analysis 得到的基础区段表，可为空。
+#
+# 核心指标：
+#   GRS：
+#       Geology Risk Score，地质关注度。
+#       根据多源证据、围岩等级、出水/掉块/变形、证据权重等计算。
+#
+#   RAI：
+#       Response Anomaly Index，施工响应异常度。
+#       根据推进速度、推力、刀盘扭矩、效率、波动等施工参数计算。
+#
+#   GRCI：
+#       Geology Response Coupling Index，地质-施工响应耦合关注度。
+#       用于识别“地质证据较强且施工响应同步异常”的区段。
+#
+# 主流程：
+#   1. 检查输入数据与 chainage 字段
+#   2. 清洗 df_geo，并按 segment_length 构造区段
+#   3. 逐记录计算地质关注基础分 row_grs_base
+#   4. 对 row_grs_base 沿里程方向进行高斯平滑，得到 row_grs
+#   5. 逐记录计算施工响应异常分
+#   6. 聚合为区段级 segment_metrics
+#   7. 计算区段级 RAI
+#   8. 动态修正 GRS
+#   9. 计算 GRCI
+#   10. 生成弱标签验证
+#   11. 与 base_segment_df 合并
+#   12. 提取 top_grci / top_grs / top_rai 区段
+#   13. 构建 summary、validation 和输出文件路径
+#
+# 输出：
+#   {
+#       segment_df: 带 GRS/RAI/GRCI 的区段表,
+#       high_attention_segments: GRCI 排名前列的高关注区段,
+#       top_grci_segments: 耦合关注度最高区段,
+#       top_grs_segments: 地质关注度最高区段,
+#       top_rai_segments: 施工响应异常最高区段,
+#       summary: 耦合分析摘要,
+#       validation: 弱标签验证结果,
+#       output_paths: 输出文件路径,
+#       warnings: 分析警告
+#   }
+# ============================================================
 def run_coupling_analysis(
     df_geo: pd.DataFrame,
     segment_length: float = 10.0,
@@ -401,7 +450,40 @@ def _apply_gaussian_chainage_smoothing(
     return out.clip(0, 1)
 
 
-
+# ============================================================
+# _aggregate_segment_features：将逐记录特征聚合到区段级
+#
+# 输入：
+#   df：
+#       已经包含 row_grs、source_evidence_norm、row_rai 以及各种
+#       row_* 响应异常分数的逐记录 DataFrame。
+#
+#   colmap：
+#       字段映射表，用于找到地质风险、hazard、围岩等级、覆盖状态等字段。
+#
+#   warnings：
+#       警告列表。若缺少速度、扭矩等关键字段，会追加提示。
+#
+# 主流程：
+#   1. 按 segment_id 分组；
+#   2. 聚合区段里程范围、样本数；
+#   3. 聚合地质关注分 row_grs，生成 GRS_mean、GRS_max；
+#   4. 用 GRS_mean 和 GRS_max 计算区段级 GRS_base；
+#   5. 聚合施工参数 speed/thrust/torque/rpm/penetration 的
+#      mean/std/min/max/median/CV；
+#   6. 对地质类别字段取众数，例如 hazard_mode、fused_grade_mode；
+#   7. 计算速度接近 0 比例 speed_zero_ratio；
+#   8. 计算掘进状态停机比例 stop_state_ratio；
+#   9. 计算区段推进效率 efficiency；
+#   10. 聚合逐记录响应异常指标 row_rai、row_iforest、row_stop 等，
+#       生成 mean/max 区段特征。
+#
+# 输出：
+#   segment_metrics：
+#       区段级特征表。每一行对应一个 10m 区段，
+#       包含地质侧 GRS 基础指标、施工参数统计、
+#       停机比例、效率指标和响应异常聚合指标。
+# ============================================================
 def _aggregate_segment_features(
     df: pd.DataFrame,
     colmap: dict[str, str | None],
@@ -521,7 +603,47 @@ def _aggregate_segment_features(
 
     return out
 
-
+    # ============================================================
+# _add_row_response_anomaly_scores：逐记录施工响应异常打分
+#
+# 输入：
+#   df：
+#       已经清洗并统一字段后的逐记录 TBM 数据。
+#       其中可能包含：
+#           __speed：推进速度
+#           __set_speed：推进给定速度
+#           __thrust：推力
+#           __torque：刀盘扭矩
+#           __rpm：刀盘转速
+#           __penetration：贯入度
+#           __state：掘进状态
+#           __routine_stop_score / __routine_stop_candidate：常规拼装停机识别结果
+#
+# 主流程：
+#   1. 使用 IsolationForest 对推力、扭矩、速度、转速、贯入度等多变量组合进行异常检测；
+#   2. 分别计算推进速度下降、推力偏高、扭矩偏高、转速异常、贯入度异常等单变量异常分数；
+#   3. 根据实际速度/给定速度计算推进效率异常；
+#   4. 根据速度接近 0 和掘进状态为 0 判断停机异常；
+#   5. 对常规管片拼装停机进行降权，避免误判为施工异常；
+#   6. 计算负载响应、速度衰减和多指标响应一致性；
+#   7. 综合多变量异常、停机异常和效率异常，得到 row_rai。
+#
+# 输出新增字段：
+#   row_iforest_anomaly_score：多变量施工响应异常分数
+#   row_speed_drop_score：推进速度下降异常分数
+#   row_thrust_anomaly_score：推力偏高异常分数
+#   row_torque_anomaly_score：扭矩偏高异常分数
+#   row_rpm_anomaly_score：转速异常分数
+#   row_penetration_anomaly_score：贯入度异常分数
+#   row_efficiency_anomaly_score：推进效率异常分数
+#   row_stop_anomaly_raw：原始停机异常标志
+#   row_routine_stop_relief：常规停机降权系数
+#   row_stop_anomaly：降权后的停机异常分数
+#   row_load_response_norm：负载响应异常程度
+#   row_speed_decay_norm：速度衰减程度
+#   row_response_consistency：多指标同步异常程度
+#   row_rai：逐记录施工响应异常指数
+# ============================================================
 def _add_row_response_anomaly_scores(df: pd.DataFrame, warnings: list[str]) -> pd.DataFrame:
     """Build row-level response anomaly features before segment aggregation."""
     out = df.copy()
@@ -629,7 +751,49 @@ def _add_row_response_anomaly_scores(df: pd.DataFrame, warnings: list[str]) -> p
     ).clip(0, 1)
     return out
 
-
+# ============================================================
+# _add_response_anomaly_index：计算区段级施工响应异常指数 RAI
+#
+# 输入：
+#   segment_df：
+#       _aggregate_segment_features 的输出。
+#       每一行对应一个 10m 区段，已经包含 row_* 异常分数的
+#       mean/max 聚合结果，例如：
+#           row_iforest_anomaly_score_mean/max
+#           row_stop_anomaly_mean/max
+#           row_efficiency_anomaly_mean/max
+#           row_speed_drop_score_mean/max
+#           row_thrust_anomaly_score_mean/max
+#           row_torque_anomaly_score_mean/max
+#
+# 主流程：
+#   1. 使用 _mean_max_blend 将逐记录异常分数的 mean/max
+#      融合成区段级异常分量；
+#   2. 生成多变量异常、停机异常、效率异常、速度下降、
+#      推力异常、扭矩异常、转速异常、贯入度异常等区段级指标；
+#   3. 根据 speed_cv 计算速度波动异常；
+#   4. 计算 param_anomaly，用于描述施工参数综合异常；
+#   5. 按权重融合：
+#        RAI = 0.70 * iforest_anomaly_score
+#            + 0.15 * stop_anomaly
+#            + 0.15 * efficiency_anomaly
+#   6. 调用 _add_anomaly_pattern 生成异常模式解释字段。
+#
+# 输出新增字段：
+#   iforest_anomaly_score：区段级多变量响应异常
+#   stop_anomaly：区段级停机异常
+#   efficiency_anomaly：区段级效率异常
+#   speed_drop_score：区段级速度下降异常
+#   thrust_anomaly_score：区段级推力异常
+#   torque_anomaly_score：区段级扭矩异常
+#   response_consistency：多指标同步异常程度
+#   load_response_norm：负载响应异常
+#   speed_decay_norm：速度衰减异常
+#   speed_volatility_score：速度波动异常
+#   param_anomaly：参数综合异常分数
+#   RAI：区段级施工响应异常指数
+#   response_anomaly_index：RAI 的兼容字段
+# ============================================================
 def _add_response_anomaly_index(segment_df: pd.DataFrame, warnings: list[str]) -> pd.DataFrame:
     """Aggregate row-level anomaly scores into a segment-level RAI."""
     out = segment_df.copy()
@@ -953,7 +1117,26 @@ def _add_weak_validation_labels(segment_df: pd.DataFrame) -> pd.DataFrame:
     out["weak_anomaly_reasons"] = reasons
     return out
 
-
+# ============================================================
+# _validate_coupling：基于弱标签的 GRCI 内部一致性验证
+#
+# 输入：
+#   segment_df：
+#       带 GRCI 和 weak_anomaly_label 的区段级结果表。
+#   top_k：
+#       检查 GRCI 排名前 top_k 的区段命中弱标签的比例。
+#
+# 核心逻辑：
+#   1. 读取 weak_anomaly_label 作为弱标签；
+#   2. 读取 GRCI 作为排序/预测分数；
+#   3. 计算 GRCI Top-K 区段中命中弱标签的数量和比例；
+#   4. 使用固定阈值 GRCI >= 0.60 作为异常预测；
+#   5. 计算相对于弱标签的 precision、recall、tp、fp、fn。
+#
+# 注意：
+#   这里不是严格人工标注验证，而是弱标签验证。
+#   结果只能说明 GRCI 与内部规则标签的一致性。
+# ============================================================
 def _validate_coupling(segment_df: pd.DataFrame, top_k: int) -> dict[str, Any]:
     """Internal helper for validate coupling."""
     if segment_df is None or segment_df.empty:
@@ -1033,21 +1216,65 @@ def _build_summary(
     top_rai_segments: list[dict[str, Any]] | None = None,
     top_grci_segments: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Build summary."""
+    """
+    构造地质-施工响应耦合分析的全局摘要。
+
+    输入：
+        segment_df:
+            带 GRS、RAI、GRCI 等指标的区段级结果表。
+        validation:
+            弱标签验证结果。
+        high_attention_segments:
+            高关注区段列表，当前通常等同于 top_grci_segments。
+        segment_length:
+            区段长度，单位 m。
+        warnings:
+            分析过程中的警告信息。
+        grs_metadata:
+            GRS 动态修正相关元信息。
+        top_grs_segments:
+            GRS 排名前列的区段。
+        top_rai_segments:
+            RAI 排名前列的区段。
+        top_grci_segments:
+            GRCI 排名前列的区段。
+
+    输出：
+        summary:
+            耦合分析全局摘要字典。
+            包含指标统计、分类分布、Top 区段、弱标签验证、
+            GRS 修正信息、summary_text 和 warnings。
+    """
     if segment_df is None or segment_df.empty:
         return _empty_summary("no segment result", warnings)
 
+    # 如果没有单独传入 top_grci_segments，则使用 high_attention_segments 作为兼容
     top_grci_segments = top_grci_segments if top_grci_segments is not None else high_attention_segments
     top_grs_segments = top_grs_segments or []
     top_rai_segments = top_rai_segments or []
+
+    # 提取核心指标序列
     grci = pd.to_numeric(segment_df.get("GRCI", 0), errors="coerce").fillna(0)
-    grs_adjusted = pd.to_numeric(segment_df.get("GRS_adjusted", segment_df.get("GRS", 0)), errors="coerce").fillna(0)
-    grs_base = pd.to_numeric(segment_df.get("GRS_geo_base", segment_df.get("GRS_base", 0)), errors="coerce").fillna(0)
+    grs_adjusted = pd.to_numeric(
+        segment_df.get("GRS_adjusted", segment_df.get("GRS", 0)),
+        errors="coerce"
+    ).fillna(0)
+    grs_base = pd.to_numeric(
+        segment_df.get("GRS_geo_base", segment_df.get("GRS_base", 0)),
+        errors="coerce"
+    ).fillna(0)
     rai = pd.to_numeric(segment_df.get("RAI", 0), errors="coerce").fillna(0)
+
+    # 统计 GRS/RAI 四象限分类数量
     class_counts = segment_df.get("grci_class_label", pd.Series(dtype=str)).value_counts().to_dict()
+
+    # 统计 GRCI 等级数量
     level_counts = segment_df.get("coupling_label", pd.Series(dtype=str)).value_counts().to_dict()
+
+    # 取 GRCI 最高区段，用于 summary_text
     top = top_grci_segments[0] if top_grci_segments else {}
 
+    # 构造报告可读的摘要文本
     summary_text = (
         f"区段级地质-施工响应耦合分析完成，共 {len(segment_df)} 个已开挖区段；"
         f"GRCI最高区段为 {top.get('segment', '--')}，"
@@ -1058,26 +1285,41 @@ def _build_summary(
     )
 
     grs_metadata = grs_metadata or {}
+
     return {
         "has_coupling": True,
         "method": GEOLOGY_METHOD_VERSION,
         "grs_model_version": grs_metadata.get("grs_model_version"),
         "segment_length_m": segment_length,
         "segment_count": int(len(segment_df)),
+
+        # 当前采用的 GRS 统计，优先使用 GRS_adjusted
         "GRS_mean": float(grs_adjusted.mean()),
         "GRS_max": float(grs_adjusted.max()),
+
+        # 地质基础 GRS 统计
         "GRS_geo_base_mean": float(grs_base.mean()),
         "GRS_geo_base_max": float(grs_base.max()),
+
+        # 动态修正后的 GRS 统计
         "GRS_adjusted_mean": float(grs_adjusted.mean()),
         "GRS_adjusted_max": float(grs_adjusted.max()),
+
+        # 施工响应异常指数统计
         "RAI_mean": float(rai.mean()),
         "RAI_max": float(rai.max()),
+
+        # 地质-施工响应耦合指数统计
         "GRCI_mean": float(grci.mean()),
         "GRCI_max": float(grci.max()),
+
+        # 分类与等级分布
         "class_counts": serialize_for_json(class_counts),
         "level_counts": serialize_for_json(level_counts),
         "grci_class_counts": serialize_for_json(class_counts),
         "coupling_level_counts": serialize_for_json(level_counts),
+
+        # GRS 动态修正信息
         "engineering_weights": serialize_for_json(grs_metadata.get("engineering_weights", {})),
         "grs_weight_method": grs_metadata.get("grs_weight_method", "engineering_prior_dynamic"),
         "correction_lambda": grs_metadata.get("correction_lambda"),
@@ -1086,17 +1328,22 @@ def _build_summary(
         "grs_correction_mode": grs_metadata.get("correction_mode"),
         "grs_has_rai": grs_metadata.get("has_rai"),
         "grs_has_stop_ratio": grs_metadata.get("has_stop_ratio"),
-        "top_segments": top_grci_segments,  # deprecated alias
-        "high_attention_segments": top_grci_segments,  # deprecated alias
+
+        # Top 区段列表
+        "top_segments": top_grci_segments,
+        "high_attention_segments": top_grci_segments,
         "top_grci_segments": top_grci_segments,
         "top_grs_segments": top_grs_segments,
         "top_rai_segments": top_rai_segments,
-        "validation": validation,  # deprecated alias
+
+        # 弱标签验证
+        "validation": validation,
         "weak_label_validation": validation,
+
+        # 文本摘要与警告
         "summary_text": summary_text,
         "warnings": warnings,
     }
-
 
 def _write_outputs(
     segment_df: pd.DataFrame,
@@ -1242,7 +1489,28 @@ def _empty_validation() -> dict[str, Any]:
 
 
 def _build_interpretation(row: pd.Series) -> str:
-    """Build interpretation."""
+    """
+    构造单个区段的耦合分析解释文本。
+
+    输入：
+        row:
+            segment_df 中的一行，对应一个里程区段。
+
+    使用字段：
+        segment:
+            区段 DK 里程标签。
+        grci_class_label:
+            根据 GRS/RAI 阈值划分得到的耦合类型。
+        GRS:
+            区段地质关注度。
+        RAI:
+            区段施工响应异常度。
+        GRCI:
+            地质-施工响应耦合关注度。
+
+    输出：
+        一句面向报告或前端展示的区段解释文本。
+    """
     segment = row.get("segment", "--")
     cls = row.get("grci_class_label", "--")
     grs = float(row.get("GRS", 0) or 0)

@@ -1,0 +1,35 @@
+{
+  "cell_count": 445,
+  "evidence_cell_count": 445,
+  "high_attention_cell_count": 393,
+  "grade_counts": {
+    "Ⅳ": 330,
+    "Ⅴ": 83,
+    "Ⅲ": 32
+  },
+  "main_hazard_counts": {
+    "掉块": 416,
+    "围岩破碎": 393,
+    "裂隙发育": 314,
+    "软硬不均": 249,
+    "明显反射异常": 238,
+    "出水": 166,
+    "裂隙密集": 135,
+    "稳定性较差": 131,
+    "围岩极破碎": 121,
+    "突涌水": 22,
+    "反射异常": 13
+  },
+  "conflict_level_counts": {
+    "low": 188,
+    "medium": 183,
+    "none": 74
+  },
+  "uncertainty_level_counts": {
+    "medium": 258,
+    "low": 157,
+    "high": 30
+  },
+  "GRS_geo_base_max": 0.9615257015105502,
+  "GRS_geo_base_mean": 0.6948853252836316
+}

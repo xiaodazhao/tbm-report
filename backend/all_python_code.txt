@@ -1,0 +1,6091 @@
+
+================================================================================
+文件地址: fusion_engine.py
+================================================================================
+
+"""
+geology_v2.fusion_engine
+
+将 cell_evidence_df 与 normalized_evidence_df 融合成 geo_states_df。
+
+输入：
+    cells_df:
+        build_chainage_cells 的输出。
+
+    cell_evidence_df:
+        project_evidence_to_cells 的输出。
+
+    normalized_evidence_df:
+        normalize_evidence_df 的输出。
+
+输出：
+    geo_states_df:
+        每一行对应一个 cell 的融合地质状态 GeoState。
+
+设计原则：
+1. 不直接修改旧逻辑；
+2. 输出结构化数据，不生成大段自然语言；
+3. 围岩等级形成 grade_distribution，不简单取最差；
+4. hazard 形成 hazard_scores，不只拼字符串；
+5. 无证据时 has_geology_evidence=False，不写“无风险/无异常”；
+6. conflict_level 表示多源证据冲突程度；
+7. GRS_geo_base 是纯地质基础关注度，不引入 RAI。
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+from geology_v2.config import (
+    CONFIDENCE_THRESHOLDS,
+    CONFLICT_THRESHOLDS,
+    GRADE_ATTENTION_SCORE,
+    GRADE_ORDER,
+    get_hazard_weight,
+    normalize_hazard_tag,
+)
+
+
+# ============================================================
+# 1. 输出字段
+# ============================================================
+
+GEO_STATE_COLUMNS = [
+    "cell_id",
+    "cell_start",
+    "cell_end",
+    "cell_center",
+
+    "has_geology_evidence",
+
+    "fused_grade",
+    "grade_distribution",
+
+    "hazard_scores",
+    "main_hazards",
+
+    "water_score",
+    "collapse_score",
+    "deformation_score",
+
+    "source_support",
+    "source_type_count",
+    "evidence_count",
+
+    "confidence_score",
+    "uncertainty_level",
+
+    "conflict_level",
+    "conflict_reasons",
+
+    "supporting_evidence_ids",
+
+    "GRS_geo_base",
+]
+
+
+HAZARD_LABELS = {
+    "water": "出水",
+    "water_inrush": "突涌水",
+    "collapse": "坍塌",
+    "block_fall": "掉块",
+    "deformation": "变形",
+    "fractured_rock": "围岩破碎",
+    "extremely_fractured_rock": "围岩极破碎",
+    "joint_development": "裂隙发育",
+    "dense_joints": "裂隙密集",
+    "weak_interlayer": "软弱夹层",
+    "mud_filling": "泥质填充",
+    "soft_hard_uneven": "软硬不均",
+    "reflection_anomaly": "反射异常",
+    "strong_reflection_anomaly": "明显反射异常",
+    "poor_stability": "稳定性较差",
+}
+
+
+# ============================================================
+# 2. 基础工具
+# ============================================================
+
+def _is_missing(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, (list, dict, tuple, set)):
+        return False
+    try:
+        return bool(pd.isna(value))
+    except Exception:
+        return False
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    if _is_missing(value):
+        return float(default)
+    try:
+        x = float(value)
+        if math.isfinite(x):
+            return float(x)
+    except Exception:
+        pass
+    return float(default)
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(_safe_float(value, default=default))
+    except Exception:
+        return int(default)
+
+
+def _safe_str(value: Any, default: str = "") -> str:
+    if _is_missing(value):
+        return default
+    return str(value).strip()
+
+
+def _clip01(value: Any) -> float:
+    return float(max(0.0, min(_safe_float(value), 1.0)))
+
+
+def _dedup_keep_order(items: Iterable[Any]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for item in items:
+        if _is_missing(item):
+            continue
+        text = str(item).strip()
+        if not text:
+            continue
+        if text not in seen:
+            out.append(text)
+            seen.add(text)
+    return out
+
+
+def _as_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple) or isinstance(value, set):
+        return list(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        # 兼容类似 "['出水', '掉块']" 或 JSON list。
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, list):
+                return obj
+        except Exception:
+            pass
+        for sep in ["；", ";", "，", ",", "|"]:
+            if sep in text:
+                return [x.strip() for x in text.split(sep) if x.strip()]
+        return [text]
+    return [value]
+
+
+def _json_clean(value: Any) -> Any:
+    """
+    将 numpy / pandas 类型清洗成 JSON 友好类型。
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, (str, bool, int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        return value
+
+    if isinstance(value, (np.integer,)):
+        return int(value)
+
+    if isinstance(value, (np.floating,)):
+        x = float(value)
+        return x if math.isfinite(x) else None
+
+    if isinstance(value, dict):
+        return {str(k): _json_clean(v) for k, v in value.items()}
+
+    if isinstance(value, (list, tuple, set)):
+        return [_json_clean(v) for v in value]
+
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+
+    return str(value)
+
+
+def _normalize_grade(value: Any) -> Optional[str]:
+    if _is_missing(value):
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    mapping = {
+        "1": "Ⅰ",
+        "2": "Ⅱ",
+        "3": "Ⅲ",
+        "4": "Ⅳ",
+        "5": "Ⅴ",
+        "I": "Ⅰ",
+        "II": "Ⅱ",
+        "III": "Ⅲ",
+        "IV": "Ⅳ",
+        "V": "Ⅴ",
+        "Ⅰ": "Ⅰ",
+        "Ⅱ": "Ⅱ",
+        "Ⅲ": "Ⅲ",
+        "Ⅳ": "Ⅳ",
+        "Ⅴ": "Ⅴ",
+    }
+    return mapping.get(text.upper(), mapping.get(text, text))
+
+
+def _grade_order(grade: Any) -> int:
+    g = _normalize_grade(grade)
+    if g is None:
+        return 0
+    return int(GRADE_ORDER.get(g, 0))
+
+
+def _grade_attention_score(grade: Any) -> float:
+    g = _normalize_grade(grade)
+    if g is None:
+        return 0.0
+    return _clip01(GRADE_ATTENTION_SCORE.get(g, 0.0))
+
+
+def _confidence_to_level(score: float) -> str:
+    score = _clip01(score)
+    if score >= float(CONFIDENCE_THRESHOLDS.get("high", 0.75)):
+        return "high"
+    if score >= float(CONFIDENCE_THRESHOLDS.get("medium", 0.45)):
+        return "medium"
+    if score >= float(CONFIDENCE_THRESHOLDS.get("low", 0.20)):
+        return "low"
+    return "none"
+
+
+def _uncertainty_from_conflict_and_confidence(conflict_score: float, confidence_score: float) -> str:
+    """
+    uncertainty 越高，表示融合结果越需要谨慎解释。
+
+    注意：
+    - 无证据时返回 unknown；
+    - 有证据但 confidence 低或 conflict 高时，uncertainty 升高。
+    """
+    conflict_score = _clip01(conflict_score)
+    confidence_score = _clip01(confidence_score)
+
+    uncertainty_score = max(1.0 - confidence_score, conflict_score)
+
+    if uncertainty_score >= float(CONFLICT_THRESHOLDS.get("high", 0.75)):
+        return "high"
+    if uncertainty_score >= float(CONFLICT_THRESHOLDS.get("medium", 0.50)):
+        return "medium"
+    if uncertainty_score >= float(CONFLICT_THRESHOLDS.get("low", 0.25)):
+        return "low"
+    return "none"
+
+
+def _conflict_level(conflict_score: float) -> str:
+    conflict_score = _clip01(conflict_score)
+
+    if conflict_score >= float(CONFLICT_THRESHOLDS.get("high", 0.75)):
+        return "high"
+    if conflict_score >= float(CONFLICT_THRESHOLDS.get("medium", 0.50)):
+        return "medium"
+    if conflict_score >= float(CONFLICT_THRESHOLDS.get("low", 0.25)):
+        return "low"
+    return "none"
+
+
+# ============================================================
+# 3. evidence-cell 去重降权
+# ============================================================
+
+def _make_dedup_key(row: pd.Series) -> str:
+    """
+    构造 cell 内证据去重 key。
+
+    目的：
+    同一报告、同一来源、同一空间类型、同一中心里程、同一主要信息的重复记录，
+    不应在同一 cell 内无限线性叠加。
+
+    例如 HSP collapse_points 被拆成多个 anomaly_point 后，
+    如果同一个点被多个相似行重复命中，需要 capped aggregation。
+    """
+    report_id = _safe_str(row.get("report_id"), default="")
+    source_type = _safe_str(row.get("source_type_norm"), default="unknown")
+    spatial_type = _safe_str(row.get("spatial_type"), default="unknown")
+    center = round(_safe_float(row.get("center_chainage"), default=-999999.0), 1)
+    grade = _normalize_grade(row.get("grade")) or ""
+    tags = "|".join(sorted([str(x) for x in _as_list(row.get("hazard_tags"))]))
+
+    return f"{report_id}::{source_type}::{spatial_type}::{center}::{grade}::{tags}"
+
+
+def _cap_duplicate_effective_weights(group: pd.DataFrame) -> pd.DataFrame:
+    """
+    对同一个 cell 内的重复证据做 capped weighting。
+
+    做法：
+    - 对相同 dedup_key 的多条记录，不让权重总和等于简单 sum；
+    - 将该组总权重压缩为 max_weight * log1p(n)，最多不超过原 sum；
+    - 这样既保留多条证据的支持感，又避免重复解析导致无限放大。
+    """
+    if group is None or group.empty:
+        return group
+
+    out = group.copy()
+    out["effective_weight"] = pd.to_numeric(out["effective_weight"], errors="coerce").fillna(0.0)
+    out["_dedup_key"] = out.apply(_make_dedup_key, axis=1)
+    out["effective_weight_capped"] = out["effective_weight"]
+
+    for _, idx in out.groupby("_dedup_key").groups.items():
+        idx = list(idx)
+        if len(idx) <= 1:
+            continue
+
+        weights = out.loc[idx, "effective_weight"].astype(float)
+        raw_sum = float(weights.sum())
+        max_weight = float(weights.max())
+        capped_sum = min(raw_sum, max_weight * (1.0 + math.log(len(idx))))
+
+        if raw_sum > 1e-12:
+            scale = capped_sum / raw_sum
+            out.loc[idx, "effective_weight_capped"] = weights * scale
+
+    return out
+
+
+# ============================================================
+# 4. 分布与评分
+# ============================================================
+
+def _build_grade_distribution(group: pd.DataFrame) -> Tuple[Dict[str, Dict[str, float]], Optional[str]]:
+    """
+    构建围岩等级支持分布，并给出 fused_grade。
+
+    fused_grade 不是简单取最差：
+    1. 先按有效权重形成 grade_distribution；
+    2. 默认取支持度最高的等级；
+    3. 若第二支持等级与最高等级接近，且更差，则做保守修正。
+    """
+    if group is None or group.empty or "grade" not in group.columns:
+        return {}, None
+
+    work = group.copy()
+    work["__grade"] = work["grade"].map(_normalize_grade)
+    work = work[work["__grade"].notna()].copy()
+
+    if work.empty:
+        return {}, None
+
+    weight_col = "effective_weight_capped" if "effective_weight_capped" in work.columns else "effective_weight"
+    work["__weight"] = pd.to_numeric(work[weight_col], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    support = work.groupby("__grade")["__weight"].sum().to_dict()
+    total = float(sum(support.values()))
+
+    if total <= 1e-12:
+        return {}, None
+
+    distribution: Dict[str, Dict[str, float]] = {}
+    for grade, value in support.items():
+        distribution[str(grade)] = {
+            "support": float(value),
+            "share": float(value / total),
+            "attention_score": float(_grade_attention_score(grade)),
+        }
+
+    sorted_items = sorted(
+        distribution.items(),
+        key=lambda kv: (kv[1]["support"], _grade_order(kv[0])),
+        reverse=True,
+    )
+
+    best_grade = sorted_items[0][0]
+    best_support = sorted_items[0][1]["support"]
+
+    # 保守修正：如果更差等级支持度接近最高支持度，则取更差的那个。
+    conservative_candidates = []
+    for grade, info in sorted_items:
+        if info["support"] >= 0.75 * best_support:
+            conservative_candidates.append(grade)
+
+    if conservative_candidates:
+        fused_grade = max(conservative_candidates, key=_grade_order)
+    else:
+        fused_grade = best_grade
+
+    return _json_clean(distribution), fused_grade
+
+
+def _append_valid_hazard_key(keys: List[str], key: Any) -> None:
+    """
+    只保留 config 中明确有权重的 hazard key。
+
+    例如：
+    - 掉块 -> block_fall，保留
+    - 裂隙密集 -> dense_joints，保留
+    - 围岩等级建议 -> 没有 hazard 权重，不保留
+
+    这样可以避免把“围岩等级建议”这种解释性标签写进 main_hazards。
+    """
+    if key is None:
+        return
+
+    text = str(key).strip()
+    if not text:
+        return
+
+    if get_hazard_weight(text) > 0:
+        keys.append(text)
+
+
+def _collect_hazard_keys(row: pd.Series) -> List[str]:
+    """
+    从一条 evidence 里收集 hazard key。
+
+    注意：
+    这里只保留真正 hazard；
+    不把“围岩等级建议”这类解释性标签当成 hazard。
+    """
+    keys: List[str] = []
+
+    for tag in _as_list(row.get("hazard_tags")):
+        key = normalize_hazard_tag(str(tag))
+        _append_valid_hazard_key(keys, key)
+
+    if _safe_int(row.get("water_flag")) == 1:
+        water_type = _safe_str(row.get("water_type"))
+        if water_type:
+            key = normalize_hazard_tag(water_type) or "water"
+            _append_valid_hazard_key(keys, key)
+        else:
+            _append_valid_hazard_key(keys, "water")
+
+    if _safe_int(row.get("collapse_flag")) == 1:
+        _append_valid_hazard_key(keys, "block_fall")
+
+    if _safe_int(row.get("deformation_flag")) == 1:
+        _append_valid_hazard_key(keys, "deformation")
+
+    joint = _safe_str(row.get("joint_development"))
+    if joint:
+        if "密集" in joint:
+            _append_valid_hazard_key(keys, "dense_joints")
+        elif "发育" in joint:
+            _append_valid_hazard_key(keys, "joint_development")
+
+    rock_mass = _safe_str(row.get("rock_mass_state"))
+    if rock_mass:
+        if "极破碎" in rock_mass:
+            _append_valid_hazard_key(keys, "extremely_fractured_rock")
+        elif "破碎" in rock_mass:
+            _append_valid_hazard_key(keys, "fractured_rock")
+
+    stability = _safe_str(row.get("stability"))
+    if stability and "差" in stability:
+        _append_valid_hazard_key(keys, "poor_stability")
+
+    return _dedup_keep_order(keys)
+
+def _combine_noisy_or(values: List[float]) -> float:
+    """
+    用 Noisy-OR 合成同一 hazard 的多条证据贡献。
+
+    作用：
+    1. 多条证据会提高 hazard score；
+    2. 分数不会简单线性叠加；
+    3. 输出限制在 0~1；
+    4. 避免 HSP anomaly_point 重复证据把分数无限放大。
+    """
+    if not values:
+        return 0.0
+
+    product = 1.0
+
+    for value in values:
+        v = _clip01(value)
+        product *= 1.0 - v
+
+    return _clip01(1.0 - product)
+
+
+def _build_hazard_scores(group: pd.DataFrame) -> Dict[str, float]:
+    """
+    构建 hazard_scores。
+
+    每个 hazard 的贡献：
+        contribution = hazard_weight * min(effective_weight_capped, 1.5)
+
+    同一 hazard 多条证据使用 Noisy-OR 合成。
+    """
+    if group is None or group.empty:
+        return {}
+
+    weight_col = "effective_weight_capped" if "effective_weight_capped" in group.columns else "effective_weight"
+
+    bucket: Dict[str, List[float]] = {}
+
+    for _, row in group.iterrows():
+        evidence_weight = min(_safe_float(row.get(weight_col), default=0.0), 1.5)
+        if evidence_weight <= 1e-12:
+            continue
+
+        hazard_keys = _collect_hazard_keys(row)
+        for key in hazard_keys:
+            if not key:
+                continue
+            hazard_weight = get_hazard_weight(key)
+            if hazard_weight <= 0:
+                continue
+
+            contribution = _clip01(hazard_weight * evidence_weight)
+            bucket.setdefault(key, []).append(contribution)
+
+    scores = {
+        key: _combine_noisy_or(values)
+        for key, values in bucket.items()
+    }
+
+    return _json_clean(dict(sorted(scores.items(), key=lambda kv: kv[1], reverse=True)))
+
+
+def _main_hazards_from_scores(hazard_scores: Dict[str, float], top_k: int = 5) -> List[str]:
+    if not hazard_scores:
+        return []
+
+    items = sorted(
+        hazard_scores.items(),
+        key=lambda kv: float(kv[1]),
+        reverse=True,
+    )
+
+    selected = []
+    for key, value in items[:top_k]:
+        if float(value) <= 0.05:
+            continue
+        selected.append(HAZARD_LABELS.get(key, key))
+
+    return selected
+
+
+def _source_support(group: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+    if group is None or group.empty:
+        return {}
+
+    weight_col = "effective_weight_capped" if "effective_weight_capped" in group.columns else "effective_weight"
+    out: Dict[str, Dict[str, float]] = {}
+
+    for source, part in group.groupby("source_type_norm"):
+        source_key = _safe_str(source, default="unknown")
+        weights = pd.to_numeric(part[weight_col], errors="coerce").fillna(0.0)
+
+        out[source_key] = {
+            "weight_sum": float(weights.sum()),
+            "weight_max": float(weights.max()) if len(weights) else 0.0,
+            "evidence_count": int(part["evidence_id"].nunique()) if "evidence_id" in part.columns else int(len(part)),
+        }
+
+    return _json_clean(out)
+
+
+def _confidence_score(group: pd.DataFrame, conflict_score: float) -> float:
+    """
+    融合置信度。
+
+    影响因素：
+    1. 总证据权重；
+    2. 来源类型数量；
+    3. 证据数量；
+    4. conflict 惩罚。
+
+    注意：
+    confidence_score 只是融合置信度，不是准确率。
+    """
+    if group is None or group.empty:
+        return 0.0
+
+    weight_col = "effective_weight_capped" if "effective_weight_capped" in group.columns else "effective_weight"
+    weights = pd.to_numeric(group[weight_col], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    total_weight = float(weights.sum())
+    evidence_count = int(group["evidence_id"].nunique()) if "evidence_id" in group.columns else int(len(group))
+    source_type_count = int(group["source_type_norm"].nunique()) if "source_type_norm" in group.columns else 1
+
+    weight_factor = 1.0 - math.exp(-total_weight / 3.0)
+    evidence_factor = min(1.0, 0.50 + 0.10 * evidence_count)
+    source_factor = min(1.0, 0.70 + 0.15 * max(source_type_count - 1, 0))
+
+    conflict_penalty = 1.0 - 0.35 * _clip01(conflict_score)
+
+    return _clip01(weight_factor * evidence_factor * source_factor * conflict_penalty)
+
+
+def _grs_geo_base(
+    fused_grade: Optional[str],
+    hazard_scores: Dict[str, float],
+    confidence_score: float,
+    has_geology_evidence: bool,
+) -> float:
+    """
+    纯地质基础关注度 GRS_geo_base。
+
+    不引入 RAI，不引入施工响应。
+    """
+    if not has_geology_evidence:
+        return 0.0
+
+    grade_score = _grade_attention_score(fused_grade)
+    hazard_score = max([float(v) for v in hazard_scores.values()], default=0.0)
+    avg_hazard_score = (
+        sum(float(v) for v in hazard_scores.values()) / max(len(hazard_scores), 1)
+        if hazard_scores else 0.0
+    )
+
+    # max hazard 反映主控风险，avg hazard 反映多灾种叠加。
+    hazard_component = _clip01(0.75 * hazard_score + 0.25 * avg_hazard_score)
+
+    value = (
+        0.45 * grade_score
+        + 0.45 * hazard_component
+        + 0.10 * _clip01(confidence_score)
+    )
+
+    return _clip01(value)
+
+
+# ============================================================
+# 5. 冲突检测
+# ============================================================
+
+def _source_grade_map(group: pd.DataFrame) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+
+    if group is None or group.empty or "grade" not in group.columns:
+        return out
+
+    weight_col = "effective_weight_capped" if "effective_weight_capped" in group.columns else "effective_weight"
+
+    for source, part in group.groupby("source_type_norm"):
+        part = part.copy()
+        part["__grade"] = part["grade"].map(_normalize_grade)
+        part = part[part["__grade"].notna()].copy()
+        if part.empty:
+            continue
+
+        support = (
+            part.groupby("__grade")[weight_col]
+            .sum()
+            .sort_values(ascending=False)
+        )
+
+        if not support.empty:
+            out[_safe_str(source, default="unknown")] = str(support.index[0])
+
+    return out
+
+
+def _detect_grade_conflict(
+    group: pd.DataFrame,
+    grade_distribution: Dict[str, Dict[str, float]],
+) -> Tuple[float, List[str]]:
+    """
+    检测围岩等级冲突。
+
+    主要看：
+    1. grade_distribution 中等级跨度；
+    2. 次级支持度是否足够高；
+    3. 不同 source_type 的主导等级是否差异较大。
+    """
+    reasons: List[str] = []
+
+    if not grade_distribution or len(grade_distribution) <= 1:
+        return 0.0, reasons
+
+    grades = list(grade_distribution.keys())
+    orders = [_grade_order(g) for g in grades if _grade_order(g) > 0]
+
+    if not orders:
+        return 0.0, reasons
+
+    span = max(orders) - min(orders)
+    supports = sorted(
+        [float(info.get("share", 0.0)) for info in grade_distribution.values()],
+        reverse=True,
+    )
+
+    second_share = supports[1] if len(supports) > 1 else 0.0
+
+    score = 0.0
+
+    if span >= 2 and second_share >= 0.20:
+        score = max(score, 0.70)
+        reasons.append(
+            f"围岩等级证据存在差异：等级跨度 {span} 级，次级支持占比 {second_share:.2f}"
+        )
+    elif span >= 1 and second_share >= 0.30:
+        score = max(score, 0.45)
+        reasons.append(
+            f"围岩等级证据存在一定差异：次级支持占比 {second_share:.2f}"
+        )
+
+    source_map = _source_grade_map(group)
+    if len(source_map) >= 2:
+        source_orders = [_grade_order(g) for g in source_map.values() if _grade_order(g) > 0]
+        if source_orders and max(source_orders) - min(source_orders) >= 2:
+            score = max(score, 0.75)
+            reasons.append(f"不同来源主导围岩等级不一致：{source_map}")
+
+    return _clip01(score), reasons
+
+
+def _detect_binary_flag_conflict(
+    group: pd.DataFrame,
+    flag_col: str,
+    label: str,
+) -> Tuple[float, List[str]]:
+    """
+    检测 water/collapse/deformation 这类判断差异。
+
+    注意：
+    flag=0 不直接写成“无风险”，这里只表达：
+    “部分证据提示该现象，部分证据未形成该标记”。
+    """
+    reasons: List[str] = []
+
+    if group is None or group.empty or flag_col not in group.columns:
+        return 0.0, reasons
+
+    weight_col = "effective_weight_capped" if "effective_weight_capped" in group.columns else "effective_weight"
+    work = group.copy()
+    work[flag_col] = pd.to_numeric(work[flag_col], errors="coerce").fillna(0).astype(int)
+    work["__weight"] = pd.to_numeric(work[weight_col], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    positive = work[work[flag_col] == 1]
+    neutral = work[work[flag_col] == 0]
+
+    if positive.empty or neutral.empty:
+        return 0.0, reasons
+
+    positive_weight = float(positive["__weight"].sum())
+    neutral_weight = float(neutral["__weight"].sum())
+
+    positive_sources = set(positive["source_type_norm"].astype(str).tolist()) if "source_type_norm" in work.columns else set()
+    neutral_sources = set(neutral["source_type_norm"].astype(str).tolist()) if "source_type_norm" in work.columns else set()
+
+    if positive_weight >= 0.60 and neutral_weight >= 0.80 and len(positive_sources | neutral_sources) >= 2:
+        score = 0.45
+        if positive_sources and neutral_sources and positive_sources.isdisjoint(neutral_sources):
+            score = 0.60
+
+        reasons.append(
+            f"{label}判断存在差异：部分证据提示{label}，部分证据未形成{label}标记"
+        )
+        return score, reasons
+
+    return 0.0, reasons
+
+
+def _detect_conflicts(
+    group: pd.DataFrame,
+    grade_distribution: Dict[str, Dict[str, float]],
+) -> Tuple[float, str, List[str]]:
+    grade_score, grade_reasons = _detect_grade_conflict(group, grade_distribution)
+    water_score, water_reasons = _detect_binary_flag_conflict(group, "water_flag", "出水")
+    collapse_score, collapse_reasons = _detect_binary_flag_conflict(group, "collapse_flag", "掉块/坍塌")
+    deformation_score, deformation_reasons = _detect_binary_flag_conflict(group, "deformation_flag", "变形")
+
+    conflict_score = max(grade_score, water_score, collapse_score, deformation_score)
+    reasons = grade_reasons + water_reasons + collapse_reasons + deformation_reasons
+    level = _conflict_level(conflict_score)
+
+    return _clip01(conflict_score), level, _dedup_keep_order(reasons)
+
+
+# ============================================================
+# 6. 单 cell 融合
+# ============================================================
+
+def _empty_geo_state(cell: pd.Series) -> Dict[str, Any]:
+    return {
+        "cell_id": _safe_str(cell.get("cell_id")),
+        "cell_start": _safe_float(cell.get("cell_start")),
+        "cell_end": _safe_float(cell.get("cell_end")),
+        "cell_center": _safe_float(cell.get("cell_center")),
+
+        "has_geology_evidence": False,
+
+        "fused_grade": None,
+        "grade_distribution": {},
+
+        "hazard_scores": {},
+        "main_hazards": [],
+
+        "water_score": 0.0,
+        "collapse_score": 0.0,
+        "deformation_score": 0.0,
+
+        "source_support": {},
+        "source_type_count": 0,
+        "evidence_count": 0,
+
+        "confidence_score": 0.0,
+        "uncertainty_level": "unknown",
+
+        "conflict_level": "none",
+        "conflict_reasons": [],
+
+        "supporting_evidence_ids": [],
+
+        "GRS_geo_base": 0.0,
+    }
+
+
+def _fuse_one_cell(cell: pd.Series, group: pd.DataFrame) -> Dict[str, Any]:
+    if group is None or group.empty:
+        return _empty_geo_state(cell)
+
+    group = _cap_duplicate_effective_weights(group)
+
+    supporting_ids = _dedup_keep_order(group["evidence_id"].tolist())
+    source_support = _source_support(group)
+
+    grade_distribution, fused_grade = _build_grade_distribution(group)
+    conflict_score, conflict_level, conflict_reasons = _detect_conflicts(group, grade_distribution)
+
+    hazard_scores = _build_hazard_scores(group)
+    main_hazards = _main_hazards_from_scores(hazard_scores)
+
+    water_score = max(
+        float(hazard_scores.get("water", 0.0)),
+        float(hazard_scores.get("water_inrush", 0.0)),
+    )
+    collapse_score = max(
+        float(hazard_scores.get("collapse", 0.0)),
+        float(hazard_scores.get("block_fall", 0.0)),
+    )
+    deformation_score = float(hazard_scores.get("deformation", 0.0))
+
+    source_type_count = int(group["source_type_norm"].nunique()) if "source_type_norm" in group.columns else 0
+    evidence_count = int(group["evidence_id"].nunique()) if "evidence_id" in group.columns else len(group)
+
+    confidence_score = _confidence_score(group, conflict_score)
+    uncertainty_level = _uncertainty_from_conflict_and_confidence(conflict_score, confidence_score)
+
+    grs_geo_base = _grs_geo_base(
+        fused_grade=fused_grade,
+        hazard_scores=hazard_scores,
+        confidence_score=confidence_score,
+        has_geology_evidence=True,
+    )
+
+    return {
+        "cell_id": _safe_str(cell.get("cell_id")),
+        "cell_start": _safe_float(cell.get("cell_start")),
+        "cell_end": _safe_float(cell.get("cell_end")),
+        "cell_center": _safe_float(cell.get("cell_center")),
+
+        "has_geology_evidence": True,
+
+        "fused_grade": fused_grade,
+        "grade_distribution": _json_clean(grade_distribution),
+
+        "hazard_scores": _json_clean(hazard_scores),
+        "main_hazards": _json_clean(main_hazards),
+
+        "water_score": float(water_score),
+        "collapse_score": float(collapse_score),
+        "deformation_score": float(deformation_score),
+
+        "source_support": _json_clean(source_support),
+        "source_type_count": int(source_type_count),
+        "evidence_count": int(evidence_count),
+
+        "confidence_score": float(confidence_score),
+        "uncertainty_level": uncertainty_level,
+
+        "conflict_level": conflict_level,
+        "conflict_reasons": _json_clean(conflict_reasons),
+
+        "supporting_evidence_ids": _json_clean(supporting_ids),
+
+        "GRS_geo_base": float(grs_geo_base),
+    }
+
+
+# ============================================================
+# 7. 主入口
+# ============================================================
+
+def fuse_geo_states(
+    cells_df: pd.DataFrame,
+    cell_evidence_df: pd.DataFrame,
+    normalized_evidence_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    融合每个 cell 的地质状态。
+
+    参数：
+        cells_df:
+            build_chainage_cells 输出。
+
+        cell_evidence_df:
+            project_evidence_to_cells 输出。
+
+        normalized_evidence_df:
+            normalize_evidence_df 输出。
+
+    返回：
+        geo_states_df，每个 cell 一行。
+
+    输出字段：
+        cell_id
+        cell_start
+        cell_end
+        cell_center
+        has_geology_evidence
+        fused_grade
+        grade_distribution
+        hazard_scores
+        main_hazards
+        water_score
+        collapse_score
+        deformation_score
+        source_support
+        source_type_count
+        evidence_count
+        confidence_score
+        uncertainty_level
+        conflict_level
+        conflict_reasons
+        supporting_evidence_ids
+        GRS_geo_base
+    """
+    if cells_df is None or cells_df.empty:
+        return pd.DataFrame(columns=GEO_STATE_COLUMNS)
+
+    cells = cells_df.copy()
+
+    required_cell_cols = {"cell_id", "cell_start", "cell_end", "cell_center"}
+    missing_cell_cols = required_cell_cols - set(cells.columns)
+    if missing_cell_cols:
+        raise ValueError(f"cells_df missing required columns: {sorted(missing_cell_cols)}")
+
+    # 如果没有任何投影关系，也要返回每个 cell 的空状态。
+    if cell_evidence_df is None or cell_evidence_df.empty:
+        records = [_empty_geo_state(row) for _, row in cells.iterrows()]
+        return pd.DataFrame(records)[GEO_STATE_COLUMNS]
+
+    if normalized_evidence_df is None or normalized_evidence_df.empty:
+        records = [_empty_geo_state(row) for _, row in cells.iterrows()]
+        return pd.DataFrame(records)[GEO_STATE_COLUMNS]
+
+    ce = cell_evidence_df.copy()
+    ne = normalized_evidence_df.copy()
+
+    required_ce_cols = {"cell_id", "evidence_id", "effective_weight"}
+    missing_ce_cols = required_ce_cols - set(ce.columns)
+    if missing_ce_cols:
+        raise ValueError(f"cell_evidence_df missing required columns: {sorted(missing_ce_cols)}")
+
+    required_ne_cols = {"evidence_id"}
+    missing_ne_cols = required_ne_cols - set(ne.columns)
+    if missing_ne_cols:
+        raise ValueError(f"normalized_evidence_df missing required columns: {sorted(missing_ne_cols)}")
+
+    # 避免 merge 后 source_type_norm / spatial_type 冲突：
+    # 以 cell_evidence_df 的投影字段为准，normalized 只补充地质属性。
+    ne_cols = [
+        "evidence_id",
+        "report_id",
+        "evidence_role",
+        "start_chainage",
+        "end_chainage",
+        "center_chainage",
+        "face_chainage",
+        "grade",
+        "lithology",
+        "weathering",
+        "joint_development",
+        "rock_mass_state",
+        "stability",
+        "water_flag",
+        "water_type",
+        "collapse_flag",
+        "deformation_flag",
+        "hazard_tags",
+        "confidence_text",
+        "raw_text",
+        "attrs_obj",
+        "parse_warnings",
+    ]
+    ne_cols = [c for c in ne_cols if c in ne.columns]
+
+    merged = ce.merge(
+        ne[ne_cols],
+        on="evidence_id",
+        how="left",
+        suffixes=("", "_evidence"),
+    )
+
+    # 确保必要字段存在。
+    for col, default in [
+        ("source_type_norm", "unknown"),
+        ("spatial_type", "unknown"),
+        ("effective_weight", 0.0),
+        ("water_flag", 0),
+        ("collapse_flag", 0),
+        ("deformation_flag", 0),
+    ]:
+        if col not in merged.columns:
+            merged[col] = default
+
+    merged["effective_weight"] = pd.to_numeric(
+        merged["effective_weight"],
+        errors="coerce",
+    ).fillna(0.0).clip(lower=0.0)
+
+    # 过滤掉无效权重。
+    merged = merged[merged["effective_weight"] > 1e-12].copy()
+
+    group_map = {
+        str(cell_id): part.copy()
+        for cell_id, part in merged.groupby("cell_id", sort=False)
+    }
+
+    records = []
+    for _, cell in cells.iterrows():
+        cell_id = _safe_str(cell.get("cell_id"))
+        group = group_map.get(cell_id, pd.DataFrame())
+        records.append(_fuse_one_cell(cell, group))
+
+    out = pd.DataFrame(records)
+
+    for col in GEO_STATE_COLUMNS:
+        if col not in out.columns:
+            out[col] = None
+
+    out = out[GEO_STATE_COLUMNS].copy()
+
+    # 数值列整理。
+    numeric_cols = [
+        "cell_start",
+        "cell_end",
+        "cell_center",
+        "water_score",
+        "collapse_score",
+        "deformation_score",
+        "source_type_count",
+        "evidence_count",
+        "confidence_score",
+        "GRS_geo_base",
+    ]
+    for col in numeric_cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+
+    out["source_type_count"] = out["source_type_count"].astype(int)
+    out["evidence_count"] = out["evidence_count"].astype(int)
+    out["has_geology_evidence"] = out["has_geology_evidence"].astype(bool)
+
+    return out
+
+
+# ============================================================
+# 8. 便捷摘要函数
+# ============================================================
+
+def summarize_geo_states(geo_states_df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    调试用摘要。
+
+    注意：
+    high_attention_cell_count 只是基于 GRS_geo_base 的高关注 cell 数，
+    不是灾害发生概率。
+    """
+    if geo_states_df is None or geo_states_df.empty:
+        return {
+            "cell_count": 0,
+            "evidence_cell_count": 0,
+            "high_attention_cell_count": 0,
+            "grade_counts": {},
+            "main_hazard_counts": {},
+            "conflict_level_counts": {},
+            "uncertainty_level_counts": {},
+            "GRS_geo_base_max": 0.0,
+            "GRS_geo_base_mean": 0.0,
+        }
+
+    df = geo_states_df.copy()
+
+    has_evidence = df.get("has_geology_evidence", pd.Series(False, index=df.index)).astype(bool)
+    grs = pd.to_numeric(df.get("GRS_geo_base", 0.0), errors="coerce").fillna(0.0)
+
+    hazard_counter: Dict[str, int] = {}
+    if "main_hazards" in df.columns:
+        for items in df["main_hazards"].tolist():
+            for item in _as_list(items):
+                text = str(item).strip()
+                if not text:
+                    continue
+                hazard_counter[text] = hazard_counter.get(text, 0) + 1
+
+    return _json_clean(
+        {
+            "cell_count": int(len(df)),
+            "evidence_cell_count": int(has_evidence.sum()),
+            "high_attention_cell_count": int((grs >= 0.55).sum()),
+            "grade_counts": df["fused_grade"].dropna().value_counts().to_dict()
+            if "fused_grade" in df.columns else {},
+            "main_hazard_counts": dict(sorted(hazard_counter.items(), key=lambda kv: kv[1], reverse=True)),
+            "conflict_level_counts": df["conflict_level"].value_counts(dropna=False).to_dict()
+            if "conflict_level" in df.columns else {},
+            "uncertainty_level_counts": df["uncertainty_level"].value_counts(dropna=False).to_dict()
+            if "uncertainty_level" in df.columns else {},
+            "GRS_geo_base_max": float(grs.max()) if len(grs) else 0.0,
+            "GRS_geo_base_mean": float(grs.mean()) if len(grs) else 0.0,
+        }
+    )
+
+
+================================================================================
+文件地址: evidence_normalizer.py
+================================================================================
+
+"""
+geology_v2.evidence_normalizer
+
+把旧 evidence_df 标准化为 geology_v2 使用的 normalized_evidence_df。
+
+本模块只做“证据标准化”，不做 cell 构建、不做空间投影、不做融合。
+后续流程应为：
+
+evidence_df
+  -> normalize_evidence_df
+  -> build_chainage_cells
+  -> project_evidence_to_cells
+  -> fuse_geo_states
+  -> build_forward_profile
+
+设计原则：
+1. 不修改旧 evidence_df；
+2. 不删除旧字段；
+3. 解析失败不抛异常，保留 parse_warnings；
+4. overview / background 不参与强逐里程融合；
+5. HSP collapse_points 拆成 anomaly_point；
+6. 所有输出尽量 JSON 可序列化。
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from typing import Any, Dict, Iterable, List, Optional
+
+import pandas as pd
+
+from geology_v2.config import (
+    CONFIDENCE_WEIGHT,
+    SOURCE_LEVEL_STRENGTH,
+    SOURCE_ROLE_MAP,
+    SPATIAL_TYPE_STRENGTH,
+    get_source_reliability,
+    normalize_hazard_tag,
+    normalize_source_type,
+)
+
+
+# ============================================================
+# 1. 输出字段定义
+# ============================================================
+
+NORMALIZED_EVIDENCE_COLUMNS = [
+    "evidence_id",
+    "report_id",
+
+    "source_type_raw",
+    "source_type_norm",
+    "evidence_role",
+    "source_level",
+    "spatial_type",
+
+    "start_chainage",
+    "end_chainage",
+    "center_chainage",
+    "face_chainage",
+
+    "grade",
+    "lithology",
+    "weathering",
+    "joint_development",
+    "rock_mass_state",
+    "stability",
+
+    "water_flag",
+    "water_type",
+    "collapse_flag",
+    "deformation_flag",
+
+    "hazard_tags",
+
+    "source_reliability",
+    "evidence_strength",
+    "confidence_text",
+
+    "raw_text",
+    "attrs_obj",
+    "parse_warnings",
+]
+
+
+# ============================================================
+# 2. 基础安全工具
+# ============================================================
+
+def _is_missing(value: Any) -> bool:
+    """
+    判断一个值是否为空。
+
+    pandas 的 NaN / None / 空字符串都视为 missing。
+    """
+    if value is None:
+        return True
+    try:
+        if pd.isna(value):
+            return True
+    except Exception:
+        pass
+    if isinstance(value, str) and value.strip() == "":
+        return True
+    return False
+
+
+def _safe_str(value: Any, default: str = "") -> str:
+    if _is_missing(value):
+        return default
+    return str(value).strip()
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    """
+    将 value 安全转为 float。
+    转换失败返回 None。
+    """
+    if _is_missing(value):
+        return None
+    try:
+        x = float(value)
+        if math.isfinite(x):
+            return x
+    except Exception:
+        return None
+    return None
+
+
+def _safe_int_flag(value: Any) -> int:
+    """
+    将各种 flag 安全转为 0/1。
+    """
+    if _is_missing(value):
+        return 0
+
+    if isinstance(value, bool):
+        return int(value)
+
+    if isinstance(value, (int, float)):
+        try:
+            return 1 if float(value) != 0 else 0
+        except Exception:
+            return 0
+
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "有", "是", "存在"}:
+        return 1
+    if text in {"0", "false", "no", "n", "无", "否", "不存在"}:
+        return 0
+
+    return 0
+
+
+def _safe_json_loads(value: Any) -> tuple[Dict[str, Any], List[str]]:
+    """
+    安全解析 attrs_json。
+
+    返回：
+    - attrs_obj
+    - parse_warnings
+
+    注意：
+    attrs_json 解析失败时不报错，只保留 warning。
+    """
+    warnings: List[str] = []
+
+    if _is_missing(value):
+        return {}, []
+
+    if isinstance(value, dict):
+        return dict(value), []
+
+    text = str(value).strip()
+    if not text:
+        return {}, []
+
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj, []
+        warnings.append("attrs_json parsed but is not a dict")
+        return {}, warnings
+    except Exception as exc:
+        warnings.append(f"attrs_json_parse_failed: {exc}")
+        return {}, warnings
+
+
+def _first_non_empty(*values: Any) -> Any:
+    """
+    返回第一个非空值。
+    """
+    for value in values:
+        if not _is_missing(value):
+            return value
+    return None
+
+
+def _dedup_keep_order(items: Iterable[Any]) -> List[str]:
+    """
+    去重但保持顺序。
+    """
+    out: List[str] = []
+    seen = set()
+
+    for item in items:
+        if _is_missing(item):
+            continue
+        text = str(item).strip()
+        if not text:
+            continue
+        if text not in seen:
+            out.append(text)
+            seen.add(text)
+
+    return out
+
+
+def _jsonable_attrs(attrs: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    轻量清洗 attrs_obj，确保尽量可 JSON 序列化。
+
+    这里只做保守处理：
+    - dict/list/str/int/float/bool/None 原样保留；
+    - 其他对象转字符串。
+    """
+    out: Dict[str, Any] = {}
+
+    for key, value in dict(attrs or {}).items():
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            out[key] = value
+        elif isinstance(value, list):
+            out[key] = [
+                item if isinstance(item, (str, int, float, bool)) or item is None else str(item)
+                for item in value
+            ]
+        elif isinstance(value, dict):
+            nested = {}
+            for k2, v2 in value.items():
+                if isinstance(v2, (str, int, float, bool)) or v2 is None:
+                    nested[str(k2)] = v2
+                else:
+                    nested[str(k2)] = str(v2)
+            out[str(key)] = nested
+        else:
+            out[str(key)] = str(value)
+
+    return out
+
+
+# ============================================================
+# 3. 字段推断
+# ============================================================
+
+def _infer_evidence_role(source_type_norm: str, source_level: str, attrs: Dict[str, Any]) -> str:
+    """
+    推断 evidence_role。
+
+    优先级：
+    1. overview/background -> background
+    2. config.SOURCE_ROLE_MAP
+    3. fact_type/source_semantics 辅助判断
+    """
+    level = _safe_str(source_level).lower()
+
+    if level in {"overview", "background"}:
+        return "background"
+
+    fact_type = _safe_str(attrs.get("fact_type")).lower()
+    semantics = _safe_str(attrs.get("source_semantics")).lower()
+
+    if "overview" in fact_type or "overview" in semantics:
+        return "background"
+
+    if "sketch" in fact_type or "observation" in fact_type:
+        return "observed"
+
+    if "conclusion" in fact_type or "conclusion" in semantics:
+        return "interpreted"
+
+    return SOURCE_ROLE_MAP.get(source_type_norm, "unknown")
+
+
+def _infer_spatial_type(source_type_norm: str, source_level: str, attrs: Dict[str, Any]) -> str:
+    """
+    推断空间类型。
+
+    输出：
+    - point
+    - anomaly_point
+    - segment
+    - overview
+    - background
+    - unknown
+    """
+    level = _safe_str(source_level).lower()
+    fact_type = _safe_str(attrs.get("fact_type")).lower()
+
+    if level in {"overview", "background"}:
+        return "overview"
+
+    if "overview" in fact_type:
+        return "overview"
+
+    if level == "point":
+        return "point"
+
+    if level in {"segment", "report_conclusion"}:
+        return "segment"
+
+    if "segment" in fact_type or "table" in fact_type:
+        return "segment"
+
+    if "conclusion" in fact_type:
+        return "segment"
+
+    if source_type_norm == "face_sketch":
+        return "point"
+
+    return "unknown"
+
+
+def _normalize_chainage_interval(
+    start_num: Any,
+    end_num: Any,
+    face_num: Any,
+    spatial_type: str,
+) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """
+    统一里程字段。
+
+    返回：
+    - start_chainage
+    - end_chainage
+    - center_chainage
+    - face_chainage
+    """
+    start_chainage = _safe_float(start_num)
+    end_chainage = _safe_float(end_num)
+    face_chainage = _safe_float(face_num)
+
+    if start_chainage is not None and end_chainage is None:
+        end_chainage = start_chainage
+    if end_chainage is not None and start_chainage is None:
+        start_chainage = end_chainage
+
+    if start_chainage is not None and end_chainage is not None:
+        if start_chainage > end_chainage:
+            start_chainage, end_chainage = end_chainage, start_chainage
+
+    if spatial_type == "point":
+        point = _first_non_empty(face_chainage, start_chainage, end_chainage)
+        point = _safe_float(point)
+        start_chainage = point
+        end_chainage = point
+        center_chainage = point
+        if face_chainage is None:
+            face_chainage = point
+        return start_chainage, end_chainage, center_chainage, face_chainage
+
+    if start_chainage is not None and end_chainage is not None:
+        center_chainage = 0.5 * (start_chainage + end_chainage)
+    else:
+        center_chainage = _safe_float(_first_non_empty(face_chainage, start_chainage, end_chainage))
+
+    return start_chainage, end_chainage, center_chainage, face_chainage
+
+
+def _normalize_grade(attrs: Dict[str, Any]) -> Optional[str]:
+    """
+    统一围岩等级字段。
+
+    旧 parser 中常见字段：
+    - support_grade
+    - support_grade_final
+    - grade
+    - fused_grade
+    """
+    value = _first_non_empty(
+        attrs.get("support_grade_final"),
+        attrs.get("support_grade"),
+        attrs.get("grade"),
+        attrs.get("fused_grade"),
+        attrs.get("rock_grade"),
+    )
+    if _is_missing(value):
+        return None
+    return str(value).strip()
+
+
+def _normalize_lithology(attrs: Dict[str, Any]) -> Optional[str]:
+    value = _first_non_empty(attrs.get("lithology"), attrs.get("rock_name"), attrs.get("岩性"))
+    return None if _is_missing(value) else str(value).strip()
+
+
+def _normalize_weathering(attrs: Dict[str, Any]) -> Optional[str]:
+    value = _first_non_empty(attrs.get("weathering"), attrs.get("weathering_degree"), attrs.get("风化程度"))
+    return None if _is_missing(value) else str(value).strip()
+
+
+def _normalize_joint_development(attrs: Dict[str, Any]) -> Optional[str]:
+    value = _first_non_empty(
+        attrs.get("joint_development"),
+        attrs.get("joint_degree"),
+        attrs.get("joint_state"),
+        attrs.get("裂隙发育"),
+    )
+    return None if _is_missing(value) else str(value).strip()
+
+
+def _normalize_rock_mass_state(attrs: Dict[str, Any]) -> Optional[str]:
+    value = _first_non_empty(
+        attrs.get("rock_mass_state"),
+        attrs.get("rockmass_state"),
+        attrs.get("rock_mass_integrity"),
+        attrs.get("岩体状态"),
+    )
+    return None if _is_missing(value) else str(value).strip()
+
+
+def _normalize_stability(attrs: Dict[str, Any]) -> Optional[str]:
+    value = _first_non_empty(attrs.get("stability"), attrs.get("self_stability"), attrs.get("稳定性"))
+    return None if _is_missing(value) else str(value).strip()
+
+
+def _normalize_hazard_tags(attrs: Dict[str, Any]) -> List[str]:
+    """
+    统一 hazard_tags。
+
+    来源：
+    1. attrs.risk_tags
+    2. attrs.hazard_tags
+    3. water/collapse/deformation flags
+    4. joint/rock_mass/stability 等描述
+    """
+    tags: List[Any] = []
+
+    for key in ["risk_tags", "hazard_tags", "source_risk_tags"]:
+        value = attrs.get(key)
+        if isinstance(value, list):
+            tags.extend(value)
+        elif not _is_missing(value):
+            tags.append(value)
+
+    water_flag = _safe_int_flag(attrs.get("water_flag"))
+    water_type = attrs.get("water_type")
+    collapse_flag = _safe_int_flag(attrs.get("collapse_flag"))
+    deformation_flag = _safe_int_flag(attrs.get("deformation_flag"))
+
+    if water_type:
+        tags.append(water_type)
+    elif water_flag:
+        tags.append("出水")
+
+    if collapse_flag:
+        tags.append("掉块")
+
+    if deformation_flag:
+        tags.append("变形")
+
+    joint = _normalize_joint_development(attrs)
+    if joint:
+        if "密集" in joint:
+            tags.append("裂隙密集")
+        elif "发育" in joint:
+            tags.append("裂隙发育")
+
+    rock_mass = _normalize_rock_mass_state(attrs)
+    if rock_mass:
+        if "极破碎" in rock_mass:
+            tags.append("围岩极破碎")
+        elif "破碎" in rock_mass:
+            tags.append("围岩破碎")
+
+    if _safe_int_flag(attrs.get("mud_filling_flag")):
+        tags.append("泥质填充")
+
+    rock_uniformity = attrs.get("rock_uniformity")
+    if not _is_missing(rock_uniformity) and "软硬不均" in str(rock_uniformity):
+        tags.append("软硬不均")
+
+    stability = _normalize_stability(attrs)
+    if stability and "差" in stability:
+        tags.append("稳定性较差")
+
+    anomaly_level = _safe_str(attrs.get("anomaly_level"))
+    if anomaly_level == "strong":
+        tags.append("明显反射异常")
+    elif anomaly_level == "medium":
+        tags.append("较明显反射异常")
+
+    # 先保留中文标签，后续 fusion_engine 里再映射成 canonical hazard key。
+    # 这里额外调用 normalize_hazard_tag 是为了过滤空值，同时检查 config 中是否已有别名。
+    out = []
+    for tag in _dedup_keep_order(tags):
+        normalized = normalize_hazard_tag(tag)
+        out.append(str(tag if normalized is not None else tag))
+
+    return _dedup_keep_order(out)
+
+
+def _normalize_confidence_text(value: Any) -> str:
+    text = _safe_str(value, default="unknown").lower()
+    if text in {"high", "medium", "low"}:
+        return text
+    if text in {"高", "较高"}:
+        return "high"
+    if text in {"中", "中等", "一般"}:
+        return "medium"
+    if text in {"低", "较低"}:
+        return "low"
+    return "unknown"
+
+
+def _compute_evidence_strength(
+    source_level: str,
+    spatial_type: str,
+    confidence_text: str,
+    attrs: Dict[str, Any],
+) -> float:
+    """
+    计算证据强度。
+
+    注意：
+    evidence_strength 是融合权重的一部分，不是风险概率。
+    """
+    level_key = _safe_str(source_level, default="unknown")
+    spatial_key = _safe_str(spatial_type, default="unknown")
+    conf_key = _safe_str(confidence_text, default="unknown")
+
+    level_weight = float(SOURCE_LEVEL_STRENGTH.get(level_key, SOURCE_LEVEL_STRENGTH["unknown"]))
+    spatial_weight = float(SPATIAL_TYPE_STRENGTH.get(spatial_key, SPATIAL_TYPE_STRENGTH["unknown"]))
+    confidence_weight = float(CONFIDENCE_WEIGHT.get(conf_key, CONFIDENCE_WEIGHT["unknown"]))
+
+    # 如果 parser 认为是 high risk，不直接当成概率，只轻微提高证据强度；
+    # 真实 hazard 分数在 fusion_engine 阶段再算。
+    risk_level = _safe_str(attrs.get("risk_level"), default="").lower()
+    if risk_level == "high":
+        risk_hint_weight = 1.10
+    elif risk_level == "medium":
+        risk_hint_weight = 1.00
+    elif risk_level == "low":
+        risk_hint_weight = 0.90
+    else:
+        risk_hint_weight = 1.00
+
+    value = level_weight * spatial_weight * confidence_weight * risk_hint_weight
+    return float(max(0.0, min(value, 2.0)))
+
+
+# ============================================================
+# 4. HSP anomaly_point 拆分
+# ============================================================
+
+def _resolve_collapse_point_chainage(
+    point_value: Any,
+    start_chainage: Optional[float],
+    end_chainage: Optional[float],
+) -> Optional[float]:
+    """
+    将 HSP collapse_points 中的点位转换为完整里程。
+
+    旧 hsp_parser 里 collapse_points 可能来自文本中的 '+190.2'，
+    这类值可能只保存为 190.2，而不是 1013190.2。
+
+    处理策略：
+    1. 如果 point_value 本身已经像完整里程，例如 > 10000，直接使用；
+    2. 如果 point_value 较小，且 start_chainage 可用，则使用 start_chainage 的千米段补齐；
+       例如 start=1013180.2, point=190.2 -> 1013190.2。
+    """
+    point = _safe_float(point_value)
+    if point is None:
+        return None
+
+    if abs(point) >= 10000:
+        return point
+
+    base = _safe_float(start_chainage)
+    if base is None:
+        base = _safe_float(end_chainage)
+
+    if base is None:
+        return point
+
+    # 以 1000m 为一个桩号千米段补齐。
+    km_base = math.floor(base / 1000.0) * 1000.0
+    candidate = km_base + point
+
+    # 如果 candidate 明显落在 segment 外太远，尝试用 end 的千米段。
+    end_base = _safe_float(end_chainage)
+    if end_base is not None:
+        min_bound = min(base, end_base) - 50.0
+        max_bound = max(base, end_base) + 50.0
+        if not (min_bound <= candidate <= max_bound):
+            km_base_2 = math.floor(end_base / 1000.0) * 1000.0
+            candidate_2 = km_base_2 + point
+            if min_bound <= candidate_2 <= max_bound:
+                candidate = candidate_2
+
+    return float(candidate)
+
+
+def _iter_hsp_anomaly_points(normalized_row: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    如果一条 HSP segment 证据中 attrs_obj.collapse_points 非空，
+    则拆出若干 anomaly_point 证据。
+
+    anomaly_point 证据会继承原证据的大部分属性，但：
+    - evidence_id 追加 _collapse_point_i
+    - spatial_type = anomaly_point
+    - start/end/center_chainage = point_chainage
+    - collapse_flag = 1
+    - hazard_tags 至少包含 掉块
+    """
+    attrs = normalized_row.get("attrs_obj") or {}
+    source_type_norm = normalized_row.get("source_type_norm")
+
+    if source_type_norm != "HSP":
+        return []
+
+    collapse_points = attrs.get("collapse_points", [])
+    if not isinstance(collapse_points, list) or not collapse_points:
+        return []
+
+    out: List[Dict[str, Any]] = []
+
+    for idx, point_value in enumerate(collapse_points):
+        point_chainage = _resolve_collapse_point_chainage(
+            point_value=point_value,
+            start_chainage=normalized_row.get("start_chainage"),
+            end_chainage=normalized_row.get("end_chainage"),
+        )
+        if point_chainage is None:
+            continue
+
+        item = dict(normalized_row)
+        item["evidence_id"] = f"{normalized_row.get('evidence_id')}_collapse_point_{idx}"
+        item["spatial_type"] = "anomaly_point"
+        item["evidence_role"] = "prediction"
+        item["source_level"] = "anomaly_point"
+
+        item["start_chainage"] = point_chainage
+        item["end_chainage"] = point_chainage
+        item["center_chainage"] = point_chainage
+
+        item["collapse_flag"] = 1
+        item["hazard_tags"] = _dedup_keep_order(list(item.get("hazard_tags") or []) + ["掉块"])
+
+        item_attrs = dict(attrs)
+        item_attrs["parent_evidence_id"] = normalized_row.get("evidence_id")
+        item_attrs["anomaly_point_type"] = "collapse_point"
+        item_attrs["anomaly_point_raw_value"] = point_value
+        item_attrs["anomaly_point_chainage"] = point_chainage
+        item["attrs_obj"] = _jsonable_attrs(item_attrs)
+
+        # anomaly point 的局部性更强，证据强度略增。
+        item["evidence_strength"] = float(max(item.get("evidence_strength", 0.0), 1.20))
+
+        out.append(item)
+
+    return out
+
+
+# ============================================================
+# 5. 单行标准化
+# ============================================================
+
+def _normalize_one_row(row: pd.Series, row_idx: int) -> Dict[str, Any]:
+    """
+    将旧 evidence_df 中的一行转换为 normalized evidence dict。
+    """
+    attrs_obj, parse_warnings = _safe_json_loads(row.get("attrs_json"))
+
+    # 兼容 attrs_obj 中已有 parse_warnings。
+    existing_warnings = attrs_obj.get("parse_warnings")
+    if isinstance(existing_warnings, list):
+        parse_warnings.extend([str(x) for x in existing_warnings if not _is_missing(x)])
+
+    source_type_raw = _safe_str(row.get("source_type"), default="unknown")
+    source_type_norm = normalize_source_type(source_type_raw)
+
+    source_level = _safe_str(row.get("source_level"), default="unknown")
+    evidence_role = _infer_evidence_role(source_type_norm, source_level, attrs_obj)
+    spatial_type = _infer_spatial_type(source_type_norm, source_level, attrs_obj)
+
+    # overview 不强逐里程融合。
+    if evidence_role == "background" or spatial_type == "overview":
+        spatial_type = "overview"
+        evidence_role = "background"
+
+    start_chainage, end_chainage, center_chainage, face_chainage = _normalize_chainage_interval(
+        start_num=row.get("start_num"),
+        end_num=row.get("end_num"),
+        face_num=row.get("face_num"),
+        spatial_type=spatial_type,
+    )
+
+    confidence_text = _normalize_confidence_text(row.get("confidence"))
+
+    grade = _normalize_grade(attrs_obj)
+    lithology = _normalize_lithology(attrs_obj)
+    weathering = _normalize_weathering(attrs_obj)
+    joint_development = _normalize_joint_development(attrs_obj)
+    rock_mass_state = _normalize_rock_mass_state(attrs_obj)
+    stability = _normalize_stability(attrs_obj)
+
+    water_flag = _safe_int_flag(attrs_obj.get("water_flag"))
+    water_type = None if _is_missing(attrs_obj.get("water_type")) else str(attrs_obj.get("water_type")).strip()
+    collapse_flag = _safe_int_flag(attrs_obj.get("collapse_flag"))
+    deformation_flag = _safe_int_flag(attrs_obj.get("deformation_flag"))
+
+    hazard_tags = _normalize_hazard_tags(attrs_obj)
+
+    source_reliability = get_source_reliability(source_type_norm)
+    evidence_strength = _compute_evidence_strength(
+        source_level=source_level,
+        spatial_type=spatial_type,
+        confidence_text=confidence_text,
+        attrs=attrs_obj,
+    )
+
+    # background / overview 证据保留，但降低强逐里程融合影响。
+    if evidence_role == "background" or spatial_type == "overview":
+        source_reliability = min(source_reliability, 0.35)
+        evidence_strength = min(evidence_strength, 0.40)
+
+    evidence_id = _safe_str(row.get("evidence_id"))
+    if not evidence_id:
+        evidence_id = f"evidence_{row_idx}"
+
+    normalized = {
+        "evidence_id": evidence_id,
+        "report_id": None if _is_missing(row.get("report_id")) else str(row.get("report_id")).strip(),
+
+        "source_type_raw": source_type_raw,
+        "source_type_norm": source_type_norm,
+        "evidence_role": evidence_role,
+        "source_level": source_level,
+        "spatial_type": spatial_type,
+
+        "start_chainage": start_chainage,
+        "end_chainage": end_chainage,
+        "center_chainage": center_chainage,
+        "face_chainage": face_chainage,
+
+        "grade": grade,
+        "lithology": lithology,
+        "weathering": weathering,
+        "joint_development": joint_development,
+        "rock_mass_state": rock_mass_state,
+        "stability": stability,
+
+        "water_flag": int(water_flag),
+        "water_type": water_type,
+        "collapse_flag": int(collapse_flag),
+        "deformation_flag": int(deformation_flag),
+
+        "hazard_tags": hazard_tags,
+
+        "source_reliability": float(source_reliability),
+        "evidence_strength": float(evidence_strength),
+        "confidence_text": confidence_text,
+
+        "raw_text": None if _is_missing(row.get("raw_text")) else str(row.get("raw_text")),
+        "attrs_obj": _jsonable_attrs(attrs_obj),
+        "parse_warnings": _dedup_keep_order(parse_warnings),
+    }
+
+    return normalized
+
+
+# ============================================================
+# 6. 主函数
+# ============================================================
+
+def normalize_evidence_df(evidence_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    标准化旧 evidence_df。
+
+    输入字段可能包括：
+    - evidence_id
+    - source_type
+    - source_level
+    - report_id
+    - start_num
+    - end_num
+    - face_num
+    - confidence
+    - attrs_json
+    - raw_text
+
+    输出字段至少包括 NORMALIZED_EVIDENCE_COLUMNS。
+
+    注意：
+    1. 不会修改原始 evidence_df；
+    2. attrs_json 解析失败不报错；
+    3. sketch -> face_sketch；
+    4. tsp -> TSP；
+    5. sonic/hsp -> HSP；
+    6. overview -> background / overview；
+    7. HSP collapse_points 会额外拆成 anomaly_point。
+    """
+    if evidence_df is None or evidence_df.empty:
+        return pd.DataFrame(columns=NORMALIZED_EVIDENCE_COLUMNS)
+
+    records: List[Dict[str, Any]] = []
+
+    df = evidence_df.copy()
+
+    # 确保常用列存在，避免 row.get 不稳定。
+    for col in [
+        "evidence_id",
+        "source_type",
+        "source_level",
+        "report_id",
+        "start_num",
+        "end_num",
+        "face_num",
+        "confidence",
+        "attrs_json",
+        "raw_text",
+    ]:
+        if col not in df.columns:
+            df[col] = None
+
+    for idx, row in df.iterrows():
+        normalized = _normalize_one_row(row, row_idx=int(idx) if isinstance(idx, int) else len(records))
+        records.append(normalized)
+
+        # HSP collapse_points 拆出 anomaly_point。
+        anomaly_points = _iter_hsp_anomaly_points(normalized)
+        records.extend(anomaly_points)
+
+    out = pd.DataFrame(records)
+
+    # 补齐列并排序。
+    for col in NORMALIZED_EVIDENCE_COLUMNS:
+        if col not in out.columns:
+            out[col] = None
+
+    out = out[NORMALIZED_EVIDENCE_COLUMNS].copy()
+
+    # 数值字段统一转换，避免后续 projector 出现 object 类型问题。
+    numeric_cols = [
+        "start_chainage",
+        "end_chainage",
+        "center_chainage",
+        "face_chainage",
+        "source_reliability",
+        "evidence_strength",
+        "water_flag",
+        "collapse_flag",
+        "deformation_flag",
+    ]
+    for col in numeric_cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    # flag 空值填 0。
+    for col in ["water_flag", "collapse_flag", "deformation_flag"]:
+        out[col] = out[col].fillna(0).astype(int)
+
+    # object 列中的 list/dict 保持原样，后续统一由 serialize_for_json 处理。
+    return out
+
+
+# ============================================================
+# 7. 便捷检查函数，可选使用
+# ============================================================
+
+def summarize_normalized_evidence(normalized_df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    对 normalized_evidence_df 做一个轻量摘要。
+
+    这个函数不是主流程必需，只用于调试第二阶段是否正常。
+    """
+    if normalized_df is None or normalized_df.empty:
+        return {
+            "evidence_count": 0,
+            "source_type_counts": {},
+            "spatial_type_counts": {},
+            "role_counts": {},
+            "anomaly_point_count": 0,
+            "parse_warning_count": 0,
+        }
+
+    warning_count = 0
+    if "parse_warnings" in normalized_df.columns:
+        for item in normalized_df["parse_warnings"].tolist():
+            if isinstance(item, list) and item:
+                warning_count += 1
+
+    return {
+        "evidence_count": int(len(normalized_df)),
+        "source_type_counts": normalized_df["source_type_norm"].value_counts(dropna=False).to_dict()
+        if "source_type_norm" in normalized_df.columns else {},
+        "spatial_type_counts": normalized_df["spatial_type"].value_counts(dropna=False).to_dict()
+        if "spatial_type" in normalized_df.columns else {},
+        "role_counts": normalized_df["evidence_role"].value_counts(dropna=False).to_dict()
+        if "evidence_role" in normalized_df.columns else {},
+        "anomaly_point_count": int((normalized_df.get("spatial_type") == "anomaly_point").sum())
+        if "spatial_type" in normalized_df.columns else 0,
+        "parse_warning_count": int(warning_count),
+    }
+
+
+================================================================================
+文件地址: config.py
+================================================================================
+
+"""
+geology_v2.config
+
+地质融合 v2 的配置项。
+
+注意：
+1. 这里的权重是工程启发式初值，不是统计学习得到的真实准确率；
+2. source_reliability 表示证据来源在融合中的相对可信度；
+3. spatial_sigma 表示证据向周边 cell 扩散的空间尺度；
+4. hazard_weights 表示不同 hazard 在地质关注度中的相对贡献；
+5. GRCI 不能被解释为风险概率。
+"""
+
+from __future__ import annotations
+
+from typing import Dict, Tuple
+
+
+# ============================================================
+# 1. 总体开关
+# ============================================================
+
+GEOLOGY_FUSION_VERSION = "v1"
+# 后续第九阶段接入 services/tbm_analysis_service.py 时再改成：
+# GEOLOGY_FUSION_VERSION = "v2"
+
+DEFAULT_CELL_LENGTH_M = 10.0
+
+
+# ============================================================
+# 2. source_type 标准化
+# ============================================================
+# 旧 evidence_df 里可能出现 sketch / tsp / sonic / hsp 等写法。
+# v2 统一成较清晰的 source_type_norm。
+# ============================================================
+
+SOURCE_TYPE_ALIASES: Dict[str, str] = {
+    "sketch": "face_sketch",
+    "face_sketch": "face_sketch",
+    "face_observation": "face_sketch",
+
+    "drill": "borehole",
+    "borehole": "borehole",
+    "advanced_borehole": "borehole",
+
+    "tsp": "TSP",
+    "TSP": "TSP",
+
+    "sonic": "HSP",
+    "hsp": "HSP",
+    "HSP": "HSP",
+
+    "report_conclusion": "report_conclusion",
+    "conclusion": "report_conclusion",
+
+    "overview": "overview",
+    "background": "overview",
+}
+
+
+# ============================================================
+# 3. 证据角色
+# ============================================================
+# observed:
+#   现场直接揭示，例如掌子面素描、钻孔揭示。
+# prediction:
+#   超前预报类证据，例如 TSP、HSP。
+# background:
+#   报告概述、区域背景，只作为背景，不强逐里程融合。
+# interpreted:
+#   报告结论类解释证据。
+# ============================================================
+
+SOURCE_ROLE_MAP: Dict[str, str] = {
+    "face_sketch": "observed",
+    "borehole": "observed",
+    "TSP": "prediction",
+    "HSP": "prediction",
+    "report_conclusion": "interpreted",
+    "overview": "background",
+}
+
+
+# ============================================================
+# 4. 来源可靠性权重
+# ============================================================
+# 初始工程经验值：
+# - face_sketch / borehole 是现场揭示，可靠性较高；
+# - TSP / HSP 是超前预报，可靠性中等偏高；
+# - report_conclusion 是人工解释结论，较高但可能概括；
+# - overview 只作为背景，权重低。
+# ============================================================
+
+SOURCE_RELIABILITY: Dict[str, float] = {
+    "face_sketch": 1.20,
+    "borehole": 1.15,
+    "TSP": 0.95,
+    "HSP": 0.90,
+    "report_conclusion": 1.00,
+    "overview": 0.35,
+    "unknown": 0.60,
+}
+
+
+# ============================================================
+# 5. source_level / spatial_type 权重
+# ============================================================
+# 这个权重不是最终风险分，只是证据强度的一部分。
+# ============================================================
+
+SOURCE_LEVEL_STRENGTH: Dict[str, float] = {
+    "point": 1.10,
+    "anomaly_point": 1.20,
+    "segment": 1.00,
+    "report_conclusion": 1.05,
+    "overview": 0.40,
+    "background": 0.35,
+    "unknown": 0.70,
+}
+
+
+SPATIAL_TYPE_STRENGTH: Dict[str, float] = {
+    "point": 1.10,
+    "anomaly_point": 1.20,
+    "segment": 1.00,
+    "overview": 0.35,
+    "background": 0.30,
+    "unknown": 0.70,
+}
+
+
+# ============================================================
+# 6. 置信度权重
+# ============================================================
+
+CONFIDENCE_WEIGHT: Dict[str, float] = {
+    "high": 1.15,
+    "medium": 1.00,
+    "low": 0.80,
+    "unknown": 0.75,
+}
+
+
+# ============================================================
+# 7. 空间 sigma 配置
+# ============================================================
+# 用于后续 project_evidence_to_cells：
+#
+# spatial_weight = exp(-0.5 * (distance / sigma) ** 2)
+#
+# 解释：
+# - 掌子面素描是点状实测，对近邻里程影响强，但不应无限扩展；
+# - HSP/TSP 是超前预报区段，segment 内权重为 1，区间外按 sigma 衰减；
+# - anomaly_point 更局部，sigma 较小；
+# - overview 只作为背景，不强融合。
+# ============================================================
+
+DEFAULT_SPATIAL_SIGMA_M = 10.0
+
+SPATIAL_SIGMA_BY_SOURCE: Dict[str, float] = {
+    "face_sketch": 6.0,
+    "borehole": 5.0,
+    "TSP": 15.0,
+    "HSP": 12.0,
+    "report_conclusion": 10.0,
+    "overview": 30.0,
+    "unknown": DEFAULT_SPATIAL_SIGMA_M,
+}
+
+SPATIAL_SIGMA_BY_TYPE: Dict[str, float] = {
+    "point": 6.0,
+    "anomaly_point": 4.0,
+    "segment": 12.0,
+    "overview": 30.0,
+    "background": 30.0,
+    "unknown": DEFAULT_SPATIAL_SIGMA_M,
+}
+
+# 更细粒度配置：优先级最高。
+# key = (source_type_norm, spatial_type)
+SPATIAL_SIGMA_BY_SOURCE_AND_TYPE: Dict[Tuple[str, str], float] = {
+    ("face_sketch", "point"): 5.0,
+    ("borehole", "point"): 4.0,
+    ("HSP", "segment"): 12.0,
+    ("HSP", "anomaly_point"): 4.0,
+    ("TSP", "segment"): 15.0,
+    ("TSP", "report_conclusion"): 12.0,
+    ("report_conclusion", "segment"): 10.0,
+    ("overview", "overview"): 30.0,
+}
+
+
+# ============================================================
+# 8. hazard 权重
+# ============================================================
+# 这些权重后续用于 hazard_scores 计算。
+# 注意：这是地质关注度权重，不是事故概率。
+# ============================================================
+
+HAZARD_WEIGHTS: Dict[str, float] = {
+    "water": 0.35,
+    "water_inrush": 0.45,
+    "collapse": 0.40,
+    "block_fall": 0.35,
+    "deformation": 0.30,
+    "fractured_rock": 0.30,
+    "extremely_fractured_rock": 0.40,
+    "joint_development": 0.25,
+    "dense_joints": 0.35,
+    "weak_interlayer": 0.30,
+    "mud_filling": 0.30,
+    "soft_hard_uneven": 0.25,
+    "reflection_anomaly": 0.25,
+    "strong_reflection_anomaly": 0.35,
+    "poor_stability": 0.35,
+}
+
+
+HAZARD_TAG_ALIASES: Dict[str, str] = {
+    "出水": "water",
+    "渗水": "water",
+    "线状出水": "water",
+    "股状出水": "water",
+    "线-股状出水": "water_inrush",
+    "涌水": "water_inrush",
+    "突水": "water_inrush",
+
+    "掉块": "block_fall",
+    "掉块风险": "block_fall",
+    "坍塌": "collapse",
+    "塌方": "collapse",
+
+    "变形": "deformation",
+    "大变形": "deformation",
+
+    "围岩破碎": "fractured_rock",
+    "岩体破碎": "fractured_rock",
+    "围岩极破碎": "extremely_fractured_rock",
+    "破碎-极破碎": "extremely_fractured_rock",
+
+    "裂隙发育": "joint_development",
+    "节理裂隙发育": "joint_development",
+    "裂隙密集": "dense_joints",
+    "节理裂隙发育密集": "dense_joints",
+
+    "泥质填充": "mud_filling",
+    "软硬不均": "soft_hard_uneven",
+
+    "反射异常": "reflection_anomaly",
+    "较明显反射异常": "reflection_anomaly",
+    "明显反射异常": "strong_reflection_anomaly",
+
+    "稳定性较差": "poor_stability",
+    "自稳性较差": "poor_stability",
+}
+
+
+# ============================================================
+# 9. 围岩等级分值
+# ============================================================
+# 后续 GRS_geo_base 会用它作为地质基础关注度的一部分。
+# ============================================================
+
+GRADE_ATTENTION_SCORE: Dict[str, float] = {
+    "Ⅰ": 0.05,
+    "Ⅱ": 0.20,
+    "Ⅲ": 0.40,
+    "Ⅳ": 0.70,
+    "Ⅴ": 1.00,
+    "I": 0.05,
+    "II": 0.20,
+    "III": 0.40,
+    "IV": 0.70,
+    "V": 1.00,
+    "1": 0.05,
+    "2": 0.20,
+    "3": 0.40,
+    "4": 0.70,
+    "5": 1.00,
+}
+
+
+GRADE_ORDER: Dict[str, int] = {
+    "Ⅰ": 1,
+    "Ⅱ": 2,
+    "Ⅲ": 3,
+    "Ⅳ": 4,
+    "Ⅴ": 5,
+    "I": 1,
+    "II": 2,
+    "III": 3,
+    "IV": 4,
+    "V": 5,
+    "1": 1,
+    "2": 2,
+    "3": 3,
+    "4": 4,
+    "5": 5,
+}
+
+
+# ============================================================
+# 10. confidence / uncertainty 阈值
+# ============================================================
+
+CONFIDENCE_THRESHOLDS: Dict[str, float] = {
+    "high": 0.75,
+    "medium": 0.45,
+    "low": 0.20,
+}
+
+UNCERTAINTY_THRESHOLDS: Dict[str, float] = {
+    "low": 0.25,
+    "medium": 0.50,
+    "high": 0.75,
+}
+
+CONFLICT_THRESHOLDS: Dict[str, float] = {
+    "low": 0.25,
+    "medium": 0.50,
+    "high": 0.75,
+}
+
+
+# ============================================================
+# 11. 前方关注等级阈值
+# ============================================================
+
+ATTENTION_LEVEL_THRESHOLDS: Dict[str, float] = {
+    "low": 0.25,
+    "medium": 0.50,
+    "high": 0.75,
+}
+
+
+def normalize_source_type(source_type: str | None) -> str:
+    """
+    Normalize raw source_type into v2 canonical source type.
+    """
+    if source_type is None:
+        return "unknown"
+
+    raw = str(source_type).strip()
+    if not raw:
+        return "unknown"
+
+    return SOURCE_TYPE_ALIASES.get(raw, SOURCE_TYPE_ALIASES.get(raw.lower(), raw))
+
+
+def get_source_reliability(source_type_norm: str | None) -> float:
+    """
+    Return reliability weight for normalized source type.
+    """
+    key = source_type_norm or "unknown"
+    return float(SOURCE_RELIABILITY.get(key, SOURCE_RELIABILITY["unknown"]))
+
+
+def get_spatial_sigma(source_type_norm: str | None, spatial_type: str | None) -> float:
+    """
+    Return spatial sigma by:
+    1. source_type + spatial_type pair;
+    2. spatial_type;
+    3. source_type;
+    4. default.
+    """
+    source_key = source_type_norm or "unknown"
+    spatial_key = spatial_type or "unknown"
+
+    if (source_key, spatial_key) in SPATIAL_SIGMA_BY_SOURCE_AND_TYPE:
+        return float(SPATIAL_SIGMA_BY_SOURCE_AND_TYPE[(source_key, spatial_key)])
+
+    if spatial_key in SPATIAL_SIGMA_BY_TYPE:
+        return float(SPATIAL_SIGMA_BY_TYPE[spatial_key])
+
+    if source_key in SPATIAL_SIGMA_BY_SOURCE:
+        return float(SPATIAL_SIGMA_BY_SOURCE[source_key])
+
+    return float(DEFAULT_SPATIAL_SIGMA_M)
+
+
+def normalize_hazard_tag(tag: str | None) -> str | None:
+    """
+    Normalize Chinese/raw hazard tag into canonical hazard key.
+    """
+    if tag is None:
+        return None
+
+    text = str(tag).strip()
+    if not text:
+        return None
+
+    return HAZARD_TAG_ALIASES.get(text, text)
+
+
+def get_hazard_weight(hazard_key: str | None) -> float:
+    """
+    Return hazard weight for canonical hazard key.
+    """
+    if hazard_key is None:
+        return 0.0
+    return float(HAZARD_WEIGHTS.get(str(hazard_key).strip(), 0.0))
+
+
+================================================================================
+文件地址: coupling_adapter.py
+================================================================================
+
+"""
+geology_v2.coupling_adapter
+
+地质-施工响应耦合适配器。
+
+输入：
+    geo_states_df:
+        fuse_geo_states 输出，包含 GRS_geo_base。
+
+    response_df:
+        施工响应异常指数数据，至少包含：
+        - cell_id
+        - RAI
+
+    或者：
+    df_plc + cells_df:
+        从 PLC 特征临时计算 RAI。
+
+输出：
+    coupled_df:
+        每个 cell 一行，包含：
+        - GRS_geo_base
+        - RAI
+        - GRCI
+        - coupling_level
+        - coupling_type
+        - coupling_explanation
+
+设计原则：
+1. GRS_geo_base 表示纯地质基础关注度；
+2. RAI 表示施工响应异常指数；
+3. GRCI 表示地质-施工响应耦合关注度；
+4. GRCI 不表示灾害概率；
+5. 没有施工响应数据时，不强行计算 GRCI；
+6. 保留 has_response_evidence 字段，避免把缺少响应数据误写成施工正常。
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from typing import Any, Dict, Iterable, List, Optional
+
+import numpy as np
+import pandas as pd
+
+
+# ============================================================
+# 1. 输出字段
+# ============================================================
+
+COUPLED_COLUMNS = [
+    "cell_id",
+    "cell_start",
+    "cell_end",
+    "cell_center",
+
+    "has_geology_evidence",
+    "GRS_geo_base",
+    "fused_grade",
+    "main_hazards",
+
+    "has_response_evidence",
+    "RAI",
+    "response_support_count",
+    "response_metrics",
+
+    "GRCI",
+    "coupling_level",
+    "coupling_type",
+    "coupling_explanation",
+]
+
+
+CHAINAGE_COLUMN_CANDIDATES = [
+    "chainage",
+    "里程",
+    "当前里程",
+    "桩号",
+    "推进里程",
+    "mile",
+    "mileage",
+]
+
+DEFAULT_PLC_FEATURE_RULES = {
+    # 特征名: 异常方向
+    # high 表示高于正常水平为异常
+    # low 表示低于正常水平为异常
+    # deviation 表示偏离正常水平为异常
+    "推力": "high",
+    "刀盘扭矩": "high",
+    "推进速度": "low",
+    "刀盘实际转速": "deviation",
+}
+
+
+# ============================================================
+# 2. 基础工具
+# ============================================================
+
+def _is_missing(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, (list, dict, tuple, set)):
+        return False
+    try:
+        return bool(pd.isna(value))
+    except Exception:
+        return False
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    if _is_missing(value):
+        return float(default)
+    try:
+        x = float(value)
+        if math.isfinite(x):
+            return float(x)
+    except Exception:
+        pass
+    return float(default)
+
+
+def _safe_str(value: Any, default: str = "") -> str:
+    if _is_missing(value):
+        return default
+    text = str(value).strip()
+    return text if text else default
+
+
+def _clip01(value: Any) -> float:
+    return float(max(0.0, min(_safe_float(value), 1.0)))
+
+
+def _as_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple) or isinstance(value, set):
+        return list(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, list):
+                return obj
+        except Exception:
+            pass
+        return [text]
+    return [value]
+
+
+def _dedup_keep_order(items: Iterable[Any]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+
+    for item in items:
+        if _is_missing(item):
+            continue
+
+        text = str(item).strip()
+        if not text:
+            continue
+
+        if text not in seen:
+            out.append(text)
+            seen.add(text)
+
+    return out
+
+
+def _json_clean(value: Any) -> Any:
+    if value is None:
+        return None
+
+    if isinstance(value, (str, bool, int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        return value
+
+    if isinstance(value, (np.integer,)):
+        return int(value)
+
+    if isinstance(value, (np.floating,)):
+        x = float(value)
+        return x if math.isfinite(x) else None
+
+    if isinstance(value, dict):
+        return {str(k): _json_clean(v) for k, v in value.items()}
+
+    if isinstance(value, (list, tuple, set)):
+        return [_json_clean(v) for v in value]
+
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+
+    return str(value)
+
+
+def _find_chainage_col(df: pd.DataFrame) -> Optional[str]:
+    if df is None or df.empty:
+        return None
+
+    lower_map = {str(col).strip().lower(): col for col in df.columns}
+
+    for name in CHAINAGE_COLUMN_CANDIDATES:
+        key = name.lower()
+        if key in lower_map:
+            return lower_map[key]
+
+    for col in df.columns:
+        text = str(col).strip().lower()
+        if "chainage" in text or "里程" in text or "桩号" in text:
+            return col
+
+    return None
+
+
+def _level_from_score(score: Optional[float]) -> str:
+    if score is None:
+        return "unknown"
+
+    value = _safe_float(score)
+
+    if value >= 0.75:
+        return "high"
+    if value >= 0.50:
+        return "medium"
+    if value >= 0.25:
+        return "low"
+    return "none"
+
+
+def _level_cn(level: str) -> str:
+    return {
+        "high": "高",
+        "medium": "中",
+        "low": "低",
+        "none": "无明显",
+        "unknown": "未知",
+    }.get(str(level), "未知")
+
+
+# ============================================================
+# 3. 从 PLC 临时构建 RAI
+# ============================================================
+
+def _robust_center_scale(series: pd.Series) -> tuple[float, float]:
+    """
+    使用 median + MAD 计算稳健中心和尺度。
+    """
+    s = pd.to_numeric(series, errors="coerce").dropna()
+
+    if s.empty:
+        return 0.0, 1.0
+
+    median = float(s.median())
+    mad = float((s - median).abs().median())
+
+    # MAD 转近似标准差
+    scale = 1.4826 * mad
+
+    if scale <= 1e-12:
+        std = float(s.std())
+        if math.isfinite(std) and std > 1e-12:
+            scale = std
+        else:
+            scale = 1.0
+
+    return median, scale
+
+
+def _feature_anomaly_score(value: float, center: float, scale: float, direction: str) -> float:
+    """
+    单个特征的异常分数，输出 0~1。
+
+    high:
+        高于中心更异常。
+    low:
+        低于中心更异常。
+    deviation:
+        偏离中心更异常。
+    """
+    if not math.isfinite(value):
+        return 0.0
+
+    scale = max(float(scale), 1e-6)
+    direction = str(direction or "deviation").lower()
+
+    if direction == "high":
+        z = max(0.0, (value - center) / scale)
+    elif direction == "low":
+        z = max(0.0, (center - value) / scale)
+    else:
+        z = abs(value - center) / scale
+
+    # z=3 约等于异常分数 1
+    return _clip01(z / 3.0)
+
+
+def build_response_index_from_plc(
+    df_plc: pd.DataFrame,
+    cells_df: pd.DataFrame,
+    feature_rules: Optional[Dict[str, str]] = None,
+    chainage_col: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    从 PLC 数据临时计算每个 cell 的 RAI。
+
+    参数：
+        df_plc:
+            PLC 数据，需要包含里程列和若干施工参数列。
+
+        cells_df:
+            build_chainage_cells 输出。
+
+        feature_rules:
+            特征规则，例如：
+            {
+                "推力": "high",
+                "刀盘扭矩": "high",
+                "推进速度": "low",
+                "刀盘实际转速": "deviation",
+            }
+
+        chainage_col:
+            可选。指定 PLC 里程列。
+
+    返回：
+        response_df:
+            cell_id
+            RAI
+            response_support_count
+            response_metrics
+
+    注意：
+        这是一个轻量 RAI 计算方法，适合先打通流程。
+        后续如果你已有更正式的 RAI 计算结果，可以直接传 response_df，不用这个函数。
+    """
+    if cells_df is None or cells_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "cell_id",
+                "RAI",
+                "response_support_count",
+                "response_metrics",
+            ]
+        )
+
+    if df_plc is None or df_plc.empty:
+        return pd.DataFrame(
+            {
+                "cell_id": cells_df["cell_id"].astype(str).tolist(),
+                "RAI": [np.nan] * len(cells_df),
+                "response_support_count": [0] * len(cells_df),
+                "response_metrics": [{} for _ in range(len(cells_df))],
+            }
+        )
+
+    rules = feature_rules or DEFAULT_PLC_FEATURE_RULES
+
+    df = df_plc.copy()
+
+    if chainage_col is None:
+        chainage_col = _find_chainage_col(df)
+
+    if chainage_col is None or chainage_col not in df.columns:
+        raise ValueError("df_plc 缺少里程列，无法计算 cell 级 RAI。")
+
+    df["__chainage"] = pd.to_numeric(df[chainage_col], errors="coerce")
+    df = df.dropna(subset=["__chainage"]).copy()
+
+    if df.empty:
+        return pd.DataFrame(
+            {
+                "cell_id": cells_df["cell_id"].astype(str).tolist(),
+                "RAI": [np.nan] * len(cells_df),
+                "response_support_count": [0] * len(cells_df),
+                "response_metrics": [{} for _ in range(len(cells_df))],
+            }
+        )
+
+    available_rules = {
+        col: direction
+        for col, direction in rules.items()
+        if col in df.columns
+    }
+
+    if not available_rules:
+        raise ValueError(
+            f"df_plc 中没有找到可用于 RAI 的特征列。候选列为：{list(rules.keys())}"
+        )
+
+    # 全局稳健中心和尺度
+    stats = {}
+    for col, direction in available_rules.items():
+        center, scale = _robust_center_scale(df[col])
+        stats[col] = {
+            "center": center,
+            "scale": scale,
+            "direction": direction,
+        }
+
+    records = []
+
+    for _, cell in cells_df.iterrows():
+        cell_id = _safe_str(cell.get("cell_id"))
+        start = _safe_float(cell.get("cell_start"))
+        end = _safe_float(cell.get("cell_end"))
+
+        part = df[
+            (df["__chainage"] >= min(start, end))
+            & (df["__chainage"] < max(start, end))
+        ].copy()
+
+        if part.empty:
+            records.append(
+                {
+                    "cell_id": cell_id,
+                    "RAI": np.nan,
+                    "response_support_count": 0,
+                    "response_metrics": {},
+                }
+            )
+            continue
+
+        feature_scores = {}
+        feature_values = {}
+
+        for col, cfg in stats.items():
+            values = pd.to_numeric(part[col], errors="coerce").dropna()
+
+            if values.empty:
+                continue
+
+            center = float(cfg["center"])
+            scale = float(cfg["scale"])
+            direction = str(cfg["direction"])
+
+            scores = [
+                _feature_anomaly_score(float(v), center, scale, direction)
+                for v in values.tolist()
+            ]
+
+            feature_scores[col] = float(max(scores)) if scores else 0.0
+            feature_values[col] = {
+                "mean": float(values.mean()),
+                "max": float(values.max()),
+                "min": float(values.min()),
+                "anomaly_score": feature_scores[col],
+                "direction": direction,
+            }
+
+        if feature_scores:
+            # max 表示主控异常，mean 表示整体异常背景
+            max_score = max(feature_scores.values())
+            mean_score = sum(feature_scores.values()) / len(feature_scores)
+            rai = _clip01(0.70 * max_score + 0.30 * mean_score)
+        else:
+            rai = np.nan
+
+        records.append(
+            {
+                "cell_id": cell_id,
+                "RAI": rai,
+                "response_support_count": int(len(part)),
+                "response_metrics": _json_clean(feature_values),
+            }
+        )
+
+    return pd.DataFrame(records)
+
+
+# ============================================================
+# 4. response_df 标准化
+# ============================================================
+
+def normalize_response_df(
+    response_df: pd.DataFrame,
+    cells_df: Optional[pd.DataFrame] = None,
+    rai_col: str = "RAI",
+) -> pd.DataFrame:
+    """
+    标准化外部传入的 response_df。
+
+    支持两种情况：
+    1. response_df 已经有 cell_id 和 RAI；
+    2. response_df 没有 cell_id，但有 chainage 和 RAI，此时需要 cells_df 映射。
+    """
+    if response_df is None or response_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "cell_id",
+                "RAI",
+                "response_support_count",
+                "response_metrics",
+            ]
+        )
+
+    df = response_df.copy()
+
+    if rai_col not in df.columns:
+        raise ValueError(f"response_df 缺少 RAI 列：{rai_col}")
+
+    df["RAI"] = pd.to_numeric(df[rai_col], errors="coerce")
+
+    if "cell_id" in df.columns:
+        out = df.copy()
+        out["cell_id"] = out["cell_id"].astype(str)
+
+        if "response_support_count" not in out.columns:
+            out["response_support_count"] = 1
+
+        if "response_metrics" not in out.columns:
+            out["response_metrics"] = [{} for _ in range(len(out))]
+
+        # 如果同一个 cell 有多行，取 RAI 最大值，support_count 求和。
+        records = []
+        for cell_id, part in out.groupby("cell_id"):
+            metrics = {}
+            for item in part["response_metrics"].tolist():
+                if isinstance(item, dict):
+                    metrics.update(item)
+
+            records.append(
+                {
+                    "cell_id": str(cell_id),
+                    "RAI": float(pd.to_numeric(part["RAI"], errors="coerce").max()),
+                    "response_support_count": int(
+                        pd.to_numeric(
+                            part["response_support_count"],
+                            errors="coerce",
+                        ).fillna(0).sum()
+                    ),
+                    "response_metrics": _json_clean(metrics),
+                }
+            )
+
+        return pd.DataFrame(records)
+
+    if cells_df is None or cells_df.empty:
+        raise ValueError("response_df 没有 cell_id 时，必须提供 cells_df 进行里程映射。")
+
+    chainage_col = _find_chainage_col(df)
+
+    if chainage_col is None:
+        raise ValueError("response_df 既没有 cell_id，也没有可识别的里程列。")
+
+    df["__chainage"] = pd.to_numeric(df[chainage_col], errors="coerce")
+    df = df.dropna(subset=["__chainage"]).copy()
+
+    records = []
+
+    for _, cell in cells_df.iterrows():
+        cell_id = _safe_str(cell.get("cell_id"))
+        start = _safe_float(cell.get("cell_start"))
+        end = _safe_float(cell.get("cell_end"))
+
+        part = df[
+            (df["__chainage"] >= min(start, end))
+            & (df["__chainage"] < max(start, end))
+        ].copy()
+
+        if part.empty:
+            records.append(
+                {
+                    "cell_id": cell_id,
+                    "RAI": np.nan,
+                    "response_support_count": 0,
+                    "response_metrics": {},
+                }
+            )
+            continue
+
+        rai_values = pd.to_numeric(part["RAI"], errors="coerce").dropna()
+
+        records.append(
+            {
+                "cell_id": cell_id,
+                "RAI": float(rai_values.max()) if not rai_values.empty else np.nan,
+                "response_support_count": int(len(part)),
+                "response_metrics": {
+                    "RAI_mean": float(rai_values.mean()) if not rai_values.empty else None,
+                    "RAI_max": float(rai_values.max()) if not rai_values.empty else None,
+                },
+            }
+        )
+
+    return pd.DataFrame(records)
+
+
+# ============================================================
+# 5. 耦合计算
+# ============================================================
+
+def _compute_grci(grs_geo_base: float, rai: float) -> float:
+    """
+    计算 GRCI。
+
+    公式：
+        GRCI = 0.55 * GRS + 0.35 * RAI + 0.10 * GRS * RAI
+
+    解释：
+        - GRS 表示地质证据基础关注度；
+        - RAI 表示施工响应异常；
+        - GRS * RAI 表示二者同步增强时的耦合项。
+
+    注意：
+        GRCI 是耦合关注度，不是灾害概率。
+    """
+    grs = _clip01(grs_geo_base)
+    response = _clip01(rai)
+
+    value = 0.55 * grs + 0.35 * response + 0.10 * grs * response
+
+    return _clip01(value)
+
+
+def _coupling_type(grs_geo_base: float, rai: float, has_response: bool) -> str:
+    if not has_response:
+        return "no_response_evidence"
+
+    grs_level = _level_from_score(grs_geo_base)
+    rai_level = _level_from_score(rai)
+
+    if grs_level in {"high", "medium"} and rai_level in {"high", "medium"}:
+        return "geo_response_coupled"
+
+    if grs_level in {"high", "medium"} and rai_level in {"low", "none"}:
+        return "geo_dominant_no_obvious_response"
+
+    if grs_level in {"low", "none"} and rai_level in {"high", "medium"}:
+        return "response_anomaly_without_strong_geo_support"
+
+    return "low_coupling"
+
+
+def _coupling_explanation(
+    grs_geo_base: float,
+    rai: Optional[float],
+    has_response: bool,
+    coupling_type: str,
+    main_hazards: List[str],
+) -> str:
+    hazards = "、".join(_dedup_keep_order(main_hazards)[:5]) if main_hazards else "未形成明确主控地质问题"
+
+    if not has_response:
+        return (
+            f"该 cell 具有地质融合结果，主要关注 {hazards}；"
+            "但缺少有效施工响应数据，因此不计算 GRCI，不能据此判断施工响应正常。"
+        )
+
+    grs_level = _level_cn(_level_from_score(grs_geo_base))
+    rai_level = _level_cn(_level_from_score(rai))
+
+    if coupling_type == "geo_response_coupled":
+        return (
+            f"该 cell 地质基础关注度为{grs_level}，施工响应异常指数为{rai_level}，"
+            f"主要地质关注项包括 {hazards}；"
+            "地质不良证据与施工响应异常存在同步增强特征，建议重点复核。"
+        )
+
+    if coupling_type == "geo_dominant_no_obvious_response":
+        return (
+            f"该 cell 地质基础关注度为{grs_level}，但施工响应异常指数为{rai_level}；"
+            f"主要地质关注项包括 {hazards}。"
+            "当前表现为地质证据主导，施工响应尚未明显同步增强，应继续跟踪。"
+        )
+
+    if coupling_type == "response_anomaly_without_strong_geo_support":
+        return (
+            f"该 cell 施工响应异常指数为{rai_level}，但地质基础关注度为{grs_level}；"
+            "建议检查施工参数、设备工况或数据质量，并结合现场揭示复核。"
+        )
+
+    return (
+        f"该 cell 地质基础关注度为{grs_level}，施工响应异常指数为{rai_level}，"
+        "暂未形成明显地质-施工响应耦合增强特征。"
+    )
+
+
+def couple_geo_response(
+    geo_states_df: pd.DataFrame,
+    response_df: Optional[pd.DataFrame] = None,
+    cells_df: Optional[pd.DataFrame] = None,
+    df_plc: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """
+    将 geo_states_df 与 response_df/df_plc 耦合，生成 GRCI。
+
+    推荐用法：
+        1. 如果已有 RAI：
+            coupled_df = couple_geo_response(
+                geo_states_df=geo_states_df,
+                response_df=response_df,
+            )
+
+        2. 如果只有 PLC：
+            coupled_df = couple_geo_response(
+                geo_states_df=geo_states_df,
+                cells_df=cells_df,
+                df_plc=df_plc,
+            )
+
+    注意：
+        没有 response 数据时，GRCI 设为 NaN。
+    """
+    if geo_states_df is None or geo_states_df.empty:
+        return pd.DataFrame(columns=COUPLED_COLUMNS)
+
+    geo = geo_states_df.copy()
+
+    required_cols = {
+        "cell_id",
+        "cell_start",
+        "cell_end",
+        "cell_center",
+        "has_geology_evidence",
+        "GRS_geo_base",
+    }
+    missing_cols = required_cols - set(geo.columns)
+    if missing_cols:
+        raise ValueError(f"geo_states_df 缺少必要字段: {sorted(missing_cols)}")
+
+    geo["cell_id"] = geo["cell_id"].astype(str)
+
+    if response_df is not None and not response_df.empty:
+        resp = normalize_response_df(response_df, cells_df=cells_df)
+    elif df_plc is not None and cells_df is not None:
+        resp = build_response_index_from_plc(
+            df_plc=df_plc,
+            cells_df=cells_df,
+        )
+    else:
+        resp = pd.DataFrame(
+            {
+                "cell_id": geo["cell_id"].astype(str).tolist(),
+                "RAI": [np.nan] * len(geo),
+                "response_support_count": [0] * len(geo),
+                "response_metrics": [{} for _ in range(len(geo))],
+            }
+        )
+
+    if resp is None or resp.empty:
+        resp = pd.DataFrame(
+            {
+                "cell_id": geo["cell_id"].astype(str).tolist(),
+                "RAI": [np.nan] * len(geo),
+                "response_support_count": [0] * len(geo),
+                "response_metrics": [{} for _ in range(len(geo))],
+            }
+        )
+
+    resp = resp.copy()
+    resp["cell_id"] = resp["cell_id"].astype(str)
+
+    merged = geo.merge(
+        resp[["cell_id", "RAI", "response_support_count", "response_metrics"]],
+        on="cell_id",
+        how="left",
+    )
+
+    records = []
+
+    for _, row in merged.iterrows():
+        cell_id = _safe_str(row.get("cell_id"))
+
+        has_geo = bool(row.get("has_geology_evidence"))
+        grs = _clip01(row.get("GRS_geo_base"))
+
+        rai_raw = row.get("RAI")
+        response_support_count = int(_safe_float(row.get("response_support_count"), default=0))
+        has_response = (
+            response_support_count > 0
+            and not _is_missing(rai_raw)
+            and math.isfinite(_safe_float(rai_raw, default=np.nan))
+        )
+
+        if has_geo and has_response:
+            rai = _clip01(rai_raw)
+            grci = _compute_grci(grs, rai)
+            coupling_level = _level_from_score(grci)
+            coupling_type = _coupling_type(grs, rai, has_response=True)
+        else:
+            rai = np.nan if not has_response else _clip01(rai_raw)
+            grci = np.nan
+            coupling_level = "unknown"
+            coupling_type = "no_response_evidence" if not has_response else "no_geo_evidence"
+
+        main_hazards = _as_list(row.get("main_hazards"))
+
+        explanation = _coupling_explanation(
+            grs_geo_base=grs,
+            rai=None if not has_response else rai,
+            has_response=has_response,
+            coupling_type=coupling_type,
+            main_hazards=[str(x) for x in main_hazards],
+        )
+
+        records.append(
+            {
+                "cell_id": cell_id,
+                "cell_start": _safe_float(row.get("cell_start")),
+                "cell_end": _safe_float(row.get("cell_end")),
+                "cell_center": _safe_float(row.get("cell_center")),
+
+                "has_geology_evidence": bool(has_geo),
+                "GRS_geo_base": float(grs),
+                "fused_grade": row.get("fused_grade"),
+                "main_hazards": _json_clean(main_hazards),
+
+                "has_response_evidence": bool(has_response),
+                "RAI": float(rai) if has_response else np.nan,
+                "response_support_count": int(response_support_count),
+                "response_metrics": _json_clean(row.get("response_metrics") or {}),
+
+                "GRCI": float(grci) if math.isfinite(_safe_float(grci, default=np.nan)) else np.nan,
+                "coupling_level": coupling_level,
+                "coupling_type": coupling_type,
+                "coupling_explanation": explanation,
+            }
+        )
+
+    out = pd.DataFrame(records)
+
+    for col in COUPLED_COLUMNS:
+        if col not in out.columns:
+            out[col] = None
+
+    out = out[COUPLED_COLUMNS].copy()
+
+    numeric_cols = [
+        "cell_start",
+        "cell_end",
+        "cell_center",
+        "GRS_geo_base",
+        "RAI",
+        "response_support_count",
+        "GRCI",
+    ]
+    for col in numeric_cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    out["response_support_count"] = out["response_support_count"].fillna(0).astype(int)
+    out["has_geology_evidence"] = out["has_geology_evidence"].astype(bool)
+    out["has_response_evidence"] = out["has_response_evidence"].astype(bool)
+
+    return out
+
+
+# ============================================================
+# 6. 摘要与文本
+# ============================================================
+
+def summarize_coupled_df(coupled_df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    耦合结果摘要。
+    """
+    if coupled_df is None or coupled_df.empty:
+        return {
+            "cell_count": 0,
+            "has_response_cell_count": 0,
+            "computed_grci_cell_count": 0,
+            "coupling_level_counts": {},
+            "coupling_type_counts": {},
+            "GRCI_max": 0.0,
+            "GRCI_mean": 0.0,
+        }
+
+    df = coupled_df.copy()
+
+    has_response = df.get("has_response_evidence", pd.Series(False, index=df.index)).astype(bool)
+    grci = pd.to_numeric(df.get("GRCI", np.nan), errors="coerce")
+
+    return _json_clean(
+        {
+            "cell_count": int(len(df)),
+            "has_response_cell_count": int(has_response.sum()),
+            "computed_grci_cell_count": int(grci.notna().sum()),
+            "coupling_level_counts": df["coupling_level"].value_counts(dropna=False).to_dict()
+            if "coupling_level" in df.columns else {},
+            "coupling_type_counts": df["coupling_type"].value_counts(dropna=False).to_dict()
+            if "coupling_type" in df.columns else {},
+            "GRCI_max": float(grci.max()) if grci.notna().any() else 0.0,
+            "GRCI_mean": float(grci.mean()) if grci.notna().any() else 0.0,
+        }
+    )
+
+
+def coupled_df_to_text(
+    coupled_df: pd.DataFrame,
+    chainage_min: Optional[float] = None,
+    chainage_max: Optional[float] = None,
+    top_k: int = 5,
+) -> str:
+    """
+    将耦合结果转成 prompt 可用短文本。
+    """
+    if coupled_df is None or coupled_df.empty:
+        return "当前范围未形成地质-施工响应耦合结果。"
+
+    df = coupled_df.copy()
+
+    if chainage_min is not None:
+        df = df[df["cell_center"] >= float(chainage_min)].copy()
+
+    if chainage_max is not None:
+        df = df[df["cell_center"] <= float(chainage_max)].copy()
+
+    if df.empty:
+        return "当前指定范围未形成地质-施工响应耦合结果。"
+
+    valid = df[df["GRCI"].notna()].copy()
+
+    if valid.empty:
+        return (
+            "当前指定范围具有地质融合结果，但缺少有效施工响应数据，"
+            "因此未计算 GRCI；不得据此判断施工响应正常。"
+        )
+
+    valid = valid.sort_values("GRCI", ascending=False)
+
+    level_counts = valid["coupling_level"].value_counts().to_dict()
+    type_counts = valid["coupling_type"].value_counts().to_dict()
+
+    lines = [
+        (
+            f"地质-施工响应耦合概览：当前范围共有 {len(df)} 个 cell，"
+            f"其中 {len(valid)} 个 cell 形成 GRCI。"
+            f"耦合等级统计为 {level_counts}，耦合类型统计为 {type_counts}。"
+            "GRCI 表示地质-施工响应耦合关注度，不表示灾害发生概率。"
+        ),
+        "重点耦合 cell 摘要：",
+    ]
+
+    for _, row in valid.head(top_k).iterrows():
+        grci = _safe_float(row.get("GRCI"))
+        grs = _safe_float(row.get("GRS_geo_base"))
+        rai = _safe_float(row.get("RAI"))
+        level = _level_cn(_safe_str(row.get("coupling_level"), default="unknown"))
+
+        lines.append(
+            f"- {row.get('cell_start'):.1f}～{row.get('cell_end'):.1f}m："
+            f"GRCI={grci:.2f}，耦合等级为{level}；"
+            f"GRS_geo_base={grs:.2f}，RAI={rai:.2f}。"
+            f"{row.get('coupling_explanation')}"
+        )
+
+    return "\n".join(lines)
+
+
+================================================================================
+文件地址: text_builder.py
+================================================================================
+
+"""
+geology_v2.text_builder
+
+将 geology_v2 的结构化结果转换为报告可用的短文本。
+
+输入：
+    geo_states_df:
+        fuse_geo_states 输出。
+
+    forward_profile:
+        build_forward_profile 输出。
+
+输出：
+    geo_state_to_text:
+        单个 cell 的简短地质状态描述。
+
+    forward_profile_to_text:
+        前方 0-10m / 10-20m / 20-30m 分段描述。
+
+    build_geology_v2_prompt_block:
+        给 LLM prompt 使用的地质 v2 文本块。
+
+设计原则：
+1. 不生成长篇大论；
+2. 不把 attention_level 写成“灾害概率”；
+3. 不把 has_geology_evidence=False 写成“无风险/无异常”；
+4. 文风保持工程报告风格；
+5. 输出用于 prompt，不直接替代最终报告。
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Any, Dict, Iterable, List, Optional
+
+import pandas as pd
+
+
+# ============================================================
+# 1. 基础工具
+# ============================================================
+
+ATTENTION_LEVEL_CN = {
+    "none": "未形成有效关注等级",
+    "low": "低关注",
+    "medium": "中等关注",
+    "high": "高关注",
+}
+
+UNCERTAINTY_LEVEL_CN = {
+    "none": "低",
+    "low": "低",
+    "medium": "中",
+    "high": "高",
+    "unknown": "未知",
+}
+
+CONFLICT_LEVEL_CN = {
+    "none": "无明显冲突",
+    "low": "低",
+    "medium": "中",
+    "high": "高",
+    "unknown": "未知",
+}
+
+
+def _is_missing(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, (list, dict, tuple, set)):
+        return False
+    try:
+        return bool(pd.isna(value))
+    except Exception:
+        return False
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    if _is_missing(value):
+        return float(default)
+    try:
+        x = float(value)
+        if math.isfinite(x):
+            return float(x)
+    except Exception:
+        pass
+    return float(default)
+
+
+def _safe_str(value: Any, default: str = "") -> str:
+    if _is_missing(value):
+        return default
+    text = str(value).strip()
+    return text if text else default
+
+
+def _as_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple) or isinstance(value, set):
+        return list(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        # 注意：这里不强行 json.loads，避免把中文列表字符串拆坏。
+        return [text]
+    return [value]
+
+
+def _dedup_keep_order(items: Iterable[Any]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+
+    for item in items:
+        if _is_missing(item):
+            continue
+
+        text = str(item).strip()
+        if not text:
+            continue
+
+        if text not in seen:
+            out.append(text)
+            seen.add(text)
+
+    return out
+
+
+def _join_cn(items: Iterable[Any], max_items: int = 5, empty: str = "未形成明确主控项") -> str:
+    values = _dedup_keep_order(items)
+    values = values[:max_items]
+
+    if not values:
+        return empty
+
+    return "、".join(values)
+
+
+def _fmt_score(value: Any, digits: int = 2) -> str:
+    x = _safe_float(value, default=0.0)
+    return f"{x:.{digits}f}"
+
+
+def _level_cn(level: Any, mapping: Dict[str, str], default: str = "未知") -> str:
+    key = _safe_str(level, default="unknown")
+    return mapping.get(key, default)
+
+
+def _normalize_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if _is_missing(value):
+        return False
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "y", "是", "有"}:
+        return True
+    if text in {"false", "0", "no", "n", "否", "无"}:
+        return False
+    try:
+        return bool(value)
+    except Exception:
+        return False
+
+
+# ============================================================
+# 2. 单个 cell 文本
+# ============================================================
+
+def geo_state_to_text(row: Any) -> str:
+    """
+    将 geo_states_df 的单行转成一句短文本。
+
+    参数：
+        row:
+            pandas.Series 或 dict。
+
+    返回：
+        工程报告风格短句。
+    """
+    if row is None:
+        return "该里程单元未形成可用地质状态。"
+
+    if isinstance(row, dict):
+        data = row
+    else:
+        try:
+            data = row.to_dict()
+        except Exception:
+            data = {}
+
+    cell_start = _safe_float(data.get("cell_start"))
+    cell_end = _safe_float(data.get("cell_end"))
+    has_evidence = _normalize_bool(data.get("has_geology_evidence"))
+
+    if not has_evidence:
+        return (
+            f"{cell_start:.1f}～{cell_end:.1f}m 区段未形成有效地质证据覆盖，"
+            "不宜据此判断为低风险。"
+        )
+
+    fused_grade = _safe_str(data.get("fused_grade"), default="未明确")
+    main_hazards = _join_cn(
+        _as_list(data.get("main_hazards")),
+        max_items=5,
+        empty="未形成明确主控地质问题",
+    )
+
+    confidence = _fmt_score(data.get("confidence_score"), digits=2)
+    uncertainty = _level_cn(
+        data.get("uncertainty_level"),
+        UNCERTAINTY_LEVEL_CN,
+        default="未知",
+    )
+    conflict = _level_cn(
+        data.get("conflict_level"),
+        CONFLICT_LEVEL_CN,
+        default="未知",
+    )
+    grs = _fmt_score(data.get("GRS_geo_base"), digits=2)
+
+    return (
+        f"{cell_start:.1f}～{cell_end:.1f}m 区段融合围岩等级以 {fused_grade} 级为主，"
+        f"主要关注 {main_hazards}。"
+        f"地质基础关注度 GRS_geo_base={grs}，"
+        f"融合置信度为 {confidence}，不确定性为{uncertainty}，"
+        f"证据冲突程度为{conflict}。"
+    )
+
+
+def geo_states_to_brief_text(
+    geo_states_df: pd.DataFrame,
+    chainage_min: Optional[float] = None,
+    chainage_max: Optional[float] = None,
+    top_k: int = 5,
+) -> str:
+    """
+    将一段 geo_states_df 摘要成简短文本。
+
+    用途：
+        给 prompt 提供“当前施工范围地质状态概览”。
+
+    注意：
+        top_k 控制输出最多列举几个重点 cell，避免 prompt 过长。
+    """
+    if geo_states_df is None or geo_states_df.empty:
+        return "当前范围未形成可用地质融合状态。"
+
+    df = geo_states_df.copy()
+
+    if chainage_min is not None:
+        df = df[df["cell_center"] >= float(chainage_min)].copy()
+
+    if chainage_max is not None:
+        df = df[df["cell_center"] <= float(chainage_max)].copy()
+
+    if df.empty:
+        return "当前指定范围未形成可用地质融合状态。"
+
+    has_evidence = df.get("has_geology_evidence", pd.Series(False, index=df.index)).astype(bool)
+    evidence_df = df[has_evidence].copy()
+
+    if evidence_df.empty:
+        return "当前指定范围缺少有效地质证据覆盖，不宜据此判断为低风险。"
+
+    grade_counts = {}
+    if "fused_grade" in evidence_df.columns:
+        grade_counts = evidence_df["fused_grade"].dropna().value_counts().to_dict()
+
+    hazard_counter: Dict[str, int] = {}
+    if "main_hazards" in evidence_df.columns:
+        for hazards in evidence_df["main_hazards"].tolist():
+            for item in _as_list(hazards):
+                text = str(item).strip()
+                if not text:
+                    continue
+                hazard_counter[text] = hazard_counter.get(text, 0) + 1
+
+    top_hazards = [
+        name for name, _ in sorted(hazard_counter.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    ]
+
+    grs = pd.to_numeric(evidence_df.get("GRS_geo_base", 0.0), errors="coerce").fillna(0.0)
+    high_count = int((grs >= 0.75).sum())
+    medium_count = int(((grs >= 0.50) & (grs < 0.75)).sum())
+    low_count = int(((grs > 0.0) & (grs < 0.50)).sum())
+
+    grade_text = "、".join([f"{k}级{v}个cell" for k, v in grade_counts.items()]) if grade_counts else "未形成明确等级分布"
+    hazard_text = _join_cn(top_hazards, max_items=5)
+
+    # 选 GRS 高的几个 cell 展示。
+    show = evidence_df.sort_values("GRS_geo_base", ascending=False).head(top_k)
+
+    lines = [
+        (
+            f"地质融合概览：当前范围共有 {len(df)} 个 cell，其中 {len(evidence_df)} 个 cell "
+            f"具有地质证据覆盖；围岩等级分布为 {grade_text}；"
+            f"主要关注 {hazard_text}。"
+        ),
+        (
+            f"按 GRS_geo_base 统计，高关注 cell 数 {high_count}，"
+            f"中等关注 cell 数 {medium_count}，低关注 cell 数 {low_count}。"
+            "该关注等级为地质证据融合结果，不表示灾害发生概率。"
+        ),
+        "重点 cell 摘要：",
+    ]
+
+    for _, row in show.iterrows():
+        lines.append(f"- {geo_state_to_text(row)}")
+
+    return "\n".join(lines)
+
+
+# ============================================================
+# 3. forward_profile 文本
+# ============================================================
+
+def _profile_item_to_text(item: Dict[str, Any]) -> str:
+    range_label = _safe_str(item.get("range_label"), default="未知范围")
+    start_chainage = _safe_float(item.get("start_chainage"))
+    end_chainage = _safe_float(item.get("end_chainage"))
+
+    main_hazards = _join_cn(
+        _as_list(item.get("main_hazards")),
+        max_items=5,
+        empty="未形成明确主控地质问题",
+    )
+
+    fused_grade = _safe_str(item.get("fused_grade"), default="未明确")
+    attention = _level_cn(
+        item.get("attention_level"),
+        ATTENTION_LEVEL_CN,
+        default="未知关注等级",
+    )
+    confidence = _fmt_score(item.get("confidence_score"), digits=2)
+    uncertainty = _level_cn(
+        item.get("uncertainty_level"),
+        UNCERTAINTY_LEVEL_CN,
+        default="未知",
+    )
+
+    supporting_cell_ids = _as_list(item.get("supporting_cell_ids"))
+    supporting_evidence_ids = _as_list(item.get("supporting_evidence_ids"))
+
+    monitoring_focus = _join_cn(
+        _as_list(item.get("monitoring_focus")),
+        max_items=3,
+        empty="结合现场揭示资料复核前方地质条件",
+    )
+
+    support_actions = _join_cn(
+        _as_list(item.get("support_actions")),
+        max_items=3,
+        empty="保持常规监测并关注证据变化",
+    )
+
+    if not supporting_cell_ids:
+        return (
+            f"{range_label}（{start_chainage:.1f}～{end_chainage:.1f}m）："
+            "该分段未形成有效前方地质证据覆盖，不宜据此判断为低风险；"
+            f"建议：{support_actions}。"
+        )
+
+    return (
+        f"{range_label}（{start_chainage:.1f}～{end_chainage:.1f}m）："
+        f"地质关注等级为{attention}，融合围岩等级以 {fused_grade} 级为主，"
+        f"主要关注 {main_hazards}；"
+        f"融合置信度为 {confidence}，不确定性为{uncertainty}。"
+        f"监测重点：{monitoring_focus}。"
+        f"建议措施：{support_actions}。"
+        f"支撑 cell 数 {len(supporting_cell_ids)}，支撑证据数 {len(supporting_evidence_ids)}。"
+    )
+
+
+def forward_profile_to_text(forward_profile: Dict[str, Any]) -> str:
+    """
+    将 forward_profile 转成报告可用短文本。
+
+    注意：
+        不把 attention_level 说成概率。
+    """
+    if not isinstance(forward_profile, dict):
+        return "前方地质剖面未形成有效结构化结果。"
+
+    has_forward_evidence = bool(forward_profile.get("has_forward_evidence"))
+    current_chainage = _safe_float(forward_profile.get("current_chainage"))
+    lookahead_m = _safe_float(forward_profile.get("lookahead_m"), default=30.0)
+    overall_level = _level_cn(
+        forward_profile.get("overall_attention_level"),
+        ATTENTION_LEVEL_CN,
+        default="未知关注等级",
+    )
+
+    profile = forward_profile.get("profile") or []
+
+    if not has_forward_evidence or not profile:
+        return (
+            f"以前方 {lookahead_m:.0f}m 为窗口，当前里程 {current_chainage:.1f}m "
+            "未形成有效前方地质证据覆盖。该结果不应解释为低风险，建议结合后续超前预报、掌子面揭示及施工响应继续核查。"
+        )
+
+    lines = [
+        (
+            f"以前方 {lookahead_m:.0f}m 为窗口，当前里程 {current_chainage:.1f}m "
+            f"的综合地质关注等级为{overall_level}。"
+            "该关注等级基于多源地质证据融合得到，不表示灾害发生概率。"
+        )
+    ]
+
+    for item in profile:
+        if isinstance(item, dict):
+            lines.append(f"- {_profile_item_to_text(item)}")
+
+    return "\n".join(lines)
+
+
+# ============================================================
+# 4. prompt block
+# ============================================================
+
+def build_geology_v2_prompt_block(
+    geo_states_df: Optional[pd.DataFrame] = None,
+    forward_profile: Optional[Dict[str, Any]] = None,
+    include_geo_states_brief: bool = True,
+    include_forward_profile: bool = True,
+    chainage_min: Optional[float] = None,
+    chainage_max: Optional[float] = None,
+) -> str:
+    """
+    构建给 LLM 使用的 geology_v2 prompt block。
+
+    用法：
+        prompt_block = build_geology_v2_prompt_block(
+            geo_states_df=geo_states_df,
+            forward_profile=forward_profile,
+        )
+
+    后续接入旧 prompt 时，只需要把 prompt_block 放到地质分析部分。
+
+    注意：
+        这里不要求 LLM 自己推断风险概率；
+        这里只给结构化融合结果的文字说明。
+    """
+    blocks: List[str] = []
+
+    blocks.append("【地质融合 v2 结果说明】")
+    blocks.append(
+        "以下内容为多源地质证据融合后的结构化结果转写，"
+        "其中“关注等级”表示地质证据融合关注程度，不表示灾害发生概率；"
+        "缺少证据覆盖时，不得表述为“无风险”或“无异常”。"
+    )
+
+    if include_geo_states_brief and geo_states_df is not None:
+        blocks.append("")
+        blocks.append("【当前范围地质状态概览】")
+        blocks.append(
+            geo_states_to_brief_text(
+                geo_states_df=geo_states_df,
+                chainage_min=chainage_min,
+                chainage_max=chainage_max,
+                top_k=5,
+            )
+        )
+
+    if include_forward_profile and forward_profile is not None:
+        blocks.append("")
+        blocks.append("【前方分段地质关注剖面】")
+        blocks.append(forward_profile_to_text(forward_profile))
+
+    return "\n".join(blocks)
+
+
+================================================================================
+文件地址: forward_profile.py
+================================================================================
+
+"""
+geology_v2.forward_profile
+
+基于 geo_states_df 构建前方分段关注剖面。
+
+输入：
+    geo_states_df:
+        fuse_geo_states 输出，每个 cell 一行。
+
+输出：
+    forward_profile dict:
+        {
+            "has_forward_evidence": bool,
+            "current_chainage": float,
+            "lookahead_m": 30.0,
+            "overall_attention_level": "none/low/medium/high",
+            "profile": [...]
+        }
+
+注意：
+1. attention_level 表示关注等级，不是风险概率；
+2. has_forward_evidence=False 只能表示前方窗口缺少地质证据，不能写成无风险；
+3. main_hazards 来自 geo_states_df 的结构化 hazard_scores / main_hazards；
+4. 不生成大段报告文字，只返回结构化数据。
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Any, Dict, Iterable, List, Optional
+
+import pandas as pd
+
+from geology_v2.config import ATTENTION_LEVEL_THRESHOLDS, GRADE_ORDER
+
+
+# ============================================================
+# 1. 基础工具
+# ============================================================
+
+def _is_missing(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, (list, dict, tuple, set)):
+        return False
+    try:
+        return bool(pd.isna(value))
+    except Exception:
+        return False
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    if _is_missing(value):
+        return float(default)
+    try:
+        x = float(value)
+        if math.isfinite(x):
+            return float(x)
+    except Exception:
+        pass
+    return float(default)
+
+
+def _safe_str(value: Any, default: str = "") -> str:
+    if _is_missing(value):
+        return default
+    return str(value).strip()
+
+
+def _as_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple) or isinstance(value, set):
+        return list(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        return [text]
+    return [value]
+
+
+def _dedup_keep_order(items: Iterable[Any]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for item in items:
+        if _is_missing(item):
+            continue
+        text = str(item).strip()
+        if not text:
+            continue
+        if text not in seen:
+            out.append(text)
+            seen.add(text)
+    return out
+
+
+def _json_clean(value: Any) -> Any:
+    if value is None:
+        return None
+
+    if isinstance(value, (str, bool, int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        return value
+
+    if isinstance(value, dict):
+        return {str(k): _json_clean(v) for k, v in value.items()}
+
+    if isinstance(value, (list, tuple, set)):
+        return [_json_clean(v) for v in value]
+
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+
+    return str(value)
+
+
+def _normalize_grade(value: Any) -> Optional[str]:
+    if _is_missing(value):
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    mapping = {
+        "1": "Ⅰ",
+        "2": "Ⅱ",
+        "3": "Ⅲ",
+        "4": "Ⅳ",
+        "5": "Ⅴ",
+        "I": "Ⅰ",
+        "II": "Ⅱ",
+        "III": "Ⅲ",
+        "IV": "Ⅳ",
+        "V": "Ⅴ",
+        "Ⅰ": "Ⅰ",
+        "Ⅱ": "Ⅱ",
+        "Ⅲ": "Ⅲ",
+        "Ⅳ": "Ⅳ",
+        "Ⅴ": "Ⅴ",
+    }
+    return mapping.get(text.upper(), mapping.get(text, text))
+
+
+def _grade_order(grade: Any) -> int:
+    g = _normalize_grade(grade)
+    if g is None:
+        return 0
+    return int(GRADE_ORDER.get(g, 0))
+
+
+# ============================================================
+# 2. attention level
+# ============================================================
+
+def _attention_level(score: float, has_evidence: bool) -> str:
+    """
+    根据 GRS_geo_base 得到关注等级。
+
+    注意：
+    关注等级不是概率。
+    """
+    if not has_evidence:
+        return "none"
+
+    value = _safe_float(score)
+
+    if value >= float(ATTENTION_LEVEL_THRESHOLDS.get("high", 0.75)):
+        return "high"
+    if value >= float(ATTENTION_LEVEL_THRESHOLDS.get("medium", 0.50)):
+        return "medium"
+    if value >= float(ATTENTION_LEVEL_THRESHOLDS.get("low", 0.25)):
+        return "low"
+    return "none"
+
+
+def _overall_attention_level(items: List[Dict[str, Any]]) -> str:
+    if not items:
+        return "none"
+
+    order = {
+        "none": 0,
+        "low": 1,
+        "medium": 2,
+        "high": 3,
+    }
+
+    best = "none"
+    for item in items:
+        level = str(item.get("attention_level", "none"))
+        if order.get(level, 0) > order.get(best, 0):
+            best = level
+
+    return best
+
+
+# ============================================================
+# 3. 分段聚合
+# ============================================================
+
+def _pick_fused_grade(part: pd.DataFrame) -> Optional[str]:
+    """
+    聚合一个 forward range 内的 fused_grade。
+
+    不是简单取最差：
+    1. 优先按 GRS_geo_base 加权支持；
+    2. 取支持度最高等级；
+    3. 若较差等级支持接近，则保守修正。
+    """
+    if part is None or part.empty or "fused_grade" not in part.columns:
+        return None
+
+    work = part.copy()
+    work["__grade"] = work["fused_grade"].map(_normalize_grade)
+    work = work[work["__grade"].notna()].copy()
+
+    if work.empty:
+        return None
+
+    if "GRS_geo_base" in work.columns:
+        work["__weight"] = pd.to_numeric(work["GRS_geo_base"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    else:
+        work["__weight"] = 1.0
+
+    support = work.groupby("__grade")["__weight"].sum().to_dict()
+    if not support:
+        return None
+
+    sorted_items = sorted(
+        support.items(),
+        key=lambda kv: (kv[1], _grade_order(kv[0])),
+        reverse=True,
+    )
+
+    best_grade = sorted_items[0][0]
+    best_support = float(sorted_items[0][1])
+
+    candidates = []
+    for grade, value in sorted_items:
+        if best_support <= 1e-12:
+            continue
+        if float(value) >= 0.75 * best_support:
+            candidates.append(grade)
+
+    if candidates:
+        return max(candidates, key=_grade_order)
+
+    return best_grade
+
+
+def _aggregate_main_hazards(part: pd.DataFrame, top_k: int = 5) -> List[str]:
+    """
+    聚合 main_hazards。
+
+    以 cell 的 GRS_geo_base 和 confidence_score 作为权重，
+    避免低置信 cell 对前方剖面影响过大。
+    """
+    if part is None or part.empty or "main_hazards" not in part.columns:
+        return []
+
+    scores: Dict[str, float] = {}
+
+    for _, row in part.iterrows():
+        grs = _safe_float(row.get("GRS_geo_base"), default=0.0)
+        confidence = _safe_float(row.get("confidence_score"), default=0.5)
+        weight = max(grs, 0.1) * max(confidence, 0.3)
+
+        for hazard in _as_list(row.get("main_hazards")):
+            text = str(hazard).strip()
+            if not text:
+                continue
+            scores[text] = scores.get(text, 0.0) + weight
+
+    items = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    return [name for name, _ in items[:top_k]]
+
+
+def _aggregate_confidence(part: pd.DataFrame) -> float:
+    if part is None or part.empty or "confidence_score" not in part.columns:
+        return 0.0
+
+    values = pd.to_numeric(part["confidence_score"], errors="coerce").fillna(0.0).clip(0, 1)
+
+    if "GRS_geo_base" in part.columns:
+        weights = pd.to_numeric(part["GRS_geo_base"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        if float(weights.sum()) > 1e-12:
+            return float((values * weights).sum() / weights.sum())
+
+    return float(values.mean())
+
+
+def _aggregate_uncertainty(part: pd.DataFrame) -> str:
+    """
+    聚合 uncertainty_level。
+
+    只要有 high，就 high；
+    否则有 medium，就 medium；
+    否则有 low，就 low；
+    否则 none/unknown。
+    """
+    if part is None or part.empty or "uncertainty_level" not in part.columns:
+        return "unknown"
+
+    values = set(part["uncertainty_level"].dropna().astype(str).tolist())
+
+    if "high" in values:
+        return "high"
+    if "medium" in values:
+        return "medium"
+    if "low" in values:
+        return "low"
+    if "none" in values:
+        return "none"
+    return "unknown"
+
+
+def _collect_supporting_ids(part: pd.DataFrame, col: str) -> List[str]:
+    ids: List[Any] = []
+
+    if part is None or part.empty or col not in part.columns:
+        return []
+
+    for value in part[col].tolist():
+        ids.extend(_as_list(value))
+
+    return _dedup_keep_order(ids)
+
+
+# ============================================================
+# 4. 建议字段
+# ============================================================
+
+def _monitoring_focus(main_hazards: List[str], attention_level: str, uncertainty_level: str) -> List[str]:
+    focus: List[str] = []
+
+    hazard_text = "、".join(main_hazards)
+
+    if main_hazards:
+        focus.append(f"重点复核{hazard_text}相关地质迹象")
+    else:
+        focus.append("结合掌子面揭示资料复核前方地质条件")
+
+    if any("水" in h for h in main_hazards):
+        focus.append("加强掌子面及拱墙出水、渗水变化观察")
+
+    if any(("掉块" in h or "坍塌" in h or "破碎" in h or "裂隙" in h) for h in main_hazards):
+        focus.append("关注围岩破碎、裂隙发育及局部掉块迹象")
+
+    if uncertainty_level in {"medium", "high", "unknown"}:
+        focus.append("关注多源证据不确定性，必要时结合现场揭示进行核查")
+
+    if attention_level == "high":
+        focus.append("建议施工参数和支护响应联动跟踪")
+
+    return _dedup_keep_order(focus)
+
+
+def _support_actions(main_hazards: List[str], attention_level: str, uncertainty_level: str) -> List[str]:
+    actions: List[str] = []
+
+    if attention_level == "high":
+        actions.append("施工前进行重点技术交底，保持审慎掘进")
+    elif attention_level == "medium":
+        actions.append("按中等关注区段进行过程跟踪")
+    elif attention_level == "low":
+        actions.append("保持常规监测并关注证据变化")
+    else:
+        actions.append("前方直接证据不足时，不宜作风险降低判断")
+
+    if any("水" in h for h in main_hazards):
+        actions.append("提前检查排水、超前探测及应急处置条件")
+
+    if any(("掉块" in h or "坍塌" in h or "破碎" in h) for h in main_hazards):
+        actions.append("关注支护时效，必要时加强超前支护或初期支护参数复核")
+
+    if uncertainty_level in {"medium", "high", "unknown"}:
+        actions.append("对冲突或不确定证据进行人工复核，不将缺证解释为低风险")
+
+    return _dedup_keep_order(actions)
+
+
+# ============================================================
+# 5. 单个 forward range
+# ============================================================
+
+def _build_one_profile_item(
+    geo_states_df: pd.DataFrame,
+    range_label: str,
+    start_chainage: float,
+    end_chainage: float,
+) -> Dict[str, Any]:
+    start = min(float(start_chainage), float(end_chainage))
+    end = max(float(start_chainage), float(end_chainage))
+
+    part = geo_states_df[
+        (geo_states_df["cell_center"] >= start)
+        & (geo_states_df["cell_center"] < end)
+    ].copy()
+
+    if part.empty:
+        return {
+            "range_label": range_label,
+            "start_chainage": float(start_chainage),
+            "end_chainage": float(end_chainage),
+            "main_hazards": [],
+            "fused_grade": None,
+            "attention_level": "none",
+            "confidence_score": 0.0,
+            "uncertainty_level": "unknown",
+            "monitoring_focus": ["该分段缺少可用前方地质证据，不宜据此判断为低风险"],
+            "support_actions": ["建议结合现场揭示和后续预报资料补充核查"],
+            "supporting_cell_ids": [],
+            "supporting_evidence_ids": [],
+        }
+
+    has_evidence_series = part.get("has_geology_evidence", pd.Series(False, index=part.index)).astype(bool)
+    has_evidence = bool(has_evidence_series.any())
+
+    evidence_part = part[has_evidence_series].copy()
+
+    if evidence_part.empty:
+        return {
+            "range_label": range_label,
+            "start_chainage": float(start_chainage),
+            "end_chainage": float(end_chainage),
+            "main_hazards": [],
+            "fused_grade": None,
+            "attention_level": "none",
+            "confidence_score": 0.0,
+            "uncertainty_level": "unknown",
+            "monitoring_focus": ["该分段未形成有效地质证据覆盖，不宜据此判断为低风险"],
+            "support_actions": ["建议结合现场揭示和后续预报资料补充核查"],
+            "supporting_cell_ids": [],
+            "supporting_evidence_ids": [],
+        }
+
+    grs = pd.to_numeric(evidence_part.get("GRS_geo_base", 0.0), errors="coerce").fillna(0.0).clip(0, 1)
+    score = float(grs.max()) if len(grs) else 0.0
+
+    attention_level = _attention_level(score, has_evidence=has_evidence)
+    main_hazards = _aggregate_main_hazards(evidence_part)
+    fused_grade = _pick_fused_grade(evidence_part)
+    confidence_score = _aggregate_confidence(evidence_part)
+    uncertainty_level = _aggregate_uncertainty(evidence_part)
+
+    return {
+        "range_label": range_label,
+        "start_chainage": float(start_chainage),
+        "end_chainage": float(end_chainage),
+        "main_hazards": _json_clean(main_hazards),
+        "fused_grade": fused_grade,
+        "attention_level": attention_level,
+        "confidence_score": float(confidence_score),
+        "uncertainty_level": uncertainty_level,
+        "monitoring_focus": _json_clean(
+            _monitoring_focus(main_hazards, attention_level, uncertainty_level)
+        ),
+        "support_actions": _json_clean(
+            _support_actions(main_hazards, attention_level, uncertainty_level)
+        ),
+        "supporting_cell_ids": _json_clean(
+            _dedup_keep_order(evidence_part["cell_id"].tolist())
+            if "cell_id" in evidence_part.columns else []
+        ),
+        "supporting_evidence_ids": _json_clean(
+            _collect_supporting_ids(evidence_part, "supporting_evidence_ids")
+        ),
+    }
+
+
+# ============================================================
+# 6. 主入口
+# ============================================================
+
+def build_forward_profile(
+    geo_states_df: pd.DataFrame,
+    current_chainage: float,
+    lookahead_m: float = 30.0,
+    step_m: float = 10.0,
+    advance_direction: int = 1,
+) -> dict:
+    """
+    构建前方分段地质关注剖面。
+
+    参数：
+        geo_states_df:
+            fuse_geo_states 输出。
+
+        current_chainage:
+            当前掌子面或当前掘进里程。
+
+        lookahead_m:
+            前方查看距离，默认 30m。
+
+        step_m:
+            分段步长，默认 10m。
+
+        advance_direction:
+            掘进方向。
+            1 表示里程增大方向；
+            -1 表示里程减小方向。
+
+    返回：
+        {
+            "has_forward_evidence": bool,
+            "current_chainage": float,
+            "lookahead_m": 30.0,
+            "overall_attention_level": "none/low/medium/high",
+            "profile": [...]
+        }
+    """
+    current = _safe_float(current_chainage)
+    lookahead = abs(_safe_float(lookahead_m, default=30.0))
+    step = abs(_safe_float(step_m, default=10.0))
+
+    if step <= 0:
+        step = 10.0
+
+    direction = 1 if int(advance_direction or 1) >= 0 else -1
+
+    if geo_states_df is None or geo_states_df.empty:
+        return {
+            "has_forward_evidence": False,
+            "current_chainage": current,
+            "lookahead_m": float(lookahead),
+            "overall_attention_level": "none",
+            "profile": [],
+        }
+
+    df = geo_states_df.copy()
+
+    required_cols = {"cell_id", "cell_center", "has_geology_evidence"}
+    missing_cols = required_cols - set(df.columns)
+    if missing_cols:
+        raise ValueError(f"geo_states_df missing required columns: {sorted(missing_cols)}")
+
+    df["cell_center"] = pd.to_numeric(df["cell_center"], errors="coerce")
+    df = df.dropna(subset=["cell_center"]).copy()
+
+    profile: List[Dict[str, Any]] = []
+
+    distance_start = 0.0
+    while distance_start < lookahead - 1e-9:
+        distance_end = min(distance_start + step, lookahead)
+
+        if direction > 0:
+            start_chainage = current + distance_start
+            end_chainage = current + distance_end
+        else:
+            start_chainage = current - distance_start
+            end_chainage = current - distance_end
+
+        range_label = f"{int(distance_start)}-{int(distance_end)}m"
+
+        item = _build_one_profile_item(
+            geo_states_df=df,
+            range_label=range_label,
+            start_chainage=start_chainage,
+            end_chainage=end_chainage,
+        )
+        profile.append(item)
+
+        distance_start = distance_end
+
+    has_forward_evidence = any(bool(item.get("supporting_cell_ids")) for item in profile)
+    overall_level = _overall_attention_level(profile)
+
+    return _json_clean(
+        {
+            "has_forward_evidence": bool(has_forward_evidence),
+            "current_chainage": float(current),
+            "lookahead_m": float(lookahead),
+            "overall_attention_level": overall_level,
+            "profile": profile,
+        }
+    )
+
+
+def summarize_forward_profile(forward_profile: dict) -> dict:
+    """
+    调试用摘要。
+    """
+    if not isinstance(forward_profile, dict):
+        return {
+            "has_forward_evidence": False,
+            "overall_attention_level": "none",
+            "profile_count": 0,
+            "range_levels": {},
+        }
+
+    profile = forward_profile.get("profile") or []
+    range_levels = {
+        item.get("range_label"): item.get("attention_level")
+        for item in profile
+        if isinstance(item, dict)
+    }
+
+    return {
+        "has_forward_evidence": bool(forward_profile.get("has_forward_evidence")),
+        "overall_attention_level": forward_profile.get("overall_attention_level", "none"),
+        "profile_count": len(profile),
+        "range_levels": range_levels,
+    }
+
+
+================================================================================
+文件地址: schemas.py
+================================================================================
+
+"""
+geology_v2.schemas
+
+地质融合 v2 的结构化数据模型。
+
+说明：
+1. 这里用 dataclass，避免引入 pydantic 依赖；
+2. 每个结构都提供 to_dict()，方便后续转成 DataFrame 或 JSON；
+3. 字段设计保持宽松，便于兼容旧 evidence_df；
+4. “无证据”只表达 has_geology_evidence=False，不表达“无风险”。
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, List, Optional
+
+
+JsonDict = Dict[str, Any]
+
+
+def _clean_dict(obj: JsonDict) -> JsonDict:
+    """
+    Convert dataclass dict into a JSON-friendly plain dict.
+
+    这里只做轻量清洗：
+    - 保留 None；
+    - 保留 list/dict；
+    - 不做 pandas/numpy 类型处理，后续统一在 serialization 层处理。
+    """
+    return dict(obj)
+
+
+@dataclass
+class GeoEvidence:
+    """
+    标准化后的地质证据。
+
+    它对应第二阶段 normalize_evidence_df 输出中的一条证据。
+    注意：
+    - source_type_raw 保留旧 evidence_df 原始来源；
+    - source_type_norm 是 v2 标准来源；
+    - evidence_role 表示 observed / prediction / interpreted / background；
+    - spatial_type 表示 point / anomaly_point / segment / overview / background；
+    - evidence_strength 不是风险概率，只是融合权重的一部分。
+    """
+
+    evidence_id: str
+    report_id: Optional[str] = None
+
+    source_type_raw: Optional[str] = None
+    source_type_norm: str = "unknown"
+    evidence_role: str = "unknown"
+    source_level: Optional[str] = None
+    spatial_type: str = "unknown"
+
+    start_chainage: Optional[float] = None
+    end_chainage: Optional[float] = None
+    center_chainage: Optional[float] = None
+    face_chainage: Optional[float] = None
+
+    grade: Optional[str] = None
+    lithology: Optional[str] = None
+    weathering: Optional[str] = None
+    joint_development: Optional[str] = None
+    rock_mass_state: Optional[str] = None
+    stability: Optional[str] = None
+
+    water_flag: int = 0
+    water_type: Optional[str] = None
+    collapse_flag: int = 0
+    deformation_flag: int = 0
+
+    hazard_tags: List[str] = field(default_factory=list)
+
+    source_reliability: float = 0.0
+    evidence_strength: float = 0.0
+    confidence_text: str = "unknown"
+
+    raw_text: Optional[str] = None
+    attrs_obj: JsonDict = field(default_factory=dict)
+    parse_warnings: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> JsonDict:
+        return _clean_dict(asdict(self))
+
+
+@dataclass
+class GeoCell:
+    """
+    沿里程方向构建的融合单元。
+
+    一个 cell 通常对应 10m。
+    后续所有 evidence 会先投影到 cell，再进行融合。
+    """
+
+    cell_id: str
+    cell_start: float
+    cell_end: float
+    cell_center: float
+    cell_length: float = 10.0
+
+    def to_dict(self) -> JsonDict:
+        return _clean_dict(asdict(self))
+
+
+@dataclass
+class CellEvidence:
+    """
+    evidence 投影到 cell 后的关系。
+
+    它不是原始证据，而是“某条证据对某个 cell 的影响关系”。
+    effective_weight = spatial_weight * source_reliability * evidence_strength
+    """
+
+    cell_id: str
+    evidence_id: str
+
+    source_type_norm: str = "unknown"
+    spatial_type: str = "unknown"
+
+    distance_m: Optional[float] = None
+    spatial_weight: float = 0.0
+    source_reliability: float = 0.0
+    evidence_strength: float = 0.0
+    effective_weight: float = 0.0
+
+    def to_dict(self) -> JsonDict:
+        return _clean_dict(asdict(self))
+
+
+@dataclass
+class GeoState:
+    """
+    每个 cell 融合后的地质状态。
+
+    这是第四阶段 fuse_geo_states 的目标结构。
+    注意：
+    - has_geology_evidence=False 只表示没有可用地质证据；
+    - fused_grade 是融合结果，不应简单理解为“最差等级”；
+    - hazard_scores 是结构化分数，不再只拼 hazard 字符串；
+    - conflict_level 用于表达多源证据冲突。
+    """
+
+    cell_id: str
+    cell_start: float
+    cell_end: float
+    cell_center: float
+
+    has_geology_evidence: bool = False
+
+    fused_grade: Optional[str] = None
+    grade_distribution: JsonDict = field(default_factory=dict)
+
+    hazard_scores: JsonDict = field(default_factory=dict)
+    main_hazards: List[str] = field(default_factory=list)
+
+    water_score: float = 0.0
+    collapse_score: float = 0.0
+    deformation_score: float = 0.0
+
+    source_support: JsonDict = field(default_factory=dict)
+    source_type_count: int = 0
+    evidence_count: int = 0
+
+    confidence_score: float = 0.0
+    uncertainty_level: str = "unknown"
+
+    conflict_level: str = "none"
+    conflict_reasons: List[str] = field(default_factory=list)
+
+    supporting_evidence_ids: List[str] = field(default_factory=list)
+
+    # 预留给第七阶段传递纯地质基础关注度。
+    GRS_geo_base: Optional[float] = None
+
+    def to_dict(self) -> JsonDict:
+        return _clean_dict(asdict(self))
+
+
+@dataclass
+class ForwardProfileItem:
+    """
+    前方剖面中的一个分段提示。
+
+    例如：
+    - 0-10m
+    - 10-20m
+    - 20-30m
+
+    注意：
+    attention_level 表示关注等级，不表示灾害概率。
+    """
+
+    range_label: str
+
+    start_chainage: float
+    end_chainage: float
+
+    main_hazards: List[str] = field(default_factory=list)
+    fused_grade: Optional[str] = None
+
+    attention_level: str = "none"
+    confidence_score: float = 0.0
+    uncertainty_level: str = "unknown"
+
+    monitoring_focus: List[str] = field(default_factory=list)
+    support_actions: List[str] = field(default_factory=list)
+
+    supporting_cell_ids: List[str] = field(default_factory=list)
+    supporting_evidence_ids: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> JsonDict:
+        return _clean_dict(asdict(self))
+
+
+def dataclass_to_dict(obj: Any) -> JsonDict:
+    """
+    通用 dataclass 转 dict 工具。
+    """
+    if hasattr(obj, "to_dict") and callable(obj.to_dict):
+        return obj.to_dict()
+    if hasattr(obj, "__dataclass_fields__"):
+        return _clean_dict(asdict(obj))
+    if isinstance(obj, dict):
+        return dict(obj)
+    raise TypeError(f"Unsupported object type: {type(obj)}")
+
+
+================================================================================
+文件地址: cell_builder.py
+================================================================================
+
+"""
+geology_v2.cell_builder
+
+构建沿里程方向的 cell。
+
+本模块只负责根据 PLC 数据或给定 extra_min / extra_max 构建里程 cell，
+不做证据投影、不做地质融合。
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Any, Optional
+
+import pandas as pd
+
+from geology_v2.config import DEFAULT_CELL_LENGTH_M
+
+
+CHAINAGE_COLUMN_CANDIDATES = [
+    "chainage",
+    "里程",
+    "当前里程",
+    "桩号",
+    "推进里程",
+    "mile",
+    "mileage",
+]
+
+
+def _find_chainage_col(df: pd.DataFrame) -> Optional[str]:
+    """
+    自动寻找 PLC 数据中的里程列。
+    """
+    if df is None or df.empty:
+        return None
+
+    lower_map = {str(col).strip().lower(): col for col in df.columns}
+
+    for name in CHAINAGE_COLUMN_CANDIDATES:
+        key = name.lower()
+        if key in lower_map:
+            return lower_map[key]
+
+    for col in df.columns:
+        col_text = str(col).strip().lower()
+        if "chainage" in col_text or "里程" in col_text or "桩号" in col_text:
+            return col
+
+    return None
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        x = float(value)
+        if math.isfinite(x):
+            return x
+    except Exception:
+        return None
+    return None
+
+
+def _number_key(value: Any) -> str:
+    """
+    生成稳定的 cell_id 数字片段。
+    """
+    try:
+        x = float(value)
+        if math.isfinite(x) and x.is_integer():
+            return str(int(x))
+        return f"{x:.3f}".rstrip("0").rstrip(".")
+    except Exception:
+        return str(value)
+
+
+def _build_cell_id(cell_start: float, cell_end: float) -> str:
+    return f"cell_{_number_key(cell_start)}_{_number_key(cell_end)}"
+
+
+def build_chainage_cells(
+    df_plc: pd.DataFrame,
+    cell_length: float = DEFAULT_CELL_LENGTH_M,
+    extra_min: Optional[float] = None,
+    extra_max: Optional[float] = None,
+) -> pd.DataFrame:
+    """
+    根据 PLC 数据构建沿里程方向的 cell。
+
+    参数：
+        df_plc:
+            PLC 原始数据或已处理数据，需要包含里程列。
+        cell_length:
+            cell 长度，默认 10m。
+        extra_min:
+            可选的额外最小里程。
+            用于把前方预报范围也纳入 cell。
+        extra_max:
+            可选的额外最大里程。
+            用于把前方预报范围也纳入 cell。
+
+    输出字段：
+        cell_id
+        cell_start
+        cell_end
+        cell_center
+        cell_length
+
+    注意：
+        如果 df_plc 没有里程列，但 extra_min / extra_max 都给了，
+        仍然可以构建 cell。
+    """
+    if cell_length is None or float(cell_length) <= 0:
+        cell_length = DEFAULT_CELL_LENGTH_M
+
+    cell_length = float(cell_length)
+
+    values = []
+
+    if df_plc is not None and not df_plc.empty:
+        chainage_col = _find_chainage_col(df_plc)
+        if chainage_col is not None:
+            series = pd.to_numeric(df_plc[chainage_col], errors="coerce").dropna()
+            values.extend(series.astype(float).tolist())
+
+    extra_min_value = _safe_float(extra_min)
+    extra_max_value = _safe_float(extra_max)
+
+    if extra_min_value is not None:
+        values.append(extra_min_value)
+    if extra_max_value is not None:
+        values.append(extra_max_value)
+
+    if not values:
+        return pd.DataFrame(
+            columns=[
+                "cell_id",
+                "cell_start",
+                "cell_end",
+                "cell_center",
+                "cell_length",
+            ]
+        )
+
+    min_chainage = min(values)
+    max_chainage = max(values)
+
+    # 向 cell_length 对齐，避免从奇怪的小数点开始切 cell。
+    start_aligned = math.floor(min_chainage / cell_length) * cell_length
+    end_aligned = math.ceil(max_chainage / cell_length) * cell_length
+
+    # 如果刚好落在边界，也至少生成一个 cell。
+    if end_aligned <= start_aligned:
+        end_aligned = start_aligned + cell_length
+
+    records = []
+    current = start_aligned
+
+    # 加一个很小的容差，避免浮点误差导致最后一个 cell 丢失。
+    eps = 1e-9
+    while current < end_aligned - eps:
+        cell_start = float(current)
+        cell_end = float(current + cell_length)
+        cell_center = float((cell_start + cell_end) / 2.0)
+
+        records.append(
+            {
+                "cell_id": _build_cell_id(cell_start, cell_end),
+                "cell_start": cell_start,
+                "cell_end": cell_end,
+                "cell_center": cell_center,
+                "cell_length": cell_length,
+            }
+        )
+
+        current += cell_length
+
+    return pd.DataFrame(records)
+
+
+================================================================================
+文件地址: init.py
+================================================================================
+
+"""
+geology_v2
+
+地质融合 v2 模块。
+
+设计目标：
+1. 与旧 geology / analysis 逻辑并行，不直接破坏旧接口；
+2. 将证据标准化、空间投影、多源融合、前方剖面、报告文字生成逐步拆开；
+3. 分析函数优先返回结构化数据，不在分析阶段生成大段自然语言；
+4. GRCI 只表示“地质-施工响应耦合关注度”，不表示灾害概率。
+"""
+
+from geology_v2.schemas import (
+    GeoEvidence,
+    GeoCell,
+    CellEvidence,
+    GeoState,
+    ForwardProfileItem,
+)
+
+__all__ = [
+    "GeoEvidence",
+    "GeoCell",
+    "CellEvidence",
+    "GeoState",
+    "ForwardProfileItem",
+]
+
+
+================================================================================
+文件地址: report_context_builder.py
+================================================================================
+
+"""
+geology_v2.report_context_builder
+
+统一构造 geology_v2 报告上下文。
+
+输入：
+    geo_states_df:
+        fuse_geo_states 输出。
+
+    forward_profile:
+        build_forward_profile 输出。
+
+    coupled_df:
+        couple_geo_response 输出，可为空。
+
+    operation_context / gas_context / face_context:
+        后续接入主流程时可传入已有结构化结果。
+        当前阶段允许为空。
+
+输出：
+    geology_v2_report_context:
+        {
+            "ok": bool,
+            "version": "geology_v2",
+            "metadata": {...},
+            "texts": {
+                "geo_brief_text": "...",
+                "forward_text": "...",
+                "coupling_text": "...",
+                "prompt_block": "..."
+            },
+            "sections": {
+                "current_face": {...},
+                "excavated_review": {...},
+                "forward_profile": {...},
+                "coupling": {...},
+                "conclusion": {...}
+            },
+            "data_summary": {...},
+            "warnings": [...]
+        }
+
+设计原则：
+1. 分析函数仍然返回结构化数据；
+2. 长文本统一交给 report_renderer.py 生成；
+3. 这里只整理上下文和短文本；
+4. 不把 GRCI 写成灾害概率；
+5. 不把无证据写成无风险；
+6. 不混写当前掌子面、已开挖区段、前方预报。
+"""
+
+from __future__ import annotations
+
+import math
+from datetime import datetime
+from typing import Any, Dict, Iterable, List, Optional
+
+import numpy as np
+import pandas as pd
+
+from geology_v2.text_builder import (
+    build_geology_v2_prompt_block,
+    forward_profile_to_text,
+    geo_states_to_brief_text,
+)
+from geology_v2.coupling_adapter import (
+    coupled_df_to_text,
+    summarize_coupled_df,
+)
+from geology_v2.fusion_engine import summarize_geo_states
+from geology_v2.forward_profile import summarize_forward_profile
+
+
+REPORT_CONTEXT_VERSION = "geology_v2_report_context_v1"
+
+
+# ============================================================
+# 1. 基础工具
+# ============================================================
+
+def _is_missing(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, (list, dict, tuple, set)):
+        return False
+    try:
+        return bool(pd.isna(value))
+    except Exception:
+        return False
+
+
+def _safe_str(value: Any, default: str = "") -> str:
+    if _is_missing(value):
+        return default
+    text = str(value).strip()
+    return text if text else default
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    if _is_missing(value):
+        return float(default)
+    try:
+        x = float(value)
+        if math.isfinite(x):
+            return float(x)
+    except Exception:
+        pass
+    return float(default)
+
+
+def _as_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    return {}
+
+
+def _as_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple) or isinstance(value, set):
+        return list(value)
+    return [value]
+
+
+def _dedup_keep_order(items: Iterable[Any]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+
+    for item in items:
+        if _is_missing(item):
+            continue
+        text = str(item).strip()
+        if not text:
+            continue
+        if text not in seen:
+            out.append(text)
+            seen.add(text)
+
+    return out
+
+
+def _json_clean(value: Any) -> Any:
+    if value is None:
+        return None
+
+    if isinstance(value, (str, bool, int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        return value
+
+    if isinstance(value, (np.integer,)):
+        return int(value)
+
+    if isinstance(value, (np.floating,)):
+        x = float(value)
+        return x if math.isfinite(x) else None
+
+    if isinstance(value, dict):
+        return {str(k): _json_clean(v) for k, v in value.items()}
+
+    if isinstance(value, (list, tuple, set)):
+        return [_json_clean(v) for v in value]
+
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+
+    return str(value)
+
+
+def _df_preview_records(df: Optional[pd.DataFrame], max_rows: int = 20) -> List[Dict[str, Any]]:
+    if df is None or df.empty:
+        return []
+
+    return _json_clean(df.head(max_rows).to_dict(orient="records"))
+
+
+def _chainage_range_text(chainage_min: Optional[float], chainage_max: Optional[float]) -> str:
+    if chainage_min is None or chainage_max is None:
+        return "未指定"
+    return f"{float(chainage_min):.1f}～{float(chainage_max):.1f}m"
+
+
+# ============================================================
+# 2. section 构造
+# ============================================================
+
+def _build_current_face_section(
+    face_context: Optional[Dict[str, Any]],
+    current_chainage: Optional[float],
+) -> Dict[str, Any]:
+    face_context = _as_dict(face_context)
+
+    text = _safe_str(
+        face_context.get("text")
+        or face_context.get("face_geo_text")
+        or face_context.get("description"),
+        default="当前掌子面描述暂未形成有效结构化结果。",
+    )
+
+    has_face_evidence = bool(face_context.get("has_face_evidence", bool(face_context)))
+
+    return {
+        "title": "当前掌子面描述",
+        "spatial_scope": "current_face",
+        "current_chainage": current_chainage,
+        "has_face_evidence": has_face_evidence,
+        "text": text,
+        "notes": [
+            "当前掌子面描述只对应当前揭示位置，不替代前方预报。",
+        ],
+    }
+
+
+def _build_excavated_review_section(
+    geo_states_df: Optional[pd.DataFrame],
+    geo_brief_text: str,
+    chainage_min: Optional[float],
+    chainage_max: Optional[float],
+) -> Dict[str, Any]:
+    has_geo_states = bool(geo_states_df is not None and not geo_states_df.empty)
+
+    return {
+        "title": "已开挖区段地质复核",
+        "spatial_scope": "excavated_or_selected_range",
+        "chainage_range": {
+            "start": chainage_min,
+            "end": chainage_max,
+            "text": _chainage_range_text(chainage_min, chainage_max),
+        },
+        "has_geo_states": has_geo_states,
+        "text": geo_brief_text,
+        "notes": [
+            "已开挖区段地质复核属于回顾性或指定范围复核，不应写成尚未开挖的前方风险。",
+        ],
+    }
+
+
+def _build_forward_section(
+    forward_profile: Optional[Dict[str, Any]],
+    forward_text: str,
+) -> Dict[str, Any]:
+    forward_profile = _as_dict(forward_profile)
+    profile = _as_list(forward_profile.get("profile"))
+
+    return {
+        "title": "前方30m分段提示",
+        "spatial_scope": "forward_lookahead",
+        "has_forward_evidence": bool(forward_profile.get("has_forward_evidence")),
+        "current_chainage": forward_profile.get("current_chainage"),
+        "lookahead_m": forward_profile.get("lookahead_m"),
+        "overall_attention_level": forward_profile.get("overall_attention_level"),
+        "profile_count": len(profile),
+        "profile": _json_clean(profile),
+        "text": forward_text,
+        "notes": [
+            "前方分段提示来自 forward_profile，不应与已开挖区段复核混写。",
+            "缺少前方证据时只能说明证据不足，不得写成无风险。",
+        ],
+    }
+
+
+def _build_coupling_section(
+    coupled_df: Optional[pd.DataFrame],
+    coupling_text: str,
+    chainage_min: Optional[float],
+    chainage_max: Optional[float],
+) -> Dict[str, Any]:
+    has_coupling = bool(coupled_df is not None and not coupled_df.empty)
+
+    summary = summarize_coupled_df(coupled_df) if has_coupling else {
+        "cell_count": 0,
+        "has_response_cell_count": 0,
+        "computed_grci_cell_count": 0,
+        "coupling_level_counts": {},
+        "coupling_type_counts": {},
+        "GRCI_max": 0.0,
+        "GRCI_mean": 0.0,
+    }
+
+    return {
+        "title": "地质-施工响应耦合分析",
+        "spatial_scope": "excavated_or_selected_range",
+        "chainage_range": {
+            "start": chainage_min,
+            "end": chainage_max,
+            "text": _chainage_range_text(chainage_min, chainage_max),
+        },
+        "has_coupling": has_coupling,
+        "summary": _json_clean(summary),
+        "text": coupling_text,
+        "notes": [
+            "GRCI 表示地质-施工响应耦合关注度，不表示灾害发生概率。",
+            "缺少施工响应数据时，不得据此判断施工响应正常。",
+        ],
+    }
+
+
+def _build_operation_section(operation_context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    operation_context = _as_dict(operation_context)
+
+    text = _safe_str(
+        operation_context.get("text")
+        or operation_context.get("operation_text")
+        or operation_context.get("summary_text"),
+        default="本阶段未接入基础工况结构化上下文。",
+    )
+
+    return {
+        "title": "基础工况上下文",
+        "spatial_scope": "time_window",
+        "has_operation_context": bool(operation_context),
+        "text": text,
+        "data": _json_clean(operation_context),
+    }
+
+
+def _build_gas_section(gas_context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    gas_context = _as_dict(gas_context)
+
+    text = _safe_str(
+        gas_context.get("text")
+        or gas_context.get("gas_text")
+        or gas_context.get("summary_text"),
+        default="本阶段未接入气体监测结构化上下文。",
+    )
+
+    return {
+        "title": "气体监测上下文",
+        "spatial_scope": "time_window",
+        "has_gas_context": bool(gas_context),
+        "text": text,
+        "data": _json_clean(gas_context),
+    }
+
+
+def _build_conclusion_section(
+    forward_profile: Optional[Dict[str, Any]],
+    coupled_df: Optional[pd.DataFrame],
+    geo_states_df: Optional[pd.DataFrame],
+) -> Dict[str, Any]:
+    warnings: List[str] = []
+
+    if geo_states_df is None or geo_states_df.empty:
+        warnings.append("地质融合状态为空，不能给出地质关注降低判断。")
+
+    fp = _as_dict(forward_profile)
+    if not fp.get("has_forward_evidence"):
+        warnings.append("前方窗口缺少有效地质证据，不能表述为前方无风险。")
+
+    if coupled_df is None or coupled_df.empty:
+        warnings.append("缺少地质-施工响应耦合结果，不能判断施工响应是否同步异常。")
+    else:
+        valid_grci = pd.to_numeric(coupled_df.get("GRCI"), errors="coerce")
+        if not valid_grci.notna().any():
+            warnings.append("GRCI 未形成有效值，多数情况下是施工响应数据缺失。")
+
+    if not warnings:
+        warnings.append("结论应基于结构化证据审慎表述，不得扩展到未覆盖时段或未覆盖里程。")
+
+    return {
+        "title": "结论与建议约束",
+        "spatial_scope": "report_level",
+        "text": "结论应综合地质融合、前方分段剖面、施工响应耦合和气体监测结果形成。",
+        "constraints": warnings,
+    }
+
+
+# ============================================================
+# 3. 主入口
+# ============================================================
+
+def build_geology_v2_report_context(
+    geo_states_df: Optional[pd.DataFrame] = None,
+    forward_profile: Optional[Dict[str, Any]] = None,
+    coupled_df: Optional[pd.DataFrame] = None,
+    operation_context: Optional[Dict[str, Any]] = None,
+    gas_context: Optional[Dict[str, Any]] = None,
+    face_context: Optional[Dict[str, Any]] = None,
+    current_chainage: Optional[float] = None,
+    chainage_min: Optional[float] = None,
+    chainage_max: Optional[float] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    include_data_preview: bool = True,
+) -> Dict[str, Any]:
+    """
+    构建 geology_v2_report_context。
+
+    当前阶段主要用于测试：
+        geo_brief_text + forward_text + coupling_text -> report_context
+
+    后续接主流程时：
+        operation_context / gas_context / face_context 可以从 analyze_tbm_data 的结构化结果传入。
+    """
+    warnings: List[str] = []
+    metadata = _as_dict(metadata)
+
+    if geo_states_df is None or geo_states_df.empty:
+        warnings.append("geo_states_df 为空，当前范围未形成地质融合状态。")
+
+    if not isinstance(forward_profile, dict):
+        warnings.append("forward_profile 为空或格式不正确，前方分段提示不可用。")
+
+    if coupled_df is None or coupled_df.empty:
+        warnings.append("coupled_df 为空，地质-施工响应耦合文本不可用。")
+
+    # 1. 生成短文本
+    geo_brief_text = geo_states_to_brief_text(
+        geo_states_df=geo_states_df,
+        chainage_min=chainage_min,
+        chainage_max=chainage_max,
+        top_k=5,
+    ) if geo_states_df is not None else "当前范围未形成可用地质融合状态。"
+
+    forward_text = forward_profile_to_text(
+        forward_profile or {}
+    )
+
+    coupling_text = coupled_df_to_text(
+        coupled_df=coupled_df,
+        chainage_min=chainage_min,
+        chainage_max=chainage_max,
+        top_k=5,
+    ) if coupled_df is not None else (
+        "当前范围未形成地质-施工响应耦合结果。"
+    )
+
+    geology_prompt_block = build_geology_v2_prompt_block(
+        geo_states_df=geo_states_df,
+        forward_profile=forward_profile,
+        include_geo_states_brief=True,
+        include_forward_profile=True,
+        chainage_min=chainage_min,
+        chainage_max=chainage_max,
+    )
+
+    prompt_block = "\n\n".join(
+        [
+            geology_prompt_block,
+            "【地质-施工响应耦合分析】",
+            coupling_text,
+            "【写作约束】",
+            "1. GRCI 只能表述为地质-施工响应耦合关注度，不得表述为灾害概率。",
+            "2. weak validation 只能表述为弱标签一致性参考，不得表述为真实准确率。",
+            "3. 缺少证据只能表述为证据不足，不得表述为无风险或无异常。",
+            "4. 当前掌子面、已开挖区段复核、前方预报必须分开表述。",
+        ]
+    )
+
+    # 2. sections
+    sections = {
+        "operation": _build_operation_section(operation_context),
+        "current_face": _build_current_face_section(face_context, current_chainage),
+        "excavated_review": _build_excavated_review_section(
+            geo_states_df=geo_states_df,
+            geo_brief_text=geo_brief_text,
+            chainage_min=chainage_min,
+            chainage_max=chainage_max,
+        ),
+        "forward_profile": _build_forward_section(
+            forward_profile=forward_profile,
+            forward_text=forward_text,
+        ),
+        "coupling": _build_coupling_section(
+            coupled_df=coupled_df,
+            coupling_text=coupling_text,
+            chainage_min=chainage_min,
+            chainage_max=chainage_max,
+        ),
+        "gas": _build_gas_section(gas_context),
+        "conclusion": _build_conclusion_section(
+            forward_profile=forward_profile,
+            coupled_df=coupled_df,
+            geo_states_df=geo_states_df,
+        ),
+    }
+
+    # 3. data summary
+    data_summary = {
+        "geo_states_summary": summarize_geo_states(geo_states_df)
+        if geo_states_df is not None else {},
+        "forward_profile_summary": summarize_forward_profile(forward_profile or {}),
+        "coupled_summary": summarize_coupled_df(coupled_df)
+        if coupled_df is not None else {},
+    }
+
+    data_preview = {}
+    if include_data_preview:
+        data_preview = {
+            "geo_states_preview": _df_preview_records(geo_states_df, max_rows=10),
+            "coupled_preview": _df_preview_records(coupled_df, max_rows=10),
+            "forward_profile": _json_clean(forward_profile or {}),
+        }
+
+    context = {
+        "ok": True,
+        "version": "geology_v2",
+        "context_version": REPORT_CONTEXT_VERSION,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "metadata": {
+            **metadata,
+            "current_chainage": current_chainage,
+            "chainage_min": chainage_min,
+            "chainage_max": chainage_max,
+            "chainage_range_text": _chainage_range_text(chainage_min, chainage_max),
+        },
+        "texts": {
+            "geo_brief_text": geo_brief_text,
+            "forward_text": forward_text,
+            "coupling_text": coupling_text,
+            "prompt_block": prompt_block,
+        },
+        "sections": sections,
+        "data_summary": _json_clean(data_summary),
+        "data_preview": _json_clean(data_preview),
+        "warnings": _dedup_keep_order(warnings),
+    }
+
+    return _json_clean(context)
+
+
+def report_context_to_prompt_text(report_context: Dict[str, Any]) -> str:
+    """
+    从 report_context 中取 prompt_block。
+
+    这个函数给后续接 llm/prompt_builder.py 使用。
+    """
+    context = _as_dict(report_context)
+    texts = _as_dict(context.get("texts"))
+    return _safe_str(texts.get("prompt_block"), default="")
+
+
+================================================================================
+文件地址: report_renderer.py
+================================================================================
+
+"""
+geology_v2.report_renderer
+
+统一渲染 geology_v2 报告文字。
+
+输入：
+    report_context:
+        report_context_builder.build_geology_v2_report_context 输出。
+
+输出：
+    render_geology_v2_report_context:
+        工程报告风格文本。
+
+注意：
+1. 本模块负责长文本生成；
+2. 分析模块不要分散生成大段文字；
+3. 不把 GRCI 写成概率；
+4. 不把无证据写成无风险；
+5. 当前掌子面、已开挖区段、前方预报分开写。
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List
+
+
+# ============================================================
+# 1. 基础工具
+# ============================================================
+
+def _as_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    return {}
+
+
+def _as_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple) or isinstance(value, set):
+        return list(value)
+    return [value]
+
+
+def _safe_text(value: Any, default: str = "暂无有效信息。") -> str:
+    if value is None:
+        return default
+    text = str(value).strip()
+    return text if text else default
+
+
+def _section_text(report_context: Dict[str, Any], section_key: str, default: str = "暂无有效信息。") -> str:
+    sections = _as_dict(report_context.get("sections"))
+    section = _as_dict(sections.get(section_key))
+    return _safe_text(section.get("text"), default=default)
+
+
+def _section_notes(report_context: Dict[str, Any], section_key: str) -> List[str]:
+    sections = _as_dict(report_context.get("sections"))
+    section = _as_dict(sections.get(section_key))
+    return [str(x) for x in _as_list(section.get("notes")) if str(x).strip()]
+
+
+def _constraints_text(report_context: Dict[str, Any]) -> str:
+    sections = _as_dict(report_context.get("sections"))
+    conclusion = _as_dict(sections.get("conclusion"))
+    constraints = [str(x) for x in _as_list(conclusion.get("constraints")) if str(x).strip()]
+
+    if not constraints:
+        return "结论应依据结构化证据审慎表述，不外推到未覆盖里程或未覆盖时段。"
+
+    return "\n".join([f"- {item}" for item in constraints])
+
+
+def _metadata_line(report_context: Dict[str, Any]) -> str:
+    metadata = _as_dict(report_context.get("metadata"))
+
+    current_chainage = metadata.get("current_chainage")
+    chainage_range_text = metadata.get("chainage_range_text", "未指定")
+    date = metadata.get("date") or metadata.get("report_date") or metadata.get("time_window") or "未指定"
+
+    parts = [
+        f"报告日期/时间窗：{date}",
+        f"当前里程：{current_chainage if current_chainage is not None else '未指定'}",
+        f"复核范围：{chainage_range_text}",
+    ]
+
+    return "；".join(parts) + "。"
+
+
+# ============================================================
+# 2. 主渲染函数
+# ============================================================
+
+def render_geology_v2_report_context(
+    report_context: Dict[str, Any],
+    include_operation: bool = True,
+    include_gas: bool = True,
+) -> str:
+    """
+    将 geology_v2_report_context 渲染为报告文本。
+
+    该文本可以：
+    1. 直接作为调试报告；
+    2. 作为 LLM prompt 中的结构化上下文；
+    3. 后续进一步交给大模型润色。
+
+    注意：
+        这里是“确定性模板渲染”，不是 LLM 生成。
+    """
+    if not isinstance(report_context, dict):
+        return "地质融合 v2 报告上下文为空，无法生成报告文本。"
+
+    warnings = [str(x) for x in _as_list(report_context.get("warnings")) if str(x).strip()]
+
+    lines: List[str] = []
+
+    lines.append("TBM 地质融合 v2 报告上下文")
+    lines.append("=" * 40)
+    lines.append(_metadata_line(report_context))
+    lines.append("")
+
+    lines.append("一、写作约束")
+    lines.append(
+        "本报告上下文基于多源地质证据、前方分段剖面和地质-施工响应耦合结果构建。"
+        "其中 GRCI 表示地质-施工响应耦合关注度，不表示灾害发生概率；"
+        "缺少证据覆盖时只能说明证据不足，不得表述为无风险或无异常。"
+    )
+    if warnings:
+        lines.append("上下文警告：")
+        for item in warnings:
+            lines.append(f"- {item}")
+    lines.append("")
+
+    if include_operation:
+        lines.append("二、基础工况上下文")
+        lines.append(_section_text(report_context, "operation", default="本阶段未接入基础工况结构化上下文。"))
+        lines.append("")
+
+    lines.append("三、当前掌子面描述")
+    lines.append(_section_text(report_context, "current_face", default="当前掌子面描述暂未形成有效结构化结果。"))
+    for note in _section_notes(report_context, "current_face"):
+        lines.append(f"说明：{note}")
+    lines.append("")
+
+    lines.append("四、已开挖区段地质复核")
+    lines.append(_section_text(report_context, "excavated_review", default="当前范围未形成可用地质融合状态。"))
+    for note in _section_notes(report_context, "excavated_review"):
+        lines.append(f"说明：{note}")
+    lines.append("")
+
+    lines.append("五、前方 30m 分段提示")
+    lines.append(_section_text(report_context, "forward_profile", default="前方地质剖面未形成有效结构化结果。"))
+    for note in _section_notes(report_context, "forward_profile"):
+        lines.append(f"说明：{note}")
+    lines.append("")
+
+    lines.append("六、地质-施工响应耦合分析")
+    lines.append(_section_text(report_context, "coupling", default="当前范围未形成地质-施工响应耦合结果。"))
+    for note in _section_notes(report_context, "coupling"):
+        lines.append(f"说明：{note}")
+    lines.append("")
+
+    if include_gas:
+        lines.append("七、气体监测上下文")
+        lines.append(_section_text(report_context, "gas", default="本阶段未接入气体监测结构化上下文。"))
+        lines.append("")
+
+    lines.append("八、结论与建议约束")
+    lines.append(_constraints_text(report_context))
+
+    return "\n".join(lines)
+
+
+def render_prompt_block_from_context(report_context: Dict[str, Any]) -> str:
+    """
+    输出给 LLM prompt 使用的文本块。
+    """
+    if not isinstance(report_context, dict):
+        return ""
+
+    texts = _as_dict(report_context.get("texts"))
+    return _safe_text(texts.get("prompt_block"), default="")
+
+
+================================================================================
+文件地址: evidence_projector.py
+================================================================================
+
+"""
+geology_v2.evidence_projector
+
+将标准化后的地质证据投影到 chainage cells。
+
+输入：
+    cells_df
+    normalized_evidence_df
+
+输出：
+    cell_evidence_df
+
+核心思想：
+1. segment 类型证据：
+   - cell_center 在证据区间内，distance=0；
+   - 区间外，distance 为 cell_center 到区间边界的距离。
+2. point / anomaly_point 类型证据：
+   - distance 为 cell_center 到证据 center_chainage 的距离。
+3. overview / background：
+   - 默认不参与强逐里程融合；
+   - 可以保留极低权重，作为背景。
+4. spatial_weight:
+   spatial_weight = exp(-0.5 * (distance / sigma) ** 2)
+5. effective_weight:
+   effective_weight = spatial_weight * source_reliability * evidence_strength
+
+注意：
+    effective_weight 只是融合权重，不是风险概率。
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Any, Optional
+
+import pandas as pd
+
+from geology_v2.config import get_spatial_sigma
+
+
+CELL_EVIDENCE_COLUMNS = [
+    "cell_id",
+    "evidence_id",
+    "source_type_norm",
+    "spatial_type",
+    "distance_m",
+    "spatial_weight",
+    "source_reliability",
+    "evidence_strength",
+    "effective_weight",
+]
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        x = float(value)
+        if math.isfinite(x):
+            return x
+    except Exception:
+        return None
+    return None
+
+
+def _spatial_weight(distance_m: float, sigma_m: float) -> float:
+    """
+    高斯空间权重。
+    """
+    distance = abs(float(distance_m))
+    sigma = max(float(sigma_m), 1e-6)
+    value = math.exp(-0.5 * (distance / sigma) ** 2)
+    return float(max(0.0, min(value, 1.0)))
+
+
+def _distance_to_segment(
+    cell_center: float,
+    start_chainage: Optional[float],
+    end_chainage: Optional[float],
+) -> Optional[float]:
+    """
+    cell_center 到 segment 证据区间的距离。
+
+    区间内 distance = 0。
+    区间外 distance = 到最近边界的距离。
+    """
+    if start_chainage is None or end_chainage is None:
+        return None
+
+    start = float(min(start_chainage, end_chainage))
+    end = float(max(start_chainage, end_chainage))
+    center = float(cell_center)
+
+    if start <= center <= end:
+        return 0.0
+
+    if center < start:
+        return float(start - center)
+
+    return float(center - end)
+
+
+def _distance_to_point(
+    cell_center: float,
+    center_chainage: Optional[float],
+) -> Optional[float]:
+    """
+    cell_center 到点状证据的距离。
+    """
+    if center_chainage is None:
+        return None
+
+    return float(abs(float(cell_center) - float(center_chainage)))
+
+
+def _evidence_distance(cell_center: float, evidence_row: pd.Series) -> Optional[float]:
+    """
+    根据 spatial_type 计算证据到 cell 的距离。
+    """
+    spatial_type = str(evidence_row.get("spatial_type", "unknown") or "unknown")
+
+    start_chainage = _safe_float(evidence_row.get("start_chainage"))
+    end_chainage = _safe_float(evidence_row.get("end_chainage"))
+    center_chainage = _safe_float(evidence_row.get("center_chainage"))
+
+    if spatial_type in {"segment", "report_conclusion"}:
+        return _distance_to_segment(
+            cell_center=cell_center,
+            start_chainage=start_chainage,
+            end_chainage=end_chainage,
+        )
+
+    if spatial_type in {"point", "anomaly_point"}:
+        return _distance_to_point(
+            cell_center=cell_center,
+            center_chainage=center_chainage,
+        )
+
+    if spatial_type in {"overview", "background"}:
+        # overview 不强逐里程融合，给一个很大的虚拟距离。
+        # 后面 effective_weight 会非常低。
+        if center_chainage is not None:
+            return _distance_to_point(
+                cell_center=cell_center,
+                center_chainage=center_chainage,
+            )
+        return 9999.0
+
+    # unknown 尽量用 center_chainage。
+    if center_chainage is not None:
+        return _distance_to_point(
+            cell_center=cell_center,
+            center_chainage=center_chainage,
+        )
+
+    return None
+
+
+def _projection_radius(source_type_norm: str, spatial_type: str, sigma_m: float) -> float:
+    """
+    控制投影范围，避免所有证据投影到所有 cell，导致速度太慢。
+
+    默认取 3 * sigma。
+    对 segment 证据，区间内总是命中；区间外最多扩散 3 * sigma。
+    """
+    if spatial_type in {"overview", "background"}:
+        return 0.0
+
+    return float(max(3.0 * sigma_m, 1.0))
+
+
+def _should_keep_projection(
+    distance_m: Optional[float],
+    source_type_norm: str,
+    spatial_type: str,
+    sigma_m: float,
+) -> bool:
+    """
+    判断一条 evidence-cell 投影是否保留。
+    """
+    if distance_m is None:
+        return False
+
+    if spatial_type in {"overview", "background"}:
+        # overview 默认不进入强融合。
+        # 如果后续你想让 overview 作为背景进入，可以改这里。
+        return False
+
+    radius = _projection_radius(source_type_norm, spatial_type, sigma_m)
+    return abs(float(distance_m)) <= radius
+
+
+def project_evidence_to_cells(
+    cells_df: pd.DataFrame,
+    normalized_evidence_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    将 normalized_evidence_df 投影到 cells_df。
+
+    参数：
+        cells_df:
+            build_chainage_cells 的输出。
+        normalized_evidence_df:
+            normalize_evidence_df 的输出。
+
+    输出字段：
+        cell_id
+        evidence_id
+        source_type_norm
+        spatial_type
+        distance_m
+        spatial_weight
+        source_reliability
+        evidence_strength
+        effective_weight
+    """
+    if cells_df is None or cells_df.empty:
+        return pd.DataFrame(columns=CELL_EVIDENCE_COLUMNS)
+
+    if normalized_evidence_df is None or normalized_evidence_df.empty:
+        return pd.DataFrame(columns=CELL_EVIDENCE_COLUMNS)
+
+    required_cell_cols = {"cell_id", "cell_center"}
+    missing_cell_cols = required_cell_cols - set(cells_df.columns)
+    if missing_cell_cols:
+        raise ValueError(f"cells_df missing required columns: {sorted(missing_cell_cols)}")
+
+    required_evidence_cols = {
+        "evidence_id",
+        "source_type_norm",
+        "spatial_type",
+        "source_reliability",
+        "evidence_strength",
+    }
+    missing_evidence_cols = required_evidence_cols - set(normalized_evidence_df.columns)
+    if missing_evidence_cols:
+        raise ValueError(f"normalized_evidence_df missing required columns: {sorted(missing_evidence_cols)}")
+
+    cells = cells_df.copy()
+    evidences = normalized_evidence_df.copy()
+
+    cells["cell_center"] = pd.to_numeric(cells["cell_center"], errors="coerce")
+    cells = cells.dropna(subset=["cell_center"]).copy()
+
+    if cells.empty:
+        return pd.DataFrame(columns=CELL_EVIDENCE_COLUMNS)
+
+    records = []
+
+    for _, evidence in evidences.iterrows():
+        evidence_id = str(evidence.get("evidence_id", "") or "").strip()
+        if not evidence_id:
+            continue
+
+        source_type_norm = str(evidence.get("source_type_norm", "unknown") or "unknown")
+        spatial_type = str(evidence.get("spatial_type", "unknown") or "unknown")
+
+        source_reliability = _safe_float(evidence.get("source_reliability"))
+        evidence_strength = _safe_float(evidence.get("evidence_strength"))
+
+        if source_reliability is None:
+            source_reliability = 0.0
+        if evidence_strength is None:
+            evidence_strength = 0.0
+
+        sigma_m = get_spatial_sigma(
+            source_type_norm=source_type_norm,
+            spatial_type=spatial_type,
+        )
+
+        for _, cell in cells.iterrows():
+            cell_center = _safe_float(cell.get("cell_center"))
+            if cell_center is None:
+                continue
+
+            distance_m = _evidence_distance(
+                cell_center=cell_center,
+                evidence_row=evidence,
+            )
+
+            if not _should_keep_projection(
+                distance_m=distance_m,
+                source_type_norm=source_type_norm,
+                spatial_type=spatial_type,
+                sigma_m=sigma_m,
+            ):
+                continue
+
+            spatial_weight = _spatial_weight(
+                distance_m=float(distance_m),
+                sigma_m=sigma_m,
+            )
+
+            effective_weight = float(spatial_weight * source_reliability * evidence_strength)
+
+            if effective_weight <= 1e-12:
+                continue
+
+            records.append(
+                {
+                    "cell_id": str(cell.get("cell_id")),
+                    "evidence_id": evidence_id,
+                    "source_type_norm": source_type_norm,
+                    "spatial_type": spatial_type,
+                    "distance_m": float(distance_m),
+                    "spatial_weight": float(spatial_weight),
+                    "source_reliability": float(source_reliability),
+                    "evidence_strength": float(evidence_strength),
+                    "effective_weight": float(effective_weight),
+                }
+            )
+
+    if not records:
+        return pd.DataFrame(columns=CELL_EVIDENCE_COLUMNS)
+
+    out = pd.DataFrame(records)
+
+    for col in CELL_EVIDENCE_COLUMNS:
+        if col not in out.columns:
+            out[col] = None
+
+    out = out[CELL_EVIDENCE_COLUMNS].copy()
+
+    numeric_cols = [
+        "distance_m",
+        "spatial_weight",
+        "source_reliability",
+        "evidence_strength",
+        "effective_weight",
+    ]
+    for col in numeric_cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+
+    return out
+
+
+def summarize_cell_evidence(cell_evidence_df: pd.DataFrame) -> dict:
+    """
+    便捷调试函数：统计投影结果。
+    """
+    if cell_evidence_df is None or cell_evidence_df.empty:
+        return {
+            "projection_count": 0,
+            "cell_count": 0,
+            "evidence_count": 0,
+            "source_type_counts": {},
+            "spatial_type_counts": {},
+            "effective_weight_max": 0.0,
+            "effective_weight_mean": 0.0,
+        }
+
+    return {
+        "projection_count": int(len(cell_evidence_df)),
+        "cell_count": int(cell_evidence_df["cell_id"].nunique())
+        if "cell_id" in cell_evidence_df.columns else 0,
+        "evidence_count": int(cell_evidence_df["evidence_id"].nunique())
+        if "evidence_id" in cell_evidence_df.columns else 0,
+        "source_type_counts": cell_evidence_df["source_type_norm"].value_counts(dropna=False).to_dict()
+        if "source_type_norm" in cell_evidence_df.columns else {},
+        "spatial_type_counts": cell_evidence_df["spatial_type"].value_counts(dropna=False).to_dict()
+        if "spatial_type" in cell_evidence_df.columns else {},
+        "effective_weight_max": float(cell_evidence_df["effective_weight"].max())
+        if "effective_weight" in cell_evidence_df.columns else 0.0,
+        "effective_weight_mean": float(cell_evidence_df["effective_weight"].mean())
+        if "effective_weight" in cell_evidence_df.columns else 0.0,
+    }
+

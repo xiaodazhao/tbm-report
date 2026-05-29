@@ -1,0 +1,18 @@
+{
+  "normalized_not_empty": true,
+  "has_face_sketch": true,
+  "has_TSP": true,
+  "has_HSP": true,
+  "has_anomaly_point": true,
+  "cells_not_empty": true,
+  "cell_evidence_not_empty": true,
+  "geo_states_not_empty": true,
+  "geo_states_has_GRS_geo_base": true,
+  "geo_states_has_supporting_ids": true,
+  "forward_profile_has_3_ranges": true,
+  "forward_profile_range_labels": [
+    "0-10m",
+    "10-20m",
+    "20-30m"
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "evidence_count": 878,
+  "source_type_counts": {
+    "HSP": 570,
+    "face_sketch": 169,
+    "TSP": 139
+  },
+  "spatial_type_counts": {
+    "anomaly_point": 394,
+    "segment": 314,
+    "point": 169,
+    "overview": 1
+  },
+  "role_counts": {
+    "prediction": 637,
+    "observed": 169,
+    "interpreted": 71,
+    "background": 1
+  },
+  "anomaly_point_count": 394,
+  "parse_warning_count": 0
+}

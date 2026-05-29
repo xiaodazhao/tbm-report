@@ -77,24 +77,65 @@ def compute_row_grs_base(
     colmap: dict[str, str | None],
     warnings: list[str] | None = None,
 ) -> tuple[pd.Series, pd.Series, pd.DataFrame]:
-    """Compute row-level equal-weight GRS components.
+    """
+    计算逐记录地质关注基础分 GRS_base。
 
-    The base model keeps the same geology evidence dimensions as before,
-    but removes subjective engineering weights. Each component is normalized
-    to a shared 0-1 space and then aggregated with equal weighting.
+    本函数是 GRS 的地质侧基础评分模型。
+    它不使用机器学习，而是基于工程先验提取多个地质证据分量，
+    将每个分量归一化到 0~1 后进行等权平均。
+
+    输入：
+        df:
+            清洗后的逐记录 df_geo，包含地质融合字段。
+        colmap:
+            字段映射表，用于找到 hazard、risk、active_sources、
+            围岩等级、出水、掉块等字段。
+        warnings:
+            警告列表。若关键地质字段缺失，会追加 warning。
+
+    输出：
+        grs_base:
+            每条记录的基础地质关注分，范围 0~1。
+        source_confidence:
+            每条记录的多源证据支持度，范围 0~1。
+        components:
+            GRS 的各组成分量表，包括：
+                grade_score
+                hazard_score
+                water_score
+                collapse_score
+                source_confidence
     """
     if warnings is None:
         warnings = []
 
+    # 保留原始索引，保证后面生成的 Series 与 df 对齐
     idx = df.index
-    text = _combined_text(df, [colmap.get("hazard"), colmap.get("risk"), colmap.get("active_sources")])
 
+    # 将 hazard、risk、active_sources 等文本字段合并成一个文本证据池
+    # 后续 hazard/water/collapse 等分量可以从文本中识别关键词。
+    text = _combined_text(
+        df,
+        [colmap.get("hazard"), colmap.get("risk"), colmap.get("active_sources")]
+    )
+
+    # 1. 围岩等级分量：围岩等级越差，分数越高
     grade_score = _grade_score_series(df, colmap, warnings)
+
+    # 2. 地质异常标签分量：根据破碎、裂隙、反射异常、软弱夹层等标签计算
     hazard_score = _hazard_score_series(df, colmap, text, warnings)
+
+    # 3. 水害分量：根据出水标志、出水类型或文本中的水害关键词计算
     water_score = _water_score_series(df, colmap, text, warnings)
+
+    # 4. 掉块/塌方/失稳分量：根据 collapse 标志或相关关键词计算
     collapse_score = _collapse_score_series(df, colmap, text, warnings)
+
+    # 5. 多源证据支持分量：来源越多，证据置信度越高
     source_confidence = _source_confidence_series(df, colmap, warnings)
 
+    # 6. 组装原始分量，并清洗异常值
+    # 所有分量都限制在 0~1 范围内。
     raw_components = pd.DataFrame(
         {
             "grade_score": grade_score,
@@ -106,6 +147,8 @@ def compute_row_grs_base(
         index=idx,
     ).replace([np.inf, -np.inf], np.nan).fillna(0).clip(0, 1)
 
+    # 7. 对每一个分量再次归一化到统一 0~1 空间
+    # 这样后续可以进行等权平均，避免某一分量因数值尺度不同而主导结果。
     components = pd.DataFrame(
         {
             column: _normalize_feature_series(raw_components[column])
@@ -114,14 +157,43 @@ def compute_row_grs_base(
         index=idx,
     ).replace([np.inf, -np.inf], np.nan).fillna(0).clip(0, 1)
 
+    # 8. 等权平均得到逐记录 GRS_base
+    # GRS_base = 五个归一化地质分量的平均值。
     grs_base = components.mean(axis=1).fillna(0).clip(0, 1)
 
+    # 9. 如果所有分量都为 0，说明地质字段可能缺失或不可用，记录 warning
+    # 注意：这不代表真实无风险，而是模型没有可用地质证据。
     if float(components.abs().sum(axis=1).sum()) <= 1e-12:
         warnings.append("GRS base uses zero-risk fallback because geology component fields are unavailable")
 
+    # 10. 返回 GRS_base、多源证据支持度和分量明细
     return grs_base.clip(0, 1), source_confidence.fillna(0).clip(0, 1), components
-
-
+# ============================================================
+# apply_dynamic_grs_correction：对区段级 GRS 做动态修正
+#
+# 输入：
+#   segment_df：
+#       区段级特征表，至少包含 GRS_base 或 GRS。
+#       如果包含 RAI/response_anomaly_index 和停机比例字段，
+#       则可以进行施工响应修正。
+#
+# 核心逻辑：
+#   1. 读取基础地质关注分 GRS_base；
+#   2. 如果存在 RAI 和 stop_ratio/speed_zero_ratio/stop_state_ratio，
+#      则计算修正项：
+#          correction = 0.5 * RAI + 0.5 * stop_ratio
+#   3. 使用 correction_lambda 对 GRS_base 做乘法修正：
+#          GRS_corrected = GRS_base * (1 + lambda * correction)
+#   4. 对修正结果进行空间平滑；
+#   5. 施加 min_grs 下限，得到最终 GRS_adjusted；
+#   6. 将 GRS 作为 GRS_adjusted 的兼容别名；
+#   7. 返回修正后的区段表和 GRS 修正元信息 metadata。
+#
+# 注意：
+#   GRS_geo_base 表示纯地质基础分；
+#   GRS_adjusted 表示结合施工响应修正后的最终分；
+#   GRS 当前作为 GRS_adjusted 的兼容字段。
+# ============================================================
 def apply_dynamic_grs_correction(
     segment_df: pd.DataFrame,
     correction_lambda: float = DEFAULT_CORRECTION_LAMBDA,

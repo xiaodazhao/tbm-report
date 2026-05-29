@@ -194,13 +194,34 @@ def risk_probability_to_text(df_geo):
     except Exception as e:
         print("[Geo Attention Profile Text Error]", e)
         return "沿线地质关注剖面分析不可用。"
-# =========================
-# 核心分析引擎
-# =========================
+
+
+# ============================================================
+# _run_geology_analysis：地质融合与地质-施工耦合分析主流程
+#
+# 输入：
+#   df：单日 TBM 原始运行数据
+#
+# 主流程：
+#   1. 读取 evidence_db.csv 地质证据库
+#   2. 根据里程把 TSP/HSP/素描/钻孔等证据贴到 PLC 数据上，生成 df_geo
+#   3. 生成记录级地质摘要 geo_summary_record
+#   4. 生成区段级地质摘要 geo_summary_segment
+#   5. 提取典型高关注区段 typical_segments_df
+#   6. 根据当前掌子面位置生成前方风险提示 forward_risk_summary
+#   7. 计算地质-施工响应耦合指标 GRS、RAI、GRCI
+#   8. 返回 geology_result，供 analyze_tbm_data 统一组装 result
+#
+# 输出：
+#   geology_result：包含 df_geo、geo_text、forward_risk_text、
+#   coupling_summary、high_attention_segments 等地质相关结果
+# ============================================================
 def _run_geology_analysis(df: pd.DataFrame) -> dict:
     """Run geology analysis."""
     try:
         evidence_df = load_evidence_db(EVIDENCE_DB_PATH)
+        # 2. 按里程将地质证据融合到 TBM 运行数据上
+        # df_geo = 原始 PLC 数据 + 地质风险标签 + 围岩等级 + 灾害类型 + 多源证据数量
         df_geo = attach_geology_labels(df, evidence_df)
         df_geo = annotate_routine_ring_building_stops(df_geo)
         current_chainage = None
@@ -208,8 +229,9 @@ def _run_geology_analysis(df: pd.DataFrame) -> dict:
             valid_chainage = pd.to_numeric(df_geo["chainage"], errors="coerce").dropna()
             if not valid_chainage.empty:
                 current_chainage = float(valid_chainage.iloc[-1])
-
-        segment_df = run_segment_analysis(df_geo, segment_length=10)
+        # 4. 对已开挖区段进行区段级分析，并提取典型高关注区段
+        segment_df = run_segment_analysis(df_geo, segment_length=10)#按里程区段分析地质/施工表现
+        #做 GRS、RAI、GRCI 耦合分析
         coupling_analysis_result = run_coupling_analysis(
             df_geo=df_geo,
             segment_length=10,
@@ -228,9 +250,12 @@ def _run_geology_analysis(df: pd.DataFrame) -> dict:
         top_rai_segments = coupling_analysis_result.get("top_rai_segments", [])
         weak_label_validation = coupling_analysis_result.get("weak_label_validation", coupling_validation)
 
-        geo_summary_record = summarize_geology_record_level(df_geo)
-        geo_summary_segment = summarize_geology_segment_level(segment_df)
-        typical_segments_df = build_typical_segments_table(segment_df, top_n=20)
+        # 3. 生成记录级地质摘要和区段级地质摘要
+        # record_level 偏细，segment_level 偏报告表达
+        geo_summary_record = summarize_geology_record_level(df_geo)#按记录总结地质表现和施工响应
+        geo_summary_segment = summarize_geology_segment_level(segment_df)#按区段总结地质表现和施工响应
+        typical_segments_df = build_typical_segments_table(segment_df, top_n=20)#提取典型地质区段
+        #生成掌子面前方风险提示
         forward_risk_summary = generate_forward_risk_summary(
             df_plc=df_geo,
             evidence_df=evidence_df,
@@ -618,12 +643,37 @@ def _build_llm_summary(
     return summary
 
 
+# ============================================================
+# analyze_tbm_data 是后端核心分析总入口
+#
+# 输入：
+#   df：单日 TBM 原始运行数据
+#   context：日期、数据源、分析模式等上下文信息
+#
+# 主流程：
+#   1. 地质融合：把 TSP/HSP/素描/钻孔等证据按里程贴到 PLC 数据上
+#   2. 基础工况分析：识别停机、过渡、稳定掘进、异常扭矩
+#   3. 聚类施工状态：在有效掘进样本中识别高负载/低速/稳定等状态模式
+#   4. 气体分析：统计全天、掘进期、停机期及状态级气体变化
+#   5. 风险与耦合分析：形成 GRS、RAI、GRCI 等区段级关注指标
+#   6. 数字孪生状态：生成当前施工状态快照和 CST 结构
+#   7. LLM 摘要：组装报告生成所需的结构化摘要和文本输入
+#
+# 输出：
+#   result：一个大字典，供 /summary、/state、/geology、/report 等接口复用
+# ============================================================ 
+# df：一天的 TBM 运行数据
+# context：接口传进来的日期、分析模式、文件名等
 def analyze_tbm_data(df: pd.DataFrame, context: dict | None = None):
     """Analyze tbm data."""
     context = context or {}
+    # 1. 地质融合：把 evidence_db 和 PLC 里程对齐
     geology_result = _run_geology_analysis(df)
+    # 2. 基础工况：判断停机、过渡、稳定掘进、异常扭矩
     operation_result = _run_operation_analysis(geology_result["df_geo"])
+    # 3. 聚类状态：用推力、扭矩、转速、推进速度做 KMeans
     state_result = _run_state_analysis(geology_result["df_geo"])
+    # 4. 气体分析：统计 CO2/H2S/SO2/NO2/NO/CH4
     gas_result = _run_gas_analysis(geology_result["df_geo"], state_result["df_state"])
 
     warnings = [
@@ -664,6 +714,8 @@ def analyze_tbm_data(df: pd.DataFrame, context: dict | None = None):
         context=context,
         persist=bool(context.get("persist_cst", False)),
     )
+    
+    # 5. 汇总成给 LLM 用的结构化 summary
     llm_summary = _build_llm_summary(
         seg_text=operation_result["seg_text"],
         stats=operation_result["stats"],
@@ -701,62 +753,62 @@ def analyze_tbm_data(df: pd.DataFrame, context: dict | None = None):
         }
 
     return {
-        "segments": operation_result["segments"],
-        "seg_text": operation_result["seg_text"],
-        "stats": operation_result["stats"],
-        "stats_text": operation_result["stats_text"],
-        "operation_mode_summary": _build_operation_mode_summary(operation_result["stats"]),
-        "df_geo": geology_result["df_geo"],
-        "df_state": state_result["df_state"],
-        "state_labels": state_result["state_labels"],
-        "state_segments": state_result["state_segments"],
-        "state_text": state_result["state_text"],
-        "eff_df": state_result["eff_df"],
-        "eff_text": state_result["eff_text"],
-        "state_stats": state_result["state_stats"],
-        "state_stats_text": state_result["state_stats_text"],
-        "cluster_state_summary": _build_cluster_state_summary(
-            state_labels=state_result["state_labels"],
-            state_stats=state_result["state_stats"],
-            eff_df=state_result["eff_df"],
-            n_valid=state_result["n_valid"],
-            state_cfg=state_result["state_cfg"],
-        ),
-        "gas_stats": gas_result["gas_stats"],
-        "gas_text": gas_result["gas_text"],
-        "geo_summary_record": geology_result["geo_summary_record"],
-        "geo_summary_segment": geology_result["geo_summary_segment"],
-        "geo_summary": geology_result["geo_summary_segment"],
-        "geo_text": geology_result["geo_text"],
-        "face_description": _build_face_description(geology_result["face_geo_text"], digital_twin_state),
-        "excavated_segment_summary": _build_excavated_segment_summary(
-            geo_summary_segment=geology_result["geo_summary_segment"],
-            geo_text=geology_result["geo_text"],
-            typical_segments_df=geology_result["typical_segments_df"],
-        ),
-        "segment_df": geology_result["segment_df"],
-        "typical_segments_df": geology_result["typical_segments_df"],
-        "forward_risk_summary": geology_result["forward_risk_summary"],
-        "forward_risk_text": geology_result["forward_risk_text"],
-        "coupling_summary": geology_result["coupling_summary"],
-        "coupling_validation": geology_result["coupling_validation"],
-        "coupling_output_paths": geology_result["coupling_output_paths"],
-        "high_attention_segments": geology_result["high_attention_segments"],
-        "top_grci_segments": geology_result.get("top_grci_segments", geology_result["high_attention_segments"]),
-        "top_grs_segments": geology_result.get("top_grs_segments", []),
-        "top_rai_segments": geology_result.get("top_rai_segments", []),
-        "weak_label_validation": geology_result.get("weak_label_validation", geology_result["coupling_validation"]),
-        "response_anomaly_summary": build_response_anomaly_summary(
-            coupling_summary=geology_result["coupling_summary"],
-            high_attention_segments=geology_result["high_attention_segments"],
-        ),
-        "digital_twin_state": digital_twin_state,
-        "cst_state": cst_state,
-        "llm_summary": llm_summary,
-        "face_geo_text": geology_result["face_geo_text"],
-        "risk_prob_text": risk_prob_text,
-        "warnings": warnings,
-    }
+    "segments": operation_result["segments"],  # 基础工况分段结果：停机、过渡、工作、异常等连续时间段
+    "seg_text": operation_result["seg_text"],  # 基础工况分段的文本描述，主要给 LLM 报告使用
+    "stats": operation_result["stats"],  # 基础工况统计结果，例如工作时长、停机时长、异常段数量等
+    "stats_text": operation_result["stats_text"],  # 基础工况统计的文本描述，主要给 LLM 报告使用
+    "operation_mode_summary": _build_operation_mode_summary(operation_result["stats"]),  # 基础工况结构化摘要，用于统一描述 operation_mode 层面的状态
+    "df_geo": geology_result["df_geo"],  # 融合地质信息后的 TBM 数据表，在原始 PLC 数据基础上增加地质风险、围岩、灾害标签等字段
+    "df_state": state_result["df_state"],  # 融合施工状态后的数据表，在 df_geo 基础上增加 state_id 等聚类状态字段
+    "state_labels": state_result["state_labels"],  # 聚类施工状态的语义标签，例如高负载低速、稳定推进、低负载快速推进等
+    "state_segments": state_result["state_segments"],  # 聚类施工状态的连续时间分段结果
+    "state_text": state_result["state_text"],  # 聚类施工状态分段的文本描述，主要给 LLM 报告使用
+    "eff_df": state_result["eff_df"],  # 不同聚类施工状态下的效率统计表，例如平均推进速度、平均推力、平均扭矩等
+    "eff_text": state_result["eff_text"],  # 施工状态效率统计的文本描述，主要给 LLM 报告使用
+    "state_stats": state_result["state_stats"],  # 聚类施工状态的总体统计，例如累计时长、占比、最大连续段、切换次数等
+    "state_stats_text": state_result["state_stats_text"],  # 聚类施工状态总体统计的文本描述，主要给 LLM 报告使用
+    "cluster_state_summary": _build_cluster_state_summary(  # 聚类施工状态的结构化摘要，用于统一描述 cluster_state 层面的状态
+        state_labels=state_result["state_labels"],
+        state_stats=state_result["state_stats"],
+        eff_df=state_result["eff_df"],
+        n_valid=state_result["n_valid"],
+        state_cfg=state_result["state_cfg"],
+    ),
+    "gas_stats": gas_result["gas_stats"],  # 气体监测结构化统计结果，包括全天、掘进期、停机期及状态级气体统计
+    "gas_text": gas_result["gas_text"],  # 气体监测分析文本，主要给 LLM 报告使用
+    "geo_summary_record": geology_result["geo_summary_record"],  # 记录级地质摘要，通常对应每条 PLC 记录附近的地质融合信息
+    "geo_summary_segment": geology_result["geo_summary_segment"],  # 区段级地质摘要，按里程区段汇总后的地质风险、围岩、灾害关注信息
+    "geo_summary": geology_result["geo_summary_segment"],  # 地质摘要的兼容字段，实际等同于 geo_summary_segment
+    "geo_text": geology_result["geo_text"],  # 已开挖区段地质摘要文本，主要给 LLM 报告使用
+    "face_description": _build_face_description(geology_result["face_geo_text"], digital_twin_state),  # 当前掌子面描述的结构化对象，强调当前掌子面直接揭示信息
+    "excavated_segment_summary": _build_excavated_segment_summary(  # 已开挖区段地质与响应复核摘要，用于和前方风险区分
+        geo_summary_segment=geology_result["geo_summary_segment"],
+        geo_text=geology_result["geo_text"],
+        typical_segments_df=geology_result["typical_segments_df"],
+    ),
+    "segment_df": geology_result["segment_df"],  # 区段级分析结果表，通常包含地质关注、施工响应、耦合指标等字段
+    "typical_segments_df": geology_result["typical_segments_df"],  # 典型地质区段表，用于提取代表性高关注区段
+    "forward_risk_summary": geology_result["forward_risk_summary"],  # 掌子面前方窗口内的风险提示结构化摘要
+    "forward_risk_text": geology_result["forward_risk_text"],  # 掌子面前方风险提示文本，主要给 LLM 报告使用
+    "coupling_summary": geology_result["coupling_summary"],  # 地质-施工响应耦合分析摘要，包含 GRS、RAI、GRCI 等指标总体结果
+    "coupling_validation": geology_result["coupling_validation"],  # 耦合分析的弱标签验证结果，用于评估高关注区段与施工异常代理标签的一致性
+    "coupling_output_paths": geology_result["coupling_output_paths"],  # 耦合分析输出文件路径，例如区段 CSV、摘要 JSON、高关注区段 JSON 等
+    "high_attention_segments": geology_result["high_attention_segments"],  # 高关注区段列表，通常指 GRCI 排名前列的区段
+    "top_grci_segments": geology_result.get("top_grci_segments", geology_result["high_attention_segments"]),  # 按 GRCI 排序的高耦合关注区段，缺省时使用 high_attention_segments
+    "top_grs_segments": geology_result.get("top_grs_segments", []),  # 按 GRS 排序的高地质关注区段
+    "top_rai_segments": geology_result.get("top_rai_segments", []),  # 按 RAI 排序的高施工响应异常区段
+    "weak_label_validation": geology_result.get("weak_label_validation", geology_result["coupling_validation"]),  # 弱标签验证结果的兼容字段，优先使用 weak_label_validation
+    "response_anomaly_summary": build_response_anomaly_summary(  # 区段级施工响应异常摘要，用于和 operation_mode、cluster_state 区分
+        coupling_summary=geology_result["coupling_summary"],
+        high_attention_segments=geology_result["high_attention_segments"],
+    ),
+    "digital_twin_state": digital_twin_state,  # 数字孪生状态快照，描述当前 TBM 施工、地质、风险、气体等综合状态
+    "cst_state": cst_state,  # Construction State Twin 结构化状态对象，比 digital_twin_state 更适合做状态更新和历史对比
+    "llm_summary": llm_summary,  # 给 LLM 报告生成使用的统一结构化摘要
+    "face_geo_text": geology_result["face_geo_text"],  # 当前掌子面地质描述文本，主要给 LLM 报告使用
+    "risk_prob_text": risk_prob_text,  # 补充风险剖面文本，注意这里不是严格概率，应理解为风险/关注度描述
+    "warnings": warnings,  # 分析过程中的警告信息，例如字段缺失、地质证据不足、耦合分析不可用等
+}
 
 
 # =========================

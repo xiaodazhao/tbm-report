@@ -296,49 +296,149 @@ def add_relative_change_features(df: pd.DataFrame):
 
 
 def run_segment_analysis(df: pd.DataFrame, segment_length=10):
-    """一键完成已开挖区段级基础聚合。"""
+    """
+    一键完成已开挖区段级基础聚合。
+
+    输入：
+        df:
+            带地质融合标签的 TBM/PLC 数据表，通常是 df_geo。
+            每一行是一条施工记录。
+
+        segment_length:
+            区段长度，单位为米。
+            默认 10m 一个区段。
+
+    输出：
+        segment_df:
+            区段级分析结果表。
+            每一行对应一个里程区段，包含施工参数统计、地质标签统计、
+            效率指标、相邻区段变化特征和施工响应解释等。
+    """
+
+    # 1. 根据 chainage 将逐条 PLC 记录划分到固定长度的里程区段中
+    # 例如默认每 10 m 一个区段，生成 segment_start、segment_end 等字段。
     out = build_segments(df, segment_length=segment_length)
+
+    # 2. 对每个区段内的多条 PLC 记录进行聚合
+    # 生成区段级统计结果，例如平均推进速度、平均推力、主要地质标签、
+    # 最大证据来源数、围岩等级众数等。
     out = aggregate_segments(out)
+
+    # 3. 将数字里程区段格式化为报告友好的区段标签
+    # 例如 1012300~1012310 转为 DyK1012+300~DyK1012+310。
     out = format_segment_label(out)
+
+    # 4. 添加区段施工效率指标
+    # 用于判断该区段推进效率、速度跟随、停机占比等施工表现。
     out = add_efficiency_indicator(out)
+
+    # 5. 添加相邻区段之间的相对变化特征
+    # 例如推进速度下降、推力升高、扭矩升高等变化。
     out = add_relative_change_features(out)
+
+    # 6. 根据区段施工参数、效率指标和变化特征生成施工响应解释
+    # 例如稳定推进、效率下降、高负载低速、施工响应波动等。
     out = analyze_segment_response(out)
+
+    # 7. 按区段起点里程排序，保证报告和接口输出顺序一致
     if "segment_start" in out.columns:
         out = out.sort_values("segment_start").reset_index(drop=True)
+
     return out
 
 
 def build_typical_segments_table(segment_df: pd.DataFrame, top_n=20):
-    """生成典型区段表：按地质证据支持 + 施工响应变化 + 耦合指标排序。"""
+    """
+    生成典型区段表。
+
+    输入：
+        segment_df:
+            区段级分析结果表，每一行对应一个固定里程区段。
+            通常已经包含地质关注提示、施工参数相对变化、耦合指标等字段。
+
+        top_n:
+            返回优先级最高的前 N 个区段，默认 20 个。
+
+    排序依据：
+        1. 地质证据支持程度：
+           - geo_attention_hint_score
+           - seg_active_report_source_count_max
+           - seg_evidence_support_weight_max
+
+        2. 关键地质事实：
+           - 出水
+           - 掉块/塌方
+           - 变形
+
+        3. 施工响应变化：
+           - 推进速度下降
+           - 推力升高
+           - 刀盘扭矩升高
+
+        4. 地质-施工响应耦合指标：
+           - GRCI 或 risk_response_coupling_index
+
+    输出：
+        typical_segments_df:
+            按 typical_segment_priority_score 从高到低排序后的典型区段表。
+            用于报告摘要、前端展示或后续重点复核。
+    """
     out = segment_df.copy()
     if out.empty:
         return out
 
+    # 初始化典型区段优先级分数
     score = pd.Series(0, index=out.index, dtype=float)
+
+    # 1. 地质关注提示分数，权重 5
+    # 分数越高，说明该区段地质证据关注程度越高。
     if "geo_attention_hint_score" in out.columns:
         score += _safe_numeric(out["geo_attention_hint_score"]) * 5
+
+    # 2. 多源证据支持数量，权重 3
+    # 报告-来源组合数达到 4 个及以上时，该项归一化为 1。
     if "seg_active_report_source_count_max" in out.columns:
         score += (_safe_numeric(out["seg_active_report_source_count_max"]) / 4.0).clip(0, 1) * 3
+
+    # 3. 证据支持权重，权重 2
+    # 反映该区段命中证据的加权支持强度。
     if "seg_evidence_support_weight_max" in out.columns:
         score += _normalize_nonnegative(_safe_numeric(out["seg_evidence_support_weight_max"])) * 2
 
+    # 4. 关键地质事实标志，每类权重 1.5
+    # 出水、掉块/塌方、变形可以累加，因此多类现象同时出现时优先级更高。
     for col in ["seg_geo_water_flag_max", "seg_geo_collapse_flag_max", "seg_geo_deformation_flag_max"]:
         if col in out.columns:
             score += _safe_numeric(out[col]).clip(0, 1) * 1.5
 
+    # 5. 推进速度下降，权重 8
+    # rel_change 为负表示低于全局均值；取负号后只对下降幅度加分。
     if "推进速度_mean_rel_change" in out.columns:
         score += (-_safe_numeric(out["推进速度_mean_rel_change"])).clip(lower=0) * 8
+
+    # 6. 推力升高，权重 5
+    # rel_change 为正表示高于全局均值，只对升高部分加分。
     if "推力_mean_rel_change" in out.columns:
         score += _safe_numeric(out["推力_mean_rel_change"]).clip(lower=0) * 5
+
+    # 7. 刀盘扭矩升高，权重 5
+    # rel_change 为正表示高于全局均值，只对升高部分加分。
     if "刀盘扭矩_mean_rel_change" in out.columns:
         score += _safe_numeric(out["刀盘扭矩_mean_rel_change"]).clip(lower=0) * 5
+
+    # 8. 地质-施工响应耦合指标，权重 8
+    # 优先使用新字段 GRCI；若不存在，则兼容旧字段 risk_response_coupling_index。
     if "GRCI" in out.columns:
         score += _safe_numeric(out["GRCI"]).clip(0, 1) * 8
     elif "risk_response_coupling_index" in out.columns:
         score += _safe_numeric(out["risk_response_coupling_index"]).clip(0, 1) * 8
 
+    # 9. 保存综合优先级分数
     out["typical_segment_priority_score"] = score
+
     # 兼容旧字段名
     out["priority_score"] = out["typical_segment_priority_score"]
+
+    # 10. 按优先级从高到低排序，并返回前 top_n 个典型区段
     out = out.sort_values("typical_segment_priority_score", ascending=False).reset_index(drop=True)
     return out.head(top_n)

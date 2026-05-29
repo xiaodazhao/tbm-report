@@ -10,7 +10,7 @@ from pathlib import Path
 # =========================================================
 
 # 你的项目文件夹路径
-ROOT_DIR = r"/Users/zhaoxiaoda/Desktop/未命名文件夹 2/tbm_twin_refactor"
+ROOT_DIR = r"/Users/zhaoxiaoda/Desktop/llmnew/backend/geology_v2"
 
 # 输出 txt 文件
 OUTPUT_FILE = "all_python_code.txt"

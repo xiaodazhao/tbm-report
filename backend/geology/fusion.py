@@ -21,33 +21,69 @@ GRADE_ORDER = {
 
 def get_active(chainage, evidence, point_buffer=5.0):
     """
-    获取当前里程命中的所有地质证据
-    - segment / report_conclusion: 按区间命中
-    - point: 按点位缓冲命中
+    获取当前里程命中的所有地质证据。
+
+    参数：
+        chainage:
+            当前 TBM/PLC 记录对应的里程值。
+
+        evidence:
+            地质证据库表，每一行是一条地质证据。
+            通常包含 start_num、end_num、source_level、source_type、attrs_json 等字段。
+
+        point_buffer:
+            点状证据的匹配缓冲范围，单位为米。
+            例如掌子面素描是一个点位，不是区间，因此允许前后一定范围内匹配。
+
+    匹配规则：
+        1. segment / report_conclusion：
+           按 start_num ~ end_num 区间匹配，并加入 TOLERANCE_M 容差。
+
+        2. point：
+           按点位前后 point_buffer 米进行缓冲匹配。
+
+    返回：
+        当前 chainage 命中的所有地质证据 hit_df。
     """
+
+    # 1. 如果证据库为空，则当前里程没有可匹配的地质证据
     if evidence is None or evidence.empty:
         return evidence
 
+    # 2. 兼容旧版 evidence 表
+    # 如果没有 source_level 字段，则默认所有证据都是区间证据，
+    # 直接按照 start_num ~ end_num 区间进行匹配。
     if "source_level" not in evidence.columns:
         return evidence[
             (evidence["start_num"] - TOLERANCE_M <= chainage) &
             (evidence["end_num"] + TOLERANCE_M >= chainage)
         ]
 
+    # 3. 将证据分成两类：
+    #    - seg_df：区间型证据，包括 segment、report_conclusion 等
+    #    - point_df：点状证据，例如掌子面素描、现场点位观测等
     seg_df = evidence[evidence["source_level"] != "point"].copy()
     point_df = evidence[evidence["source_level"] == "point"].copy()
 
+    # 4. 区间型证据匹配
+    # 当前 chainage 落在 start_num ~ end_num 范围内，则认为命中。
+    # TOLERANCE_M 用于处理里程解析误差或数据对齐误差。
     hit_seg = seg_df[
         (seg_df["start_num"] - TOLERANCE_M <= chainage) &
         (seg_df["end_num"] + TOLERANCE_M >= chainage)
     ]
 
+    # 5. 点状证据匹配
+    # 点状证据没有严格区间，因此使用 point_buffer 做前后缓冲。
+    # 例如掌子面素描点位前后 5 m 内都认为可以参考。
     hit_point = point_df[
         (point_df["start_num"] - point_buffer <= chainage) &
         (point_df["end_num"] + point_buffer >= chainage)
     ]
 
+    # 6. 将区间命中的证据和点位缓冲命中的证据合并返回
     return pd.concat([hit_seg, hit_point], ignore_index=True)
+
 def normalize_report_id(report_id: str) -> str:
     """
     规范化报告ID，避免同一报告因命名差异被重复统计
@@ -237,7 +273,16 @@ def _merge_field_mode(parsed_rows, key):
             vals.append(x)
     return _pick_mode(vals)
 
-
+# fuse 是逐里程地质事实融合函数。
+# 输入是当前 chainage 命中的多条地质证据 hit_df。
+# 它不直接做风险等级评定，而是融合事实信息：
+#   1. 围岩等级：提取所有 support_grade/rock_grade，并取最不利等级
+#   2. 出水/掉块/变形：只要任一证据出现，就置为 1
+#   3. 岩性、风化、裂隙、岩体状态：按字段众数或规则合并
+#   4. 灾害标签：合并 risk_tags、水害、掉块、破碎等标签
+#   5. 来源统计：统计 source_type + report_id 组合数
+#   6. 不确定性：多源证据越多，不确定性越低
+# 输出是一条当前里程的地质事实标签记录，后续会 merge 回 df_geo。
 def fuse(chainage, df):
     """
     对某一里程的命中证据进行融合
@@ -433,16 +478,50 @@ def fuse(chainage, df):
 
 def annotate_unique_chainage(unique_chainage_df, evidence):
     """
-    对唯一里程表做逐里程注记
+    对唯一里程表做逐里程注记。
+
+    输入：
+        unique_chainage_df:
+            从 PLC 数据中提取出来的唯一里程表，通常只包含 chainage 一列。
+            这样可以避免对相同里程重复执行地质证据匹配。
+
+        evidence:
+            地质证据库表，包含 TSP/HSP/掌子面素描/钻孔等多源地质证据。
+            每条证据通常具有 start_num、end_num、source_type、source_level、attrs_json 等字段。
+
+    输出：
+        一个 DataFrame。
+        每一行对应一个唯一 chainage 的地质融合结果。
+        后续会按照 chainage merge 回原始 PLC 数据表。
     """
+
+    # 用列表暂存每一个唯一里程的融合结果。
+    # 每个元素通常是一个 dict，例如：
+    # {"chainage": x, "risk": "...", "risk_score": ..., "hazard": "..."}
     results = []
+
+    # 唯一里程数量，用于打印进度。
     total = len(unique_chainage_df)
 
+    # 遍历每一个唯一里程 x。
+    # 这里不是遍历原始 PLC 的每一行，而是遍历去重后的 chainage，
+    # 可以显著减少重复计算。
     for i, x in enumerate(unique_chainage_df["chainage"], start=1):
+
+        # 每处理 5000 个唯一里程打印一次进度，
+        # 避免大数据量时用户误以为程序卡死。
         if i % 5000 == 0:
             print(f"已处理唯一里程: {i}/{total}")
 
+        # 1. 根据当前里程 x，从 evidence 中筛选出有效地质证据。
+        # get_active 负责判断哪些证据的 start_num/end_num 范围覆盖当前里程。
         hit_df = get_active(x, evidence)
+
+        # 2. 将当前里程命中的多条证据融合成一条地质标签记录。
+        # fuse 负责生成 risk、risk_score、hazard、fused_grade、
+        # active_source_count、water_flag、collapse_flag 等字段。
         results.append(fuse(x, hit_df))
 
+    # 将所有唯一里程的融合结果转成 DataFrame。
+    # 之后 attach_geology_labels 会用 chainage 把它 merge 回原始 PLC 数据。
     return pd.DataFrame(results)

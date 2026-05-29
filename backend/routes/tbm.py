@@ -306,7 +306,7 @@ def _build_history_payload(current_date: str, result: dict, limit: int) -> dict:
         "history_comparison": serialize_for_json(history_comparison),
     }
 
-
+# 这里定义 /api/tbm 下的所有接口
 def register_tbm_routes(
     app: FastAPI,
     analyze_tbm_data,
@@ -324,7 +324,8 @@ def register_tbm_routes(
     def _resolve_daily_path(date: Optional[str] = None) -> Path:
         """Resolve daily path."""
         return get_csv_path_by_date(date) if date else get_latest_csv_path()
-
+    
+    # 根据日期找到 CSV，读取数据，调用 analyze_tbm_data，返回统一分析结果 result
     def _get_daily_analysis(date: Optional[str] = None) -> tuple[Path, dict, list[str], dict, str | None]:
         """Get daily analysis."""
         path = _resolve_daily_path(date)

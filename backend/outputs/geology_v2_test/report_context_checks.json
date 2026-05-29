@@ -1,0 +1,10 @@
+{
+  "context_ok": true,
+  "has_texts": true,
+  "has_prompt_block": true,
+  "has_sections": true,
+  "has_forward_section": true,
+  "has_coupling_section": true,
+  "rendered_report_not_empty": true,
+  "prompt_text_consistent": true
+}

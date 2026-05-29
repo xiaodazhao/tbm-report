@@ -20,16 +20,26 @@ def _value_counts(df: pd.DataFrame, col: str | None, top_n: int | None = None):
 
 def summarize_geology_record_level(df: pd.DataFrame):
     """Generate record-level geology summary for auxiliary interpretation."""
+    #如果 df 里没有 active_report_source_count 或 active_source_count，说明这张表还没有地质融合字段。
     source_col = _first_existing(df, ["active_report_source_count", "active_source_count"])
     if source_col is None:
         return {"has_geology": False, "summary_text": "未进行地质融合分析。"}
-
+    
+    #兼容旧字段
     coverage_col = _first_existing(df, ["geo_coverage_status", "coverage"])
     hazard_col = _first_existing(df, ["geo_hazard_summary", "hazard"])
     evidence_col = _first_existing(df, ["matched_evidence_record_count", "evidence_count"])
     support_col = _first_existing(df, ["evidence_support_weight_sum", "weighted_evidence_strength"])
     uncertainty_col = _first_existing(df, ["geo_fusion_uncertainty", "uncertainty"])
 
+    """
+    sample_count = 这一天共有多少条 PLC 记录
+    coverage_counts = none/single/multi 各有多少条
+    hazard_counts = 最常见的地质标签前 5 个
+    fusion_uncertainty_counts = high/medium/low 各多少条
+    max_active_report_source_count = 单条记录最多命中几个来源
+    mean_active_report_source_count = 平均每条记录命中几个来源
+    """
     result = {
         "has_geology": True,
         "sample_count": int(len(df)),
@@ -39,6 +49,7 @@ def summarize_geology_record_level(df: pd.DataFrame):
         "max_active_report_source_count": int(pd.to_numeric(df[source_col], errors="coerce").max()) if source_col else None,
         "mean_active_report_source_count": float(pd.to_numeric(df[source_col], errors="coerce").mean()) if source_col else None,
     }
+    #地质证据支撑是否充分，可以统计 evidence_count 或 evidence_support_weight_sum 的最大值和平均值来反映证据数量和强度。
     if evidence_col:
         result["max_matched_evidence_record_count"] = int(pd.to_numeric(df[evidence_col], errors="coerce").max())
         result["mean_matched_evidence_record_count"] = float(pd.to_numeric(df[evidence_col], errors="coerce").mean())
@@ -46,6 +57,7 @@ def summarize_geology_record_level(df: pd.DataFrame):
         result["max_evidence_support_weight_sum"] = float(pd.to_numeric(df[support_col], errors="coerce").max())
         result["mean_evidence_support_weight_sum"] = float(pd.to_numeric(df[support_col], errors="coerce").mean())
 
+    # 如果 active_report_source_count/active_source_count≥4 的记录数量较多，说明有多个来源的证据在支撑当前里程的地质标签，证据较为充分。
     high_source_df = df[pd.to_numeric(df[source_col], errors="coerce").fillna(0) >= 4]
     result["high_source_support_record_count"] = int(len(high_source_df))
 
@@ -87,6 +99,12 @@ def summarize_geology_segment_level(segment_df: pd.DataFrame):
     interp_col = _first_existing(segment_df, ["segment_response_interpretation", "interpretation"])
     attention_col = _first_existing(segment_df, ["geo_attention_hint_level"])
 
+
+    """一共有多少个区段
+    各类地质关注标签出现多少个区段
+    各类围岩等级出现多少个区段
+    各类地质关注等级出现多少个区段
+    施工响应解释类型分布"""
     result = {
         "has_geology": True,
         "segment_count": int(len(segment_df)),
@@ -99,6 +117,7 @@ def summarize_geology_segment_level(segment_df: pd.DataFrame):
     multi_source_df = segment_df[pd.to_numeric(segment_df[source_col], errors="coerce").fillna(0) >= 3] if source_col else pd.DataFrame()
     result["multi_report_source_segment_count"] = int(len(multi_source_df))
 
+    # 如果地质关注提示分为 high/medium/low，统计 high 的区段数量；如果没有这个字段，可以用 active_report_source_count_max≥4 来近似替代。
     if "geo_attention_hint_score" in segment_df.columns:
         high_geo_df = segment_df[pd.to_numeric(segment_df["geo_attention_hint_score"], errors="coerce").fillna(0) >= 0.70]
     elif source_col:
@@ -107,6 +126,8 @@ def summarize_geology_segment_level(segment_df: pd.DataFrame):
         high_geo_df = pd.DataFrame()
     result["high_geo_attention_segment_count"] = int(len(high_geo_df))
 
+
+    # 如果有 GRCI 字段，可以统计 GRCI≥0.55 的高耦合关注区段数量；如果没有 GRCI 字段，可以用 active_report_source_count_max≥4 来近似替代。
     if "GRCI" in segment_df.columns:
         high_coupling_df = segment_df[pd.to_numeric(segment_df["GRCI"], errors="coerce").fillna(0) >= 0.55]
         result["high_coupling_segment_count"] = int(len(high_coupling_df))
