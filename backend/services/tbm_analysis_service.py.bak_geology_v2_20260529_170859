@@ -218,152 +218,22 @@ def risk_probability_to_text(df_geo):
 #   geology_result：包含 df_geo、geo_text、forward_risk_text、
 #   coupling_summary、high_attention_segments 等地质相关结果
 # ============================================================
-
-# ============================================================
-# geology_v2 接入辅助函数
-# ============================================================
-def _infer_current_chainage_for_geology_v2(df: pd.DataFrame) -> float | None:
-    # 从 PLC/df_geo 中推断当前掌子面里程。
-    # 优先使用 chainage 最后一条有效记录，保持与原有 _run_geology_analysis 逻辑一致。
-    if df is None or df.empty or "chainage" not in df.columns:
-        return None
-
-    values = pd.to_numeric(df["chainage"], errors="coerce").dropna()
-    if values.empty:
-        return None
-
-    return float(values.iloc[-1])
-
-
-def _run_geology_v2_context_safe(
-    *,
-    df_geo: pd.DataFrame,
-    evidence_df: pd.DataFrame,
-    current_chainage: float | None,
-    context: dict | None = None,
-) -> dict:
-    # 安全运行 geology_v2 pipeline。
-    # online 模式会进行 evidence availability filter，避免未来超前预报/解释结论泄漏。
-    # 这里不替代旧的 GRS/RAI/GRCI 主链路，只补充 geology_v2 上下文。
-    # 失败时返回 ok=False，不抛出到主报告流程。
-    if run_geology_v2_context is None:
-        return {
-            "ok": False,
-            "warnings": ["geology_v2.pipeline 未能导入，跳过 geology_v2 接入。"],
-            "texts": {},
-            "data_summary": {},
-        }
-
-    if current_chainage is None:
-        return {
-            "ok": False,
-            "warnings": ["缺少 current_chainage，跳过 geology_v2 接入。"],
-            "texts": {},
-            "data_summary": {},
-        }
-
-    ctx = context or {}
-    analysis_date = (
-        ctx.get("analysis_date")
-        or ctx.get("date")
-        or ctx.get("report_date")
-        or None
-    )
-
-    try:
-        return run_geology_v2_context(
-            df_plc=df_geo,
-            evidence_df=evidence_df,
-            current_chainage=current_chainage,
-            analysis_date=analysis_date,
-            mode=ctx.get("geology_v2_mode", "online"),
-            advance_direction=ctx.get("advance_direction", 1),
-            lookahead_m=float(ctx.get("geology_v2_lookahead_m", 30.0)),
-            cell_length=float(ctx.get("geology_v2_cell_length_m", 10.0)),
-            review_back_m=float(ctx.get("geology_v2_review_back_m", 20.0)),
-            review_forward_m=float(ctx.get("geology_v2_review_forward_m", 40.0)),
-            build_report=True,
-            base_context={
-                "analysis_mode": ctx.get("analysis_mode"),
-                "source_name": ctx.get("source_name"),
-                "source_path": ctx.get("source_path"),
-            },
-        )
-    except Exception as exc:
-        return {
-            "ok": False,
-            "warnings": [f"geology_v2 pipeline 运行失败：{exc}"],
-            "texts": {},
-            "data_summary": {},
-        }
-
-
-def _apply_geology_v2_to_llm_summary(
-    llm_summary: dict,
-    geology_result: dict,
-) -> dict:
-    # 将 geology_v2 文本接入 LLM summary 的 prompt_text_inputs。
-    # 原 prompt_builder 已经读取 excavated_segment_text 和 forward_risk_text，
-    # 这里只替换这两个面向报告的文本入口。
-    if not isinstance(llm_summary, dict):
-        return llm_summary
-
-    v2_result = geology_result.get("geology_v2_result") or {}
-    if not isinstance(v2_result, dict) or not v2_result.get("ok"):
-        return llm_summary
-
-    texts = geology_result.get("geology_v2_texts") or {}
-    if not isinstance(texts, dict):
-        texts = {}
-
-    prompt_text_inputs = llm_summary.setdefault("prompt_text_inputs", {})
-
-    geo_brief_text = str(texts.get("geo_brief_text") or "").strip()
-    forward_text = str(texts.get("forward_text") or "").strip()
-    prompt_block = str(geology_result.get("geology_v2_prompt_block") or texts.get("prompt_block") or "").strip()
-    rendered_text = str(geology_result.get("geology_v2_rendered_text") or "").strip()
-
-    # 已开挖区段摘要：优先采用 geology_v2 的严格 cell 融合摘要。
-    if geo_brief_text:
-        prompt_text_inputs["excavated_segment_text"] = geo_brief_text
-
-    # 前方风险提示：优先采用 geology_v2 的 forward_profile 文本。
-    # 该文本明确说明“关注等级不等于灾害概率”，适合直接进报告。
-    if forward_text:
-        prompt_text_inputs["forward_risk_text"] = forward_text
-        llm_summary["forward_risk_text"] = forward_text
-
-    # 保留完整块，方便后续前端/调试读取；当前 prompt_builder 不强制展示该字段。
-    if prompt_block:
-        prompt_text_inputs["geology_v2_prompt_block"] = prompt_block
-        llm_summary["geology_v2_prompt_block"] = prompt_block
-
-    if rendered_text:
-        llm_summary["geology_v2_rendered_text"] = rendered_text
-
-    llm_summary["geology_v2_data_summary"] = serialize_for_json(
-        geology_result.get("geology_v2_data_summary", {})
-    )
-    llm_summary["geology_v2_context"] = serialize_for_json(
-        geology_result.get("geology_v2_context", {})
-    )
-
-    return llm_summary
-
-
-def _run_geology_analysis(df: pd.DataFrame, context: dict | None = None) -> dict:
-    # Run geology analysis with legacy geology chain + optional geology_v2 context.
+def _run_geology_analysis(df: pd.DataFrame) -> dict:
+    """Run geology analysis."""
     try:
         evidence_df = load_evidence_db(EVIDENCE_DB_PATH)
-
-        # 1. 旧链路：按里程将地质证据融合到 TBM 运行数据上
+        # 2. 按里程将地质证据融合到 TBM 运行数据上
+        # df_geo = 原始 PLC 数据 + 地质风险标签 + 围岩等级 + 灾害类型 + 多源证据数量
         df_geo = attach_geology_labels(df, evidence_df)
         df_geo = annotate_routine_ring_building_stops(df_geo)
-
-        current_chainage = _infer_current_chainage_for_geology_v2(df_geo)
-
-        # 2. 旧链路：已开挖区段分析 + GRS/RAI/GRCI 耦合分析
-        segment_df = run_segment_analysis(df_geo, segment_length=10)
+        current_chainage = None
+        if "chainage" in df_geo.columns:
+            valid_chainage = pd.to_numeric(df_geo["chainage"], errors="coerce").dropna()
+            if not valid_chainage.empty:
+                current_chainage = float(valid_chainage.iloc[-1])
+        # 4. 对已开挖区段进行区段级分析，并提取典型高关注区段
+        segment_df = run_segment_analysis(df_geo, segment_length=10)#按里程区段分析地质/施工表现
+        #做 GRS、RAI、GRCI 耦合分析
         coupling_analysis_result = run_coupling_analysis(
             df_geo=df_geo,
             segment_length=10,
@@ -382,18 +252,19 @@ def _run_geology_analysis(df: pd.DataFrame, context: dict | None = None) -> dict
         top_rai_segments = coupling_analysis_result.get("top_rai_segments", [])
         weak_label_validation = coupling_analysis_result.get("weak_label_validation", coupling_validation)
 
-        # 3. 旧链路：记录级/区段级摘要、典型区段、前方风险提示
-        geo_summary_record = summarize_geology_record_level(df_geo)
-        geo_summary_segment = summarize_geology_segment_level(segment_df)
-        typical_segments_df = build_typical_segments_table(segment_df, top_n=20)
-
+        # 3. 生成记录级地质摘要和区段级地质摘要
+        # record_level 偏细，segment_level 偏报告表达
+        geo_summary_record = summarize_geology_record_level(df_geo)#按记录总结地质表现和施工响应
+        geo_summary_segment = summarize_geology_segment_level(segment_df)#按区段总结地质表现和施工响应
+        typical_segments_df = build_typical_segments_table(segment_df, top_n=20)#提取典型地质区段
+        #生成掌子面前方风险提示
         forward_risk_summary = generate_forward_risk_summary(
             df_plc=df_geo,
             evidence_df=evidence_df,
             lookahead_m=30,
         )
 
-        geology_result = {
+        return {
             "df_geo": df_geo,
             "segment_df": segment_df,
             "typical_segments_df": typical_segments_df,
@@ -416,56 +287,6 @@ def _run_geology_analysis(df: pd.DataFrame, context: dict | None = None) -> dict
             "weak_label_validation": weak_label_validation,
             "warnings": [],
         }
-
-        # 4. 新链路：geology_v2 并行上下文
-        geology_v2_result = _run_geology_v2_context_safe(
-            df_geo=df_geo,
-            evidence_df=evidence_df,
-            current_chainage=current_chainage,
-            context=context,
-        )
-
-        geology_v2_texts = geology_v2_result.get("texts") or {}
-        if not isinstance(geology_v2_texts, dict):
-            geology_v2_texts = {}
-
-        geology_v2_prompt = ""
-        if geology_v2_result.get("ok"):
-            if geology_v2_prompt_block is not None:
-                try:
-                    geology_v2_prompt = geology_v2_prompt_block(geology_v2_result)
-                except Exception:
-                    geology_v2_prompt = str(geology_v2_texts.get("prompt_block") or "")
-            else:
-                geology_v2_prompt = str(geology_v2_texts.get("prompt_block") or "")
-
-            # 面向报告的文本入口优先使用 v2。
-            # 注意：不覆盖 coupling_summary，避免 v2 无响应数据时把旧 GRCI 结果冲掉。
-            if geology_v2_texts.get("geo_brief_text"):
-                geology_result["geo_text"] = str(geology_v2_texts["geo_brief_text"])
-            if geology_v2_texts.get("forward_text"):
-                geology_result["forward_risk_text"] = str(geology_v2_texts["forward_text"])
-        else:
-            geology_result["warnings"].extend(geology_v2_result.get("warnings", []))
-
-        geology_result.update(
-            {
-                "geology_v2_result": geology_v2_result,
-                "geology_v2_context": geology_v2_result.get("report_context", {}),
-                "geology_v2_prompt_block": geology_v2_prompt,
-                "geology_v2_rendered_text": geology_v2_result.get("rendered_report_text", ""),
-                "geology_v2_data_summary": geology_v2_result.get("data_summary", {}),
-                "geology_v2_texts": geology_v2_texts,
-                "geology_v2_forward_profile": geology_v2_result.get("forward_profile", {}),
-                "geology_v2_warnings": geology_v2_result.get("warnings", []),
-                "geology_v2_geo_states_df": geology_v2_result.get("geo_states_df", pd.DataFrame()),
-                "geology_v2_cell_evidence_df": geology_v2_result.get("cell_evidence_df", pd.DataFrame()),
-                "geology_v2_normalized_df": geology_v2_result.get("normalized_df", pd.DataFrame()),
-            }
-        )
-
-        return geology_result
-
     except Exception as exc:
         print(f"[Geology Error] {exc}")
         return {
@@ -491,17 +312,6 @@ def _run_geology_analysis(df: pd.DataFrame, context: dict | None = None) -> dict
             "top_grs_segments": [],
             "top_rai_segments": [],
             "weak_label_validation": {},
-            "geology_v2_result": {"ok": False, "warnings": [f"主地质流程失败，未运行 geology_v2：{exc}"]},
-            "geology_v2_context": {},
-            "geology_v2_prompt_block": "",
-            "geology_v2_rendered_text": "",
-            "geology_v2_data_summary": {},
-            "geology_v2_texts": {},
-            "geology_v2_forward_profile": {},
-            "geology_v2_warnings": [f"主地质流程失败，未运行 geology_v2：{exc}"],
-            "geology_v2_geo_states_df": pd.DataFrame(),
-            "geology_v2_cell_evidence_df": pd.DataFrame(),
-            "geology_v2_normalized_df": pd.DataFrame(),
             "warnings": [f"地质融合分析已降级：{exc}"],
         }
 
@@ -860,7 +670,7 @@ def analyze_tbm_data(df: pd.DataFrame, context: dict | None = None):
     """Analyze tbm data."""
     context = context or {}
     # 1. 地质融合：把 evidence_db 和 PLC 里程对齐
-    geology_result = _run_geology_analysis(df, context=context)
+    geology_result = _run_geology_analysis(df)
     # 2. 基础工况：判断停机、过渡、稳定掘进、异常扭矩
     operation_result = _run_operation_analysis(geology_result["df_geo"])
     # 3. 聚类状态：用推力、扭矩、转速、推进速度做 KMeans
@@ -936,8 +746,6 @@ def analyze_tbm_data(df: pd.DataFrame, context: dict | None = None):
         digital_twin_state=digital_twin_state,
         cst_state=cst_state,
     )
-    llm_summary = _apply_geology_v2_to_llm_summary(llm_summary, geology_result)
-
     # Keep structural Twin/CST state independent from LLM summary/prompt text.
     # Only a lightweight reference is kept to avoid recursive references and semantic drift.
     if isinstance(cst_state, dict):
@@ -1001,13 +809,6 @@ def analyze_tbm_data(df: pd.DataFrame, context: dict | None = None):
     "llm_summary": llm_summary,  # 给 LLM 报告生成使用的统一结构化摘要
     "face_geo_text": geology_result["face_geo_text"],  # 当前掌子面地质描述文本，主要给 LLM 报告使用
     "risk_prob_text": risk_prob_text,  # 补充风险剖面文本，注意这里不是严格概率，应理解为风险/关注度描述
-    "geology_v2_context": geology_result.get("geology_v2_context", {}),  # geology_v2 统一报告上下文
-    "geology_v2_prompt_block": geology_result.get("geology_v2_prompt_block", ""),  # geology_v2 给 LLM 的完整地质块
-    "geology_v2_rendered_text": geology_result.get("geology_v2_rendered_text", ""),  # geology_v2 渲染后的地质报告文本
-    "geology_v2_data_summary": geology_result.get("geology_v2_data_summary", {}),  # geology_v2 诊断摘要
-    "geology_v2_texts": geology_result.get("geology_v2_texts", {}),  # geology_v2 各类文本
-    "geology_v2_forward_profile": geology_result.get("geology_v2_forward_profile", {}),  # geology_v2 前方分段剖面
-    "geology_v2_warnings": geology_result.get("geology_v2_warnings", []),  # geology_v2 警告
     "warnings": warnings,  # 分析过程中的警告信息，例如字段缺失、地质证据不足、耦合分析不可用等
 }
 

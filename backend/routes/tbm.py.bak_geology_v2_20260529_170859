@@ -292,12 +292,6 @@ def _build_geology_payload(result: dict) -> dict:
         "high_attention_segments": serialize_for_json(result.get("high_attention_segments", [])),
         "digital_twin_state": serialize_for_json(result.get("digital_twin_state", {})),
         "cst_state": serialize_for_json(result.get("cst_state", {})),
-        "geology_v2_context": serialize_for_json(result.get("geology_v2_context", {})),
-        "geology_v2_data_summary": serialize_for_json(result.get("geology_v2_data_summary", {})),
-        "geology_v2_prompt_block": result.get("geology_v2_prompt_block", ""),
-        "geology_v2_rendered_text": result.get("geology_v2_rendered_text", ""),
-        "geology_v2_forward_profile": serialize_for_json(result.get("geology_v2_forward_profile", {})),
-        "geology_v2_warnings": serialize_for_json(result.get("geology_v2_warnings", [])),
     }
 
 
