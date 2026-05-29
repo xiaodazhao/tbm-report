@@ -1,17 +1,17 @@
 {
-  "projection_count": 234,
+  "projection_count": 224,
   "cell_count": 22,
-  "evidence_count": 32,
+  "evidence_count": 28,
   "source_type_counts": {
     "TSP": 166,
-    "HSP": 59,
+    "HSP": 49,
     "face_sketch": 9
   },
   "spatial_type_counts": {
     "segment": 202,
-    "anomaly_point": 23,
+    "anomaly_point": 13,
     "point": 9
   },
   "effective_weight_max": 0.9872815715888194,
-  "effective_weight_mean": 0.49966212843776586
+  "effective_weight_mean": 0.505708707131939
 }

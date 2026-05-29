@@ -40,6 +40,7 @@ def _finalize_attrs(attrs: Dict[str, Any] | dict, parse_warnings=None) -> dict:
     out.setdefault("parse_quality", "rule_based")
     out.setdefault("parse_warnings", warnings)
     out.setdefault("source_semantics", _infer_source_semantics(out.get("fact_type")))
+
     # source_* is the parser-internal interpretation. System-wide geo_attention
     # should be produced later by fusion/model layers, not by parser risk_level.
     out.setdefault("source_risk_level", out.get("risk_level"))
@@ -48,7 +49,7 @@ def _finalize_attrs(attrs: Dict[str, Any] | dict, parse_warnings=None) -> dict:
 
 
 def _norm_text(text: str) -> str:
-    """Internal helper for norm text."""
+    """Normalize text while preserving line breaks."""
     if not text:
         return ""
     text = text.replace("\u3000", " ")
@@ -60,7 +61,7 @@ def _norm_text(text: str) -> str:
 
 
 def _flat_text(text: str) -> str:
-    """Internal helper for flat text."""
+    """Normalize text into a compact single-line string."""
     text = _norm_text(text)
     text = text.replace("\n", "")
     text = re.sub(r"\s+", "", text)
@@ -84,7 +85,7 @@ def _safe_mileage(x: Optional[str]) -> Optional[float]:
 
 
 def _extract_meta_from_text(text: str, pdf_name: str) -> Dict[str, Any]:
-    """Extract meta from text."""
+    """Extract report metadata from PDF text."""
     t = _norm_text(text)
 
     report_id = pdf_name.replace(".pdf", "")
@@ -92,11 +93,14 @@ def _extract_meta_from_text(text: str, pdf_name: str) -> Dict[str, Any]:
 
     report_date = (
         _safe_search(r"检测日期[:：]?\s*([0-9]{4}\s*年\s*[0-9]{1,2}\s*月\s*[0-9]{1,2}\s*日)", t)
+        or _safe_search(r"测试日期[:：]?\s*([0-9]{4}\s*年\s*[0-9]{1,2}\s*月\s*[0-9]{1,2}\s*日)", t)
         or _safe_search(r"(二〇[^\n]+)", t)
     )
 
     forecast = _safe_search(r"预报范围\s*(DyK\d+\+\d+\.?\d*\s*~\s*DyK\d+\+\d+\.?\d*)", t)
-    face = _safe_search(r"开挖面里程\s*(DyK\d+\+\d+\.?\d*)", t)
+    face = _safe_search(r"开挖面里\s*程\s*(DyK\d+\+\d+\.?\d*)", t) or _safe_search(
+        r"开挖面里程\s*(DyK\d+\+\d+\.?\d*)", t
+    )
     next_ = _safe_search(r"下次物探预报里程为\s*(DyK\d+\+\d+\.?\d*)", t)
 
     start_num, end_num = None, None
@@ -119,7 +123,7 @@ def _extract_meta_from_text(text: str, pdf_name: str) -> Dict[str, Any]:
 
 
 def _parse_range_cell(text: str):
-    """Parse range cell."""
+    """Parse chainage range cell."""
     if not text:
         return None
 
@@ -137,7 +141,7 @@ def _parse_range_cell(text: str):
 
 
 def _infer_anomaly_level(text: str) -> str:
-    """Infer anomaly level."""
+    """Infer HSP reflection anomaly level."""
     flat = _flat_text(text)
 
     # 顺序非常关键：先判断“未见”
@@ -151,7 +155,7 @@ def _infer_anomaly_level(text: str) -> str:
 
 
 def _extract_support_grade(text: str) -> Optional[str]:
-    """Extract support grade."""
+    """Extract support grade from text."""
     flat = _flat_text(text)
     m = re.search(r"([ⅠⅡⅢⅣⅤIVX]+)级围岩", flat)
     if m:
@@ -160,7 +164,7 @@ def _extract_support_grade(text: str) -> Optional[str]:
 
 
 def _extract_joint_degree(text: str) -> Optional[str]:
-    """Extract joint degree."""
+    """Extract joint development degree."""
     flat = _flat_text(text)
     if "节理裂隙发育密集" in flat:
         return "发育密集"
@@ -186,7 +190,7 @@ def _extract_rock_mass_state(text: str) -> Optional[str]:
 
 
 def _extract_weathering(text: str) -> Optional[str]:
-    """Extract weathering."""
+    """Extract weathering degree."""
     flat = _flat_text(text)
     for x in ["全风化", "强风化", "弱风化", "微风化", "未风化"]:
         if x in flat:
@@ -203,7 +207,7 @@ def _extract_rock_uniformity(text: str) -> Optional[str]:
 
 
 def _extract_stability(text: str) -> Optional[str]:
-    """Extract stability."""
+    """Extract stability description."""
     flat = _flat_text(text)
     if "围岩整体稳定性差" in flat or "围岩整体稳定性较差" in flat or "围岩自稳性差" in flat:
         return "较差"
@@ -221,32 +225,67 @@ def _extract_lithology(text: str) -> Optional[str]:
 
 
 def _extract_collapse_info(risk_hint: str, conclusion: str):
-    """Extract collapse info."""
+    """Extract collapse information.
+
+    修正原则：
+    1. collapse_flag 可以来自风险提示或结论中的“掉块”；
+    2. collapse_points 只能来自明确风险提示列；
+    3. 如果 risk_hint 只是里程范围，例如 DyK1013+190.2~DyK1013+224，
+       不能抽出 +190.2 / +224 当作掉块点；
+    4. 避免把段起点、段终点误生成 anomaly_point。
+    """
     flat_hint = _flat_text(risk_hint or "")
     flat_conc = _flat_text(conclusion or "")
-    flat = flat_hint + flat_conc
+    flat_all = flat_hint + flat_conc
 
-    collapse_flag = 1 if "掉块" in flat else 0
-
+    collapse_flag = 1 if "掉块" in flat_all else 0
     collapse_points = []
-    # 只从风险提示列抽里程点，不从range列误抽
-    pts = re.findall(r"\+(\d+\.?\d*)", flat_hint)
+
+    # 必须是明确风险提示，不是普通里程范围。
+    has_explicit_point_risk = (
+        "掉块风险" in flat_hint
+        or "附近有掉块" in flat_hint
+        or "有掉块风险" in flat_hint
+    )
+
+    if not has_explicit_point_risk:
+        return collapse_flag, collapse_points
+
+    # 去掉完整里程段，避免 DyK1013+190.2~DyK1013+224 被拆成 +190.2 和 +224。
+    hint_without_full_ranges = re.sub(
+        r"DyK\d+\+\d+\.?\d*\s*[~～\-]\s*DyK\d+\+\d+\.?\d*",
+        "",
+        flat_hint,
+    )
+
+    # 只抽“+224、+232附近有掉块风险”这种短桩号。
+    pts = re.findall(r"\+(\d+\.?\d*)", hint_without_full_ranges)
     for p in pts:
         try:
             collapse_points.append(float(p))
         except Exception:
             pass
 
-    return collapse_flag, collapse_points
+    # 去重保序。
+    out = []
+    seen = set()
+    for p in collapse_points:
+        key = round(float(p), 3)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(float(p))
+
+    return collapse_flag, out
 
 
 def _infer_risk_level(
     anomaly_level: str,
     collapse_flag: int,
     support_grade: Optional[str],
-    rock_mass_state: Optional[str]
+    rock_mass_state: Optional[str],
 ) -> str:
-    """Infer risk level."""
+    """Infer parser-local source risk level."""
     if anomaly_level == "strong" or collapse_flag == 1 or rock_mass_state in {"破碎-极破碎", "极破碎"}:
         return "high"
     if anomaly_level == "medium" or support_grade == "Ⅴ" or rock_mass_state in {"破碎", "较破碎"}:
@@ -259,9 +298,9 @@ def _build_risk_tags(
     collapse_flag: int,
     joint_degree: Optional[str],
     rock_mass_state: Optional[str],
-    support_grade: Optional[str]
+    support_grade: Optional[str],
 ):
-    """Build risk tags."""
+    """Build parser-local risk tags."""
     tags = []
 
     if anomaly_level == "strong":
@@ -295,7 +334,7 @@ def _build_risk_tags(
 
 
 def _score_range_cell(text: str) -> int:
-    """Internal helper for score range cell."""
+    """Score whether a cell is a chainage range cell."""
     flat = _flat_text(text)
     if re.search(r"DyK\d+\+\d+\.?\d*", flat) and "~" in flat:
         return 3
@@ -303,47 +342,84 @@ def _score_range_cell(text: str) -> int:
 
 
 def _score_detect_cell(text: str) -> int:
-    """Internal helper for score detect cell."""
+    """Score whether a cell is a geophysical detection result cell."""
     flat = _flat_text(text)
     keys = ["未见明显反射异常", "较明显反射异常", "明显反射异常", "反射异常"]
     return sum(1 for k in keys if k in flat)
 
 
 def _score_conclusion_cell(text: str) -> int:
-    """Internal helper for score conclusion cell."""
+    """Score whether a cell is a forecast conclusion cell."""
     flat = _flat_text(text)
     keys = ["围岩", "岩性", "弱风化", "软硬不均", "裂隙", "岩体", "稳定性", "变差", "变好", "掌子面相当"]
     return sum(1 for k in keys if k in flat)
 
 
 def _score_risk_hint_cell(text: str) -> int:
-    """Internal helper for score risk hint cell."""
+    """Score whether a cell is an explicit risk hint cell.
+
+    只识别真正风险提示，不把普通里程范围当作 risk_hint。
+    """
     flat = _flat_text(text)
-    keys = ["掉块风险", "附近有掉块", "风险提示"]
-    return sum(1 for k in keys if k in flat)
+
+    score = 0
+    if "掉块风险" in flat:
+        score += 3
+    if "附近有掉块" in flat:
+        score += 3
+    if "有掉块风险" in flat:
+        score += 3
+    if "里程+" in flat and "掉块" in flat:
+        score += 2
+
+    # 表头不应被选成风险提示。
+    if flat in {"风险提示", "风险提示建议"}:
+        return 0
+
+    return score
 
 
 def _score_grade_cell(text: str) -> int:
-    """Internal helper for score grade cell."""
+    """Score whether a cell is a support grade cell."""
     flat = _flat_text(text)
     if re.search(r"[ⅠⅡⅢⅣⅤIVX]+级围岩", flat):
         return 3
     return 0
 
 
+def _best_scored_cell(non_empty: List[str], score_func, min_score: int = 1) -> str:
+    """Return the best scored cell only if its score reaches min_score."""
+    if not non_empty:
+        return ""
+
+    scored = [(c, score_func(c)) for c in non_empty]
+    best_cell, best_score = max(scored, key=lambda x: x[1])
+
+    if best_score >= min_score:
+        return best_cell
+
+    return ""
+
+
 def _pick_cells_from_row(row: List[str]) -> Dict[str, str]:
-    """Internal helper for pick cells from row."""
+    """Pick semantic cells from one pdfplumber table row.
+
+    修正点：
+    - range_cell 必须识别到真实里程段；
+    - detect / conclusion / risk_hint / grade 只有打分达到阈值才保留；
+    - 避免在无风险提示时，把“里程范围”误当成 risk_hint。
+    """
     cells = [("" if c is None else str(c).strip()) for c in row]
     non_empty = [c for c in cells if c]
 
     if not non_empty:
         return {"range": "", "detect": "", "conclusion": "", "risk_hint": "", "grade": ""}
 
-    range_cell = max(non_empty, key=_score_range_cell, default="")
-    detect_cell = max(non_empty, key=_score_detect_cell, default="")
-    conclusion_cell = max(non_empty, key=_score_conclusion_cell, default="")
-    risk_hint_cell = max(non_empty, key=_score_risk_hint_cell, default="")
-    grade_cell = max(non_empty, key=_score_grade_cell, default="")
+    range_cell = _best_scored_cell(non_empty, _score_range_cell, min_score=3)
+    detect_cell = _best_scored_cell(non_empty, _score_detect_cell, min_score=1)
+    conclusion_cell = _best_scored_cell(non_empty, _score_conclusion_cell, min_score=1)
+    risk_hint_cell = _best_scored_cell(non_empty, _score_risk_hint_cell, min_score=1)
+    grade_cell = _best_scored_cell(non_empty, _score_grade_cell, min_score=3)
 
     return {
         "range": range_cell,
@@ -355,13 +431,13 @@ def _pick_cells_from_row(row: List[str]) -> Dict[str, str]:
 
 
 def _is_valid_hsp_row(picked: Dict[str, str]) -> bool:
-    """Internal helper for is valid hsp row."""
+    """Check whether a picked row is a valid HSP forecast row."""
     range_text = picked.get("range", "") or ""
     detect_text = picked.get("detect", "") or ""
     conclusion_text = picked.get("conclusion", "") or ""
     grade_text = picked.get("grade", "") or ""
 
-    # 必须有里程段
+    # 必须有里程段。
     if not range_text:
         return False
 
@@ -373,7 +449,7 @@ def _is_valid_hsp_row(picked: Dict[str, str]) -> bool:
     if len(miles) < 2:
         return False
 
-    # 排除“预报范围”这种假行
+    # 排除“预报范围”这种假行。
     flat_detect = _flat_text(detect_text)
     flat_conc = _flat_text(conclusion_text)
     flat_grade = _flat_text(grade_text)
@@ -381,7 +457,7 @@ def _is_valid_hsp_row(picked: Dict[str, str]) -> bool:
     if "预报范围" in flat_range or "预报范围" in flat_detect or "预报范围" in flat_conc:
         return False
 
-    # 必须至少包含 检测结果 / 结论 / 等级 其中之一
+    # 必须至少包含 检测结果 / 结论 / 等级 其中之一。
     useful = False
     if any(x in flat_detect for x in ["未见明显反射异常", "较明显反射异常", "明显反射异常", "反射异常"]):
         useful = True
@@ -394,7 +470,7 @@ def _is_valid_hsp_row(picked: Dict[str, str]) -> bool:
 
 
 def _parse_hsp_row_to_record(row_data: Dict[str, str], meta: Dict[str, Any], idx: int) -> Optional[EvidenceRecord]:
-    """Parse hsp row to record."""
+    """Parse one HSP table row into an EvidenceRecord."""
     range_info = _parse_range_cell(row_data.get("range", ""))
     if not range_info:
         return None
@@ -473,12 +549,12 @@ def _parse_hsp_row_to_record(row_data: Dict[str, str], meta: Dict[str, Any], idx
         next_forecast_num=meta["next_forecast_num"],
         confidence="medium",
         attrs_json=json.dumps(_finalize_attrs(attrs), ensure_ascii=False),
-        raw_text=raw_text
+        raw_text=raw_text,
     )
 
 
 def parse_hsp_pdf(pdf_path: Path) -> List[EvidenceRecord]:
-    """Parse hsp pdf."""
+    """Parse one HSP PDF into EvidenceRecord list."""
     doc = fitz.open(pdf_path)
     try:
         text = "\n".join([p.get_text() for p in doc])
@@ -494,7 +570,7 @@ def parse_hsp_pdf(pdf_path: Path) -> List[EvidenceRecord]:
         for page in pdf.pages:
             page_text = page.extract_text() or ""
 
-            # 只看表1那页
+            # 只看表1那页。
             if ("表 1" not in page_text and "表1" not in page_text) or "隧道超前地质预报报表" not in page_text:
                 continue
 

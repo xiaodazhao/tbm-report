@@ -2,6 +2,9 @@
 # 放在 backend/ceshi.py 运行
 
 import json
+import sys
+import traceback
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -12,6 +15,11 @@ from geology_v2.evidence_normalizer import (
     normalize_evidence_df,
     filter_available_evidence,
     summarize_normalized_evidence,
+)
+
+from geology_v2.evidence_dedup import (
+    deduplicate_hsp_anomaly_points,
+    summarize_hsp_anomaly_point_dedup,
 )
 
 from geology_v2.cell_builder import build_chainage_cells
@@ -56,8 +64,8 @@ from geology_v2.report_renderer import (
 from geology_v2.explainability import (
     explain_geo_state,
     explain_geo_state_text,
-    print_geo_state_explanation,
 )
+
 
 # =========================================================
 # 测试参数
@@ -193,17 +201,153 @@ def main():
     print("availability filter attrs:")
     print(availability_filter_info)
 
-    print("excluded_unavailable_prediction_count =",
-      availability_filter_info.get("excluded_unavailable_prediction_count"))
+    print(
+        "excluded_unavailable_prediction_count =",
+        availability_filter_info.get("excluded_unavailable_prediction_count"),
+    )
 
-    print("excluded_missing_face_chainage_count =",
-      availability_filter_info.get("excluded_missing_face_chainage_count"))
+    print(
+        "excluded_missing_face_chainage_count =",
+        availability_filter_info.get("excluded_missing_face_chainage_count"),
+    )
 
     print("normalized_df after availability filter shape =", normalized_df.shape)
     print(normalized_df.head())
 
+    normalized_summary_before_dedup = summarize_normalized_evidence(normalized_df)
+    print("normalized summary after availability filter, before HSP anomaly_point dedup:")
+    print(normalized_summary_before_dedup)
+
+    safe_json_dump(
+        normalized_summary_before_dedup,
+        out_dir / "normalized_summary_after_available_filter_before_hsp_dedup.json",
+    )
+
+    normalized_df_before_hsp_dedup = normalized_df.copy()
+    normalized_df_before_hsp_dedup.to_csv(
+        out_dir / "normalized_evidence_df_before_hsp_anomaly_point_dedup.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    # =========================================================
+    # 2.x HSP anomaly_point 边界重复去重
+    # 必须放在 availability filter 之后、project_evidence_to_cells 之前
+    # =========================================================
+    print_title("2.x HSP anomaly_point 边界重复去重")
+
+    hsp_anomaly_before = normalized_df[
+        normalized_df.get("source_type_norm", pd.Series(dtype=str)).astype(str).eq("HSP")
+        & normalized_df.get("spatial_type", pd.Series(dtype=str)).astype(str).eq("anomaly_point")
+    ].copy()
+
+    print("HSP anomaly_point count before dedup =", len(hsp_anomaly_before))
+
+    if not hsp_anomaly_before.empty:
+        before_cols = [
+            "evidence_id",
+            "report_id",
+            "source_type_norm",
+            "spatial_type",
+            "face_chainage",
+            "center_chainage",
+            "collapse_flag",
+            "collapse_state",
+            "hazard_tags",
+        ]
+        before_cols = [c for c in before_cols if c in hsp_anomaly_before.columns]
+        print("HSP anomaly_point before dedup:")
+        print(
+            hsp_anomaly_before[before_cols]
+            .sort_values(["center_chainage", "evidence_id"], ascending=[True, True])
+            .to_string()
+        )
+
+    normalized_df = deduplicate_hsp_anomaly_points(
+        normalized_df=normalized_df,
+        chainage_tol_m=0.5,
+        face_tol_m=1.0,
+    )
+
+    hsp_dedup_info = summarize_hsp_anomaly_point_dedup(normalized_df)
+
+    print("HSP anomaly_point dedup attrs:")
+    print(json.dumps(hsp_dedup_info, ensure_ascii=False, indent=2, default=str))
+
+    hsp_anomaly_after = normalized_df[
+        normalized_df.get("source_type_norm", pd.Series(dtype=str)).astype(str).eq("HSP")
+        & normalized_df.get("spatial_type", pd.Series(dtype=str)).astype(str).eq("anomaly_point")
+    ].copy()
+
+    print("HSP anomaly_point count after dedup =", len(hsp_anomaly_after))
+    print(
+        "HSP anomaly_point count reduced =",
+        len(hsp_anomaly_before) - len(hsp_anomaly_after),
+    )
+
+    if not hsp_anomaly_after.empty:
+        after_cols = [
+            "evidence_id",
+            "report_id",
+            "source_type_norm",
+            "spatial_type",
+            "face_chainage",
+            "center_chainage",
+            "collapse_flag",
+            "collapse_state",
+            "hazard_tags",
+            "duplicate_count",
+            "duplicate_evidence_ids",
+            "dedup_note",
+        ]
+        after_cols = [c for c in after_cols if c in hsp_anomaly_after.columns]
+        print("HSP anomaly_point after dedup:")
+        print(
+            hsp_anomaly_after[after_cols]
+            .sort_values(["center_chainage", "evidence_id"], ascending=[True, True])
+            .to_string()
+        )
+
+    # 专门检查 DK1013+224 和 DK1013+265
+    for check_chainage in [1013224.0, 1013265.0]:
+        center_series = pd.to_numeric(
+            hsp_anomaly_after.get("center_chainage", pd.Series(dtype=float)),
+            errors="coerce",
+        )
+        part = hsp_anomaly_after[
+            center_series.sub(check_chainage).abs() <= 0.5
+        ].copy()
+
+        print(f"\nHSP anomaly_point near {check_chainage}: count =", len(part))
+        if not part.empty:
+            cols = [
+                "evidence_id",
+                "center_chainage",
+                "face_chainage",
+                "duplicate_count",
+                "duplicate_evidence_ids",
+                "dedup_note",
+                "hazard_tags",
+            ]
+            cols = [c for c in cols if c in part.columns]
+            print(part[cols].to_string())
+
+    safe_json_dump(
+        hsp_dedup_info,
+        out_dir / "hsp_anomaly_point_dedup_info.json",
+    )
+
+    normalized_df.to_csv(
+        out_dir / "normalized_evidence_df_after_hsp_anomaly_point_dedup.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    print("normalized_df after HSP anomaly_point dedup shape =", normalized_df.shape)
+    print(normalized_df.head())
+
     normalized_summary = summarize_normalized_evidence(normalized_df)
-    print("normalized summary after availability filter:")
+    print("normalized summary after availability filter and HSP anomaly_point dedup:")
     print(normalized_summary)
 
     normalized_df.to_csv(
@@ -259,10 +403,14 @@ def main():
             "evidence_id",
             "source_type_norm",
             "spatial_type",
+            "face_chainage",
             "center_chainage",
             "collapse_flag",
             "collapse_state",
             "hazard_tags",
+            "duplicate_count",
+            "duplicate_evidence_ids",
+            "dedup_note",
         ]
         anomaly_cols = [c for c in anomaly_cols if c in anomaly_points.columns]
         print(anomaly_points[anomaly_cols].head(20).to_string())
@@ -365,19 +513,48 @@ def main():
 
     print("near_projection head 80:")
     if not near_projection.empty:
-        print(
-            near_projection[
-                [
-                    "cell_id",
-                    "evidence_id",
-                    "source_type_norm",
-                    "spatial_type",
-                    "distance_m",
-                    "spatial_weight",
-                    "effective_weight",
-                ]
-            ].head(80).to_string()
-        )
+        near_projection_show = near_projection.copy()
+
+        dedup_cols = [
+            "evidence_id",
+            "face_chainage",
+            "center_chainage",
+            "duplicate_count",
+            "duplicate_evidence_ids",
+            "dedup_note",
+        ]
+        dedup_cols = [c for c in dedup_cols if c in normalized_df.columns]
+
+        if "evidence_id" in near_projection_show.columns and dedup_cols:
+            ev_dedup = normalized_df[dedup_cols].drop_duplicates(
+                subset=["evidence_id"],
+                keep="first",
+            )
+            near_projection_show = near_projection_show.merge(
+                ev_dedup,
+                on="evidence_id",
+                how="left",
+            )
+
+        show_projection_cols = [
+            "cell_id",
+            "evidence_id",
+            "source_type_norm",
+            "spatial_type",
+            "face_chainage",
+            "center_chainage",
+            "distance_m",
+            "spatial_weight",
+            "effective_weight",
+            "duplicate_count",
+            "duplicate_evidence_ids",
+            "dedup_note",
+        ]
+        show_projection_cols = [
+            c for c in show_projection_cols if c in near_projection_show.columns
+        ]
+
+        print(near_projection_show[show_projection_cols].head(80).to_string())
     else:
         print("附近没有投影证据。")
 
@@ -399,6 +576,7 @@ def main():
     )
 
     print("geo_states_df shape =", geo_states_df.shape)
+    print("geo_states_df columns =", list(geo_states_df.columns))
 
     geo_states_summary = summarize_geo_states(geo_states_df)
     print("geo states summary:")
@@ -447,6 +625,10 @@ def main():
         "uncertainty_level",
         "conflict_level",
         "GRS_geo_base",
+        "grade_score_component",
+        "hazard_component",
+        "confidence_component",
+        "GRS_component_method",
     ]
     show_cols = [c for c in show_cols if c in geo_states_df.columns]
 
@@ -454,6 +636,21 @@ def main():
         print(geo_states_df[show_cols].head(40).to_string())
     else:
         print("geo_states_df 为空或无可展示列。")
+
+    print_existing_columns(
+        geo_states_df,
+        cols=[
+            "cell_id",
+            "GRS_geo_base",
+            "grade_score_component",
+            "hazard_component",
+            "confidence_component",
+            "GRS_formula_text",
+            "GRS_component_method",
+        ],
+        title="6.1 检查 GRS_geo_base 真实组件字段",
+        max_rows=30,
+    )
 
     geo_states_df.to_csv(
         out_dir / "geo_states_df.csv",
@@ -493,6 +690,11 @@ def main():
         "conflict_level",
         "conflict_reasons",
         "GRS_geo_base",
+        "grade_score_component",
+        "hazard_component",
+        "confidence_component",
+        "GRS_formula_text",
+        "GRS_component_method",
         "supporting_evidence_ids",
     ]
     near_state_cols = [c for c in near_state_cols if c in near_states.columns]
@@ -545,6 +747,7 @@ def main():
     checks["normalized_all_not_empty"] = not normalized_df_all.empty
     checks["normalized_available_not_empty"] = not normalized_df.empty
     checks["availability_filter_info"] = availability_filter_info
+    checks["hsp_anomaly_point_dedup_info"] = hsp_dedup_info
 
     checks["has_face_sketch"] = "face_sketch" in set(
         normalized_df.get("source_type_norm", pd.Series(dtype=str))
@@ -569,6 +772,10 @@ def main():
     checks["has_method_tags_col"] = "method_tags" in normalized_df.columns
     checks["has_unknown_hazard_tags_col"] = "unknown_hazard_tags" in normalized_df.columns
 
+    checks["has_duplicate_count_col"] = "duplicate_count" in normalized_df.columns
+    checks["has_duplicate_evidence_ids_col"] = "duplicate_evidence_ids" in normalized_df.columns
+    checks["has_dedup_note_col"] = "dedup_note" in normalized_df.columns
+
     checks["cells_not_empty"] = not cells_df.empty
     checks["cell_evidence_not_empty"] = not cell_evidence_df.empty
     checks["cell_evidence_effective_weight_max_le_1"] = (
@@ -579,6 +786,22 @@ def main():
     checks["geo_states_has_GRS_geo_base"] = "GRS_geo_base" in geo_states_df.columns
     checks["geo_states_has_supporting_ids"] = (
         "supporting_evidence_ids" in geo_states_df.columns
+    )
+
+    checks["geo_states_has_grade_score_component"] = (
+        "grade_score_component" in geo_states_df.columns
+    )
+    checks["geo_states_has_hazard_component"] = (
+        "hazard_component" in geo_states_df.columns
+    )
+    checks["geo_states_has_confidence_component"] = (
+        "confidence_component" in geo_states_df.columns
+    )
+    checks["geo_states_has_GRS_formula_text"] = (
+        "GRS_formula_text" in geo_states_df.columns
+    )
+    checks["geo_states_has_GRS_component_method"] = (
+        "GRS_component_method" in geo_states_df.columns
     )
 
     checks["forward_profile_has_3_ranges"] = (
@@ -645,9 +868,6 @@ def main():
     # =========================================================
     print_title("11. 第七阶段：地质-施工响应耦合 GRCI")
 
-    # 说明：
-    # 这里先构造一个 mock_response_df，只用于测试 coupling_adapter 是否跑通。
-    # 后面接真实 PLC 或已有 RAI 时，把这里替换成真实 response_df 即可。
     if not geo_states_df.empty:
         mock_response_df = geo_states_df[
             [
@@ -668,14 +888,12 @@ def main():
         {} for _ in range(len(mock_response_df))
     ]
 
-    # 模拟当前 1013220～1013250m 前方 30m 施工响应偏高。
     if not mock_response_df.empty:
         mask = (
             (mock_response_df["cell_center"] >= current_chainage)
             & (mock_response_df["cell_center"] < current_chainage + LOOKAHEAD_M)
         )
 
-        # 给三个 cell 一个测试用 RAI。
         target_cells = mock_response_df[mask].sort_values("cell_center").index.tolist()
         test_rai_values = [0.75, 0.65, 0.55]
 
@@ -777,6 +995,7 @@ def main():
             "note": "第八阶段 report_context 测试",
             "evidence_filter_mode": EVIDENCE_FILTER_MODE,
             "availability_filter_info": availability_filter_info,
+            "hsp_anomaly_point_dedup_info": hsp_dedup_info,
         },
         include_data_preview=True,
     )
@@ -812,7 +1031,6 @@ def main():
     print("\n=== prompt_text_from_context preview ===")
     print(prompt_text_from_context[:2000])
 
-    # 保存结果
     safe_json_dump(report_context, out_dir / "geology_v2_report_context.json")
 
     (out_dir / "geology_v2_rendered_report.txt").write_text(
@@ -830,7 +1048,6 @@ def main():
         encoding="utf-8",
     )
 
-    # 简单检查
     print("\n=== report_context checks ===")
     context_checks = {
         "context_ok": report_context.get("ok") is True,
@@ -848,15 +1065,39 @@ def main():
 
     safe_json_dump(context_checks, out_dir / "report_context_checks.json")
 
-    from geology_v2.explainability import print_geo_state_explanation
+    # =========================================================
+    # 12.1 单 cell 可解释性检查
+    # =========================================================
+    print_title("12.1 explain_geo_state 单 cell 可解释性检查")
 
-    print_geo_state_explanation(
+    explanation = explain_geo_state(
         cell_id="cell_1013220_1013230",
         geo_states_df=geo_states_df,
         cell_evidence_df=cell_evidence_df,
         normalized_df=normalized_df,
         top_n_evidence=12,
     )
+
+    explanation_text = explain_geo_state_text(explanation)
+
+    print(explanation_text)
+
+    safe_json_dump(
+        explanation,
+        out_dir / "explain_geo_state_cell_1013220_1013230.json",
+    )
+
+    (out_dir / "explain_geo_state_cell_1013220_1013230.txt").write_text(
+        explanation_text,
+        encoding="utf-8",
+    )
+
+    print("\n=== explain GRS component source check ===")
+    grs_exp = explanation.get("grs_explanation", {}) if isinstance(explanation, dict) else {}
+    print("component_source =", grs_exp.get("component_source"))
+    print("GRS_component_method =", grs_exp.get("GRS_component_method"))
+    print("GRS_formula_text =", grs_exp.get("GRS_formula_text"))
+    print("residual_to_actual =", grs_exp.get("residual_to_actual"))
 
     # =========================================================
     # 13. 完成
@@ -865,5 +1106,80 @@ def main():
     print("输出目录:", out_dir.resolve())
 
 
+# =========================================================
+# 程序入口：将所有终端输出保存到 txt
+# =========================================================
+
 if __name__ == "__main__":
-    main()
+    """
+    将 ceshi.py 的全部终端输出保存到 txt 文件。
+
+    默认模式：
+    - 终端不再刷大量内容；
+    - 只提示日志文件路径；
+    - 所有 print 输出、报错 traceback 都写入 txt。
+
+    如果你想同时在终端显示和写入 txt：
+    - 把 WRITE_ONLY_TO_TXT = True 改成 False。
+    """
+
+    WRITE_ONLY_TO_TXT = True
+
+    out_dir = Path("outputs/geology_v2_test")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    time_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = out_dir / f"ceshi_terminal_output_{time_tag}.txt"
+
+    class Tee:
+        def __init__(self, *files):
+            self.files = files
+
+        def write(self, data):
+            for f in self.files:
+                f.write(data)
+                f.flush()
+
+        def flush(self):
+            for f in self.files:
+                f.flush()
+
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+
+    print(f"[ceshi.py] 终端输出将保存到: {log_path.resolve()}")
+
+    try:
+        with log_path.open("w", encoding="utf-8") as log_file:
+            if WRITE_ONLY_TO_TXT:
+                sys.stdout = log_file
+                sys.stderr = log_file
+            else:
+                sys.stdout = Tee(old_stdout, log_file)
+                sys.stderr = Tee(old_stderr, log_file)
+
+            print("=" * 80)
+            print("ceshi.py 运行日志")
+            print("开始时间:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            print("日志文件:", log_path.resolve())
+            print("=" * 80)
+
+            try:
+                main()
+                print("\n" + "=" * 80)
+                print("ceshi.py 运行完成")
+                print("结束时间:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                print("=" * 80)
+
+            except Exception:
+                print("\n" + "=" * 80)
+                print("ceshi.py 运行失败，异常信息如下：")
+                print("=" * 80)
+                traceback.print_exc()
+                raise
+
+    finally:
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+
+    print(f"[ceshi.py] 运行结束，完整输出已保存到: {log_path.resolve()}")

@@ -1,3 +1,4 @@
+
 """
 geology_v2.fusion_engine
 
@@ -82,8 +83,12 @@ GEO_STATE_COLUMNS = [
 
     "source_trace",
 
+    "grade_score_component",
+    "hazard_component",
+    "confidence_component",
+    "GRS_formula_text",
+    "GRS_component_method",
     "GRS_geo_base",
-    
 ]
 
 
@@ -107,6 +112,15 @@ HAZARD_LABELS = {
     "strong_reflection_anomaly": "明显反射异常",
     "poor_stability": "稳定性较差",
 }
+
+GRS_FORMULA_TEXT = (
+    "GRS_geo_base = 0.45×grade_score_component "
+    "+ 0.45×hazard_component "
+    "+ 0.10×confidence_component"
+)
+
+GRS_COMPONENT_METHOD_DIRECT = "direct_from_fusion_engine"
+
 
 
 # ============================================================
@@ -741,6 +755,64 @@ def _confidence_score(group: pd.DataFrame, conflict_score: float) -> float:
     return _clip01(weight_factor * evidence_factor * source_factor * conflict_penalty)
 
 
+def _grs_geo_base_components(
+    fused_grade: Optional[str],
+    hazard_scores: Dict[str, float],
+    confidence_score: float,
+    has_geology_evidence: bool,
+) -> Dict[str, Any]:
+    """
+    计算纯地质基础关注度 GRS_geo_base 及其真实组件。
+
+    注意：
+    1. 这里是 fusion_engine 内部真实计算位置；
+    2. 输出的 component 会随 GeoState 一起写入 geo_states_df；
+    3. 不引入 RAI，不引入施工响应。
+    """
+    if not has_geology_evidence:
+        return {
+            "grade_score_component": 0.0,
+            "hazard_component": 0.0,
+            "confidence_component": 0.0,
+            "GRS_formula_text": "",
+            "GRS_component_method": "empty",
+            "GRS_geo_base": 0.0,
+        }
+
+    grade_score_component = _grade_attention_score(fused_grade)
+
+    hazard_values = [
+        float(v)
+        for v in (hazard_scores or {}).values()
+        if math.isfinite(_safe_float(v, default=0.0))
+    ]
+
+    hazard_score = max(hazard_values, default=0.0)
+    avg_hazard_score = (
+        sum(hazard_values) / max(len(hazard_values), 1)
+        if hazard_values else 0.0
+    )
+
+    # max hazard 反映主控风险，avg hazard 反映多灾种叠加。
+    hazard_component = _clip01(0.75 * hazard_score + 0.25 * avg_hazard_score)
+    confidence_component = _clip01(confidence_score)
+
+    grs_geo_base = _clip01(
+        0.45 * grade_score_component
+        + 0.45 * hazard_component
+        + 0.10 * confidence_component
+    )
+
+    return {
+        "grade_score_component": float(grade_score_component),
+        "hazard_component": float(hazard_component),
+        "confidence_component": float(confidence_component),
+        "GRS_formula_text": GRS_FORMULA_TEXT,
+        "GRS_component_method": GRS_COMPONENT_METHOD_DIRECT,
+        "GRS_geo_base": float(grs_geo_base),
+    }
+
+
 def _grs_geo_base(
     fused_grade: Optional[str],
     hazard_scores: Dict[str, float],
@@ -750,28 +822,15 @@ def _grs_geo_base(
     """
     纯地质基础关注度 GRS_geo_base。
 
-    不引入 RAI，不引入施工响应。
+    保留该函数用于兼容旧调用；真实组件由 _grs_geo_base_components 输出。
     """
-    if not has_geology_evidence:
-        return 0.0
-
-    grade_score = _grade_attention_score(fused_grade)
-    hazard_score = max([float(v) for v in hazard_scores.values()], default=0.0)
-    avg_hazard_score = (
-        sum(float(v) for v in hazard_scores.values()) / max(len(hazard_scores), 1)
-        if hazard_scores else 0.0
+    components = _grs_geo_base_components(
+        fused_grade=fused_grade,
+        hazard_scores=hazard_scores,
+        confidence_score=confidence_score,
+        has_geology_evidence=has_geology_evidence,
     )
-
-    # max hazard 反映主控风险，avg hazard 反映多灾种叠加。
-    hazard_component = _clip01(0.75 * hazard_score + 0.25 * avg_hazard_score)
-
-    value = (
-        0.45 * grade_score
-        + 0.45 * hazard_component
-        + 0.10 * _clip01(confidence_score)
-    )
-
-    return _clip01(value)
+    return float(components.get("GRS_geo_base", 0.0))
 
 
 # ============================================================
@@ -989,6 +1048,12 @@ def _empty_geo_state(cell: pd.Series) -> Dict[str, Any]:
 
         "supporting_evidence_ids": [],
         "source_trace": [],
+
+        "grade_score_component": 0.0,
+        "hazard_component": 0.0,
+        "confidence_component": 0.0,
+        "GRS_formula_text": "",
+        "GRS_component_method": "empty",
         "GRS_geo_base": 0.0,
     }
 
@@ -1026,12 +1091,13 @@ def _fuse_one_cell(cell: pd.Series, group: pd.DataFrame) -> Dict[str, Any]:
     confidence_score = _confidence_score(group, conflict_score)
     uncertainty_level = _uncertainty_from_conflict_and_confidence(conflict_score, confidence_score)
 
-    grs_geo_base = _grs_geo_base(
+    grs_components = _grs_geo_base_components(
         fused_grade=fused_grade,
         hazard_scores=hazard_scores,
         confidence_score=confidence_score,
         has_geology_evidence=True,
     )
+    grs_geo_base = float(grs_components.get("GRS_geo_base", 0.0))
 
     return {
         "cell_id": _safe_str(cell.get("cell_id")),
@@ -1064,6 +1130,11 @@ def _fuse_one_cell(cell: pd.Series, group: pd.DataFrame) -> Dict[str, Any]:
         "supporting_evidence_ids": _json_clean(supporting_ids),
         "source_trace": _json_clean(source_trace),
 
+        "grade_score_component": float(grs_components.get("grade_score_component", 0.0)),
+        "hazard_component": float(grs_components.get("hazard_component", 0.0)),
+        "confidence_component": float(grs_components.get("confidence_component", 0.0)),
+        "GRS_formula_text": _safe_str(grs_components.get("GRS_formula_text")),
+        "GRS_component_method": _safe_str(grs_components.get("GRS_component_method")),
         "GRS_geo_base": float(grs_geo_base),
     }
 
@@ -1114,6 +1185,11 @@ def fuse_geo_states(
         conflict_level
         conflict_reasons
         supporting_evidence_ids
+        grade_score_component
+        hazard_component
+        confidence_component
+        GRS_formula_text
+        GRS_component_method
         GRS_geo_base
     """
     if cells_df is None or cells_df.empty:
@@ -1326,3 +1402,6 @@ def summarize_geo_states(geo_states_df: pd.DataFrame) -> Dict[str, Any]:
             "GRS_geo_base_mean": float(grs.mean()) if len(grs) else 0.0,
         }
     )
+
+
+

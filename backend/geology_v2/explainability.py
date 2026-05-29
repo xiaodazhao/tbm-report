@@ -9,20 +9,12 @@ geology_v2/explainability.py
     explain_geo_state(cell_id, geo_states_df, cell_evidence_df, normalized_df)
     explain_geo_state_text(cell_id, geo_states_df, cell_evidence_df, normalized_df)
 
-建议放置位置：
-    backend/geology_v2/explainability.py
-
-调用示例：
-    from geology_v2.explainability import explain_geo_state, explain_geo_state_text
-
-    target_cell_id = "cell_1013220_1013230"
-    explanation = explain_geo_state(
-        target_cell_id,
-        geo_states_df=geo_states_df,
-        cell_evidence_df=cell_evidence_df,
-        normalized_df=normalized_df,
-    )
-    print(explain_geo_state_text(explanation))
+说明：
+    1. GRS_geo_base 解释优先读取 fusion_engine.py 已经输出的真实组件：
+       grade_score_component / hazard_component / confidence_component。
+    2. 如果旧数据没有这些字段，才回退到解释模块反推。
+    3. 如果 HSP anomaly_point 做过去重合并，并带有 duplicate_count / duplicate_evidence_ids，
+       则在 top evidence 中展示合并信息。
 """
 
 from __future__ import annotations
@@ -30,7 +22,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
 import pandas as pd
 
@@ -93,6 +85,13 @@ def _safe_float(value: Any, default: Optional[float] = 0.0) -> Optional[float]:
         return default
 
 
+def _clip01(value: Any) -> float:
+    x = _safe_float(value, 0.0)
+    if x is None:
+        x = 0.0
+    return float(max(0.0, min(float(x), 1.0)))
+
+
 def _dk(value: Any) -> str:
     return format_chainage_dk(value, unknown="未知里程", prefix="DK")
 
@@ -115,7 +114,6 @@ def _as_list(value: Any) -> List[Any]:
         text = value.strip()
         if not text:
             return []
-        # 尝试解析 JSON / Python list 字符串
         if (text.startswith("[") and text.endswith("]")) or (text.startswith("{") and text.endswith("}")):
             try:
                 obj = json.loads(text)
@@ -125,7 +123,6 @@ def _as_list(value: Any) -> List[Any]:
             except Exception:
                 pass
 
-        # 兼容 pandas 打印出来的 "[a, b, c]" 但不是标准 JSON 的形式
         if text.startswith("[") and text.endswith("]"):
             body = text[1:-1].strip()
             if not body:
@@ -176,14 +173,6 @@ def _short_text(text: Any, max_chars: int = 120) -> str:
     return s
 
 
-def _get_first_existing(row_or_df: Any, names: List[str]) -> Optional[str]:
-    cols = row_or_df.index if hasattr(row_or_df, "index") and not hasattr(row_or_df, "columns") else row_or_df.columns
-    for name in names:
-        if name in cols:
-            return name
-    return None
-
-
 def _extract_grade_distribution(value: Any) -> Dict[str, Dict[str, float]]:
     obj = _as_dict(value)
     out: Dict[str, Dict[str, float]] = {}
@@ -219,7 +208,6 @@ def _make_evidence_lookup(normalized_df: pd.DataFrame) -> pd.DataFrame:
     if "evidence_id" not in ev.columns:
         return pd.DataFrame()
 
-    # 去重，防止 merge 后重复膨胀
     ev = ev.drop_duplicates(subset=["evidence_id"], keep="first")
     return ev
 
@@ -256,6 +244,13 @@ def _join_cell_evidence(
             "collapse_state",
             "deformation_state",
             "raw_text",
+
+            # HSP anomaly_point dedup fields
+            "duplicate_count",
+            "duplicate_evidence_ids",
+            "dedup_key",
+            "dedup_note",
+            "duplicate_raw_text_snippets",
         ]
         keep_cols = [c for c in keep_cols if c in ev.columns]
         ce = ce.merge(ev[keep_cols], on="evidence_id", how="left", suffixes=("", "_ev"))
@@ -371,11 +366,65 @@ def _infer_grs_components(row: pd.Series) -> Dict[str, Any]:
     """
     尽量解释 GRS_geo_base 的组成。
 
-    注意：
-    如果当前 fusion_engine 没有把 grade_score/hazard_component/confidence_component
-    单独输出到 geo_states_df，本函数只能做近似反推，不宣称完全等于内部公式。
+    优先级：
+    1. 如果 geo_states_df 中已有 fusion_engine 真实输出组件，
+       直接读取 grade_score_component / hazard_component / confidence_component；
+    2. 如果没有真实组件，则回退到旧的解释性反推。
     """
     grs = float(_safe_float(row.get("GRS_geo_base"), 0.0) or 0.0)
+
+    has_direct_components = all(
+        name in row.index
+        for name in [
+            "grade_score_component",
+            "hazard_component",
+            "confidence_component",
+        ]
+    )
+
+    if has_direct_components:
+        grade_score_component = float(_safe_float(row.get("grade_score_component"), 0.0) or 0.0)
+        hazard_component = float(_safe_float(row.get("hazard_component"), 0.0) or 0.0)
+        confidence_component = float(_safe_float(row.get("confidence_component"), 0.0) or 0.0)
+
+        formula_text = _safe_str(
+            row.get("GRS_formula_text"),
+            default=(
+                "GRS_geo_base = 0.45×grade_score_component "
+                "+ 0.45×hazard_component + 0.10×confidence_component"
+            ),
+        )
+
+        component_method = _safe_str(
+            row.get("GRS_component_method"),
+            default="direct_from_fusion_engine",
+        )
+
+        reconstructed = _clip01(
+            0.45 * grade_score_component
+            + 0.45 * hazard_component
+            + 0.10 * confidence_component
+        )
+        residual = grs - reconstructed
+
+        return {
+            "component_source": "direct_from_geo_states_df",
+            "GRS_geo_base": grs,
+            "grade_score_component": grade_score_component,
+            "hazard_component": hazard_component,
+            "confidence_component": confidence_component,
+            "GRS_formula_text": formula_text,
+            "GRS_component_method": component_method,
+            "reconstructed_formula": formula_text,
+            "reconstructed_value": float(reconstructed),
+            "residual_to_actual": float(residual),
+            "note": (
+                "当前 GRS 组件来自 fusion_engine 在计算 GRS_geo_base 时的真实输出，"
+                "不是 explainability 模块反推。"
+            ),
+        }
+
+    # fallback：旧数据没有真实组件时才反推
     fused_grade = _safe_str(row.get("fused_grade"))
     grade_score = float(GRADE_SCORE_MAP.get(fused_grade, 0.0))
 
@@ -384,11 +433,11 @@ def _infer_grs_components(row: pd.Series) -> Dict[str, Any]:
 
     confidence_score = float(_safe_float(row.get("confidence_score"), 0.0) or 0.0)
 
-    # 这是当前口径下的解释性重构。若你的 fusion_engine 公式不同，后续可改这里。
     reconstructed = 0.45 * grade_score + 0.45 * hazard_component + 0.10 * confidence_score
     residual = grs - reconstructed
 
     return {
+        "component_source": "inferred_fallback",
         "GRS_geo_base": grs,
         "fused_grade": fused_grade,
         "grade_score_inferred": grade_score,
@@ -398,8 +447,8 @@ def _infer_grs_components(row: pd.Series) -> Dict[str, Any]:
         "reconstructed_value": float(reconstructed),
         "residual_to_actual": float(residual),
         "note": (
-            "若 residual_to_actual 接近 0，说明该解释公式与当前 fusion_engine 基本一致；"
-            "若偏差较大，应以 fusion_engine 实际公式为准，并把内部组件显式输出到 geo_states_df。"
+            "当前 geo_states_df 未提供真实 GRS 组件，因此使用解释性反推；"
+            "若 residual_to_actual 偏差较大，应以 fusion_engine 实际公式为准。"
         ),
     }
 
@@ -453,6 +502,13 @@ def _top_evidence(evidence_part: pd.DataFrame, top_n: int = 10) -> List[Dict[str
         else:
             loc_text = "未知里程"
 
+        duplicate_count = int(_safe_float(ev.get("duplicate_count"), 1) or 1)
+        duplicate_evidence_ids = [
+            _safe_str(x)
+            for x in _as_list(ev.get("duplicate_evidence_ids"))
+            if _safe_str(x)
+        ]
+
         out.append(
             {
                 "evidence_id": _safe_str(ev.get("evidence_id")),
@@ -466,6 +522,12 @@ def _top_evidence(evidence_part: pd.DataFrame, top_n: int = 10) -> List[Dict[str
                 "hazard_tags": [_safe_str(x) for x in _as_list(ev.get("hazard_tags")) if _safe_str(x)],
                 "effective_weight": float(_safe_float(ev.get("__weight"), 0.0) or 0.0),
                 "raw_text_snippet": _short_text(ev.get("raw_text"), 160),
+
+                # HSP anomaly_point dedup fields
+                "duplicate_count": duplicate_count,
+                "duplicate_evidence_ids": duplicate_evidence_ids,
+                "dedup_key": _safe_str(ev.get("dedup_key")),
+                "dedup_note": _safe_str(ev.get("dedup_note")),
             }
         )
 
@@ -631,13 +693,26 @@ def explain_geo_state_text(explanation: Dict[str, Any]) -> str:
 
     lines.append("4. GRS_geo_base 怎么解释")
     lines.append(f"- 实际 GRS_geo_base：{grs_exp.get('GRS_geo_base', 0):.3f}")
-    lines.append(f"- 推断 grade_score：{grs_exp.get('grade_score_inferred', 0):.3f}")
-    lines.append(f"- 推断 hazard_component：{grs_exp.get('hazard_component_inferred', 0):.3f}")
-    lines.append(f"- confidence_score：{grs_exp.get('confidence_score', 0):.3f}")
-    lines.append(f"- 解释公式：{grs_exp.get('reconstructed_formula')}")
-    lines.append(f"- 按解释公式重构值：{grs_exp.get('reconstructed_value', 0):.3f}")
-    lines.append(f"- 与实际值差异 residual：{grs_exp.get('residual_to_actual', 0):.3f}")
-    lines.append(f"- 注意：{grs_exp.get('note')}")
+
+    if grs_exp.get("component_source") == "direct_from_geo_states_df":
+        lines.append("- 组件来源：fusion_engine 真实输出")
+        lines.append(f"- grade_score_component：{grs_exp.get('grade_score_component', 0):.3f}")
+        lines.append(f"- hazard_component：{grs_exp.get('hazard_component', 0):.3f}")
+        lines.append(f"- confidence_component：{grs_exp.get('confidence_component', 0):.3f}")
+        lines.append(f"- 计算公式：{grs_exp.get('GRS_formula_text')}")
+        lines.append(f"- 组件方法：{grs_exp.get('GRS_component_method')}")
+        lines.append(f"- 按公式重构值：{grs_exp.get('reconstructed_value', 0):.3f}")
+        lines.append(f"- 与实际值差异 residual：{grs_exp.get('residual_to_actual', 0):.6f}")
+        lines.append(f"- 说明：{grs_exp.get('note')}")
+    else:
+        lines.append("- 组件来源：解释模块反推")
+        lines.append(f"- 推断 grade_score：{grs_exp.get('grade_score_inferred', 0):.3f}")
+        lines.append(f"- 推断 hazard_component：{grs_exp.get('hazard_component_inferred', 0):.3f}")
+        lines.append(f"- confidence_score：{grs_exp.get('confidence_score', 0):.3f}")
+        lines.append(f"- 解释公式：{grs_exp.get('reconstructed_formula')}")
+        lines.append(f"- 按解释公式重构值：{grs_exp.get('reconstructed_value', 0):.3f}")
+        lines.append(f"- 与实际值差异 residual：{grs_exp.get('residual_to_actual', 0):.3f}")
+        lines.append("- 注意：当前 geo_states_df 未提供真实 GRS 组件，因此使用解释性反推。")
     lines.append("")
 
     lines.append("5. confidence / conflict 怎么解释")
@@ -663,6 +738,18 @@ def explain_geo_state_text(explanation: Dict[str, Any]) -> str:
                 f"{ev.get('location_text')}，face={ev.get('face_chainage_text') or '无'}，"
                 f"weight={ev.get('effective_weight', 0):.3f}"
             )
+
+            duplicate_count = int(_safe_float(ev.get("duplicate_count"), 1) or 1)
+            if duplicate_count > 1:
+                duplicate_ids = ev.get("duplicate_evidence_ids") or []
+                lines.append(
+                    f"  duplicate_count={duplicate_count}，已合并重复边界 anomaly_point"
+                )
+                if duplicate_ids:
+                    lines.append(
+                        f"  duplicate_evidence_ids={duplicate_ids}"
+                    )
+
             lines.append(f"  id={_short_text(ev.get('evidence_id'), 120)}")
             if ev.get("grade"):
                 lines.append(f"  grade={ev.get('grade')}")

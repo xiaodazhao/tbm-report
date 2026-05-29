@@ -1,3 +1,4 @@
+
 """
 geology_v2.schemas
 
@@ -173,6 +174,11 @@ class GeoState:
     source_trace: List[JsonDict] = field(default_factory=list)
 
     # 预留给第七阶段传递纯地质基础关注度。
+    grade_score_component: float = 0.0
+    hazard_component: float = 0.0
+    confidence_component: float = 0.0
+    GRS_formula_text: str = ""
+    GRS_component_method: str = "empty"
     GRS_geo_base: Optional[float] = None
 
     def to_dict(self) -> JsonDict:
@@ -227,3 +233,5 @@ def dataclass_to_dict(obj: Any) -> JsonDict:
     if isinstance(obj, dict):
         return dict(obj)
     raise TypeError(f"Unsupported object type: {type(obj)}")
+
+

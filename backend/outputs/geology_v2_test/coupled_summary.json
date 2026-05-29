@@ -3,14 +3,14 @@
   "has_response_cell_count": 22,
   "computed_grci_cell_count": 22,
   "coupling_level_counts": {
-    "low": 18,
-    "medium": 3,
+    "low": 19,
+    "medium": 2,
     "high": 1
   },
   "coupling_type_counts": {
     "geo_dominant_no_obvious_response": 19,
     "geo_response_coupled": 3
   },
-  "GRCI_max": 0.8230437679469687,
-  "GRCI_mean": 0.4839714579730177
+  "GRCI_max": 0.8063881908145202,
+  "GRCI_mean": 0.4784498611934366
 }

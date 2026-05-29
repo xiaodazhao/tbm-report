@@ -4,12 +4,12 @@
   "analysis_date": null,
   "advance_direction": 1,
   "chainage_tolerance_m": 1.0,
-  "input_count": 878,
-  "output_count": 33,
-  "excluded_count": 845,
+  "input_count": 640,
+  "output_count": 29,
+  "excluded_count": 611,
   "excluded_future_observed_count": 166,
-  "excluded_unavailable_prediction_count": 679,
+  "excluded_unavailable_prediction_count": 445,
   "excluded_missing_face_chainage_count": 0,
-  "excluded_future_forecast_like_count": 679,
+  "excluded_future_forecast_like_count": 445,
   "excluded_future_report_count": 0
 }
