@@ -17,6 +17,12 @@ from geology_v2.evidence_normalizer import (
     summarize_normalized_evidence,
 )
 
+from geology_v2.pipeline import (
+    run_geology_v2_context,
+    print_pipeline_debug_summary,
+    geology_v2_prompt_block,
+)
+
 from geology_v2.evidence_dedup import (
     deduplicate_hsp_anomaly_points,
     summarize_hsp_anomaly_point_dedup,
@@ -163,6 +169,38 @@ def main():
     print("evidence_df columns =", list(evidence_df.columns))
     print("current_chainage =", current_chainage)
     print("evidence filter mode =", EVIDENCE_FILTER_MODE)
+
+    # =========================================================
+    # 1.5. 临时测试 pipeline 模块
+    # =========================================================
+    print_title("1.5. 临时测试 pipeline 模块")
+
+    try:
+        pipeline_result = run_geology_v2_context(
+            df_plc=None,
+            evidence_df=evidence_df,
+            current_chainage=current_chainage,
+            analysis_date=ANALYSIS_DATE,
+            mode=EVIDENCE_FILTER_MODE,
+            advance_direction=ADVANCE_DIRECTION,
+            lookahead_m=LOOKAHEAD_M,
+            cell_length=CELL_LENGTH_M,
+            review_back_m=20,
+            review_forward_m=40,
+            build_report=True,
+        )
+
+        print_pipeline_debug_summary(pipeline_result)
+
+        print("\n=== pipeline prompt_block ===")
+        print(geology_v2_prompt_block(pipeline_result))
+
+        print("\n=== pipeline rendered_report_text ===")
+        print(pipeline_result.get("rendered_report_text", ""))
+
+    except Exception:
+        print("pipeline 临时测试失败，但不影响后续原 ceshi.py 分步测试。异常如下：")
+        traceback.print_exc()
 
     # =========================================================
     # 2. 第二阶段：normalize_evidence_df + 可用性过滤
@@ -563,6 +601,7 @@ def main():
         index=False,
         encoding="utf-8-sig",
     )
+
 
     # =========================================================
     # 6. 第四阶段：fuse_geo_states
