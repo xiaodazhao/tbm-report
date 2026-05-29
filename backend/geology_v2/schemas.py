@@ -170,6 +170,7 @@ class GeoState:
     conflict_reasons: List[str] = field(default_factory=list)
 
     supporting_evidence_ids: List[str] = field(default_factory=list)
+    source_trace: List[JsonDict] = field(default_factory=list)
 
     # 预留给第七阶段传递纯地质基础关注度。
     GRS_geo_base: Optional[float] = None
@@ -209,6 +210,7 @@ class ForwardProfileItem:
 
     supporting_cell_ids: List[str] = field(default_factory=list)
     supporting_evidence_ids: List[str] = field(default_factory=list)
+    source_trace: List[JsonDict] = field(default_factory=list)
 
     def to_dict(self) -> JsonDict:
         return _clean_dict(asdict(self))

@@ -29,8 +29,9 @@ geology_v2.coupling_adapter
 设计原则：
 1. GRS_geo_base 表示纯地质基础关注度；
 2. RAI 表示施工响应异常指数；
-3. GRCI 表示地质-施工响应耦合关注度；
-4. GRCI 不表示灾害概率；
+3. GRCI 表示复盘窗口内“提前地质证据/超前预报”与“实际施工响应”之间的对应程度；
+4. GRCI 不表示灾害概率，也不作为单独的在线预测概率；
+5. GRCI 主要用于复盘评价：提前超报提示的不良地质与后续施工响应是否相互印证；
 5. 没有施工响应数据时，不强行计算 GRCI；
 6. 保留 has_response_evidence 字段，避免把缺少响应数据误写成施工正常。
 """
@@ -43,6 +44,8 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
 import pandas as pd
+
+from utils.chainage_utils import format_chainage_dk
 
 
 # ============================================================
@@ -92,6 +95,14 @@ DEFAULT_PLC_FEATURE_RULES = {
     "推进速度": "low",
     "刀盘实际转速": "deviation",
 }
+
+
+# ============================================================
+# 2. 基础工具
+# ============================================================
+
+def _dk(value: Any) -> str:
+    return format_chainage_dk(value, unknown="未知里程", prefix="DK")
 
 
 # ============================================================
@@ -663,14 +674,14 @@ def _coupling_explanation(
         return (
             f"该 cell 地质基础关注度为{grs_level}，施工响应异常指数为{rai_level}，"
             f"主要地质关注项包括 {hazards}；"
-            "地质不良证据与施工响应异常存在同步增强特征，建议重点复核。"
+            "在复盘窗口内，提前地质证据与实际施工响应表现具有较明显对应关系，说明超前预报或地质融合结果与施工参数响应相互印证，建议作为重点复核区段。"
         )
 
     if coupling_type == "geo_dominant_no_obvious_response":
         return (
             f"该 cell 地质基础关注度为{grs_level}，但施工响应异常指数为{rai_level}；"
             f"主要地质关注项包括 {hazards}。"
-            "当前表现为地质证据主导，施工响应尚未明显同步增强，应继续跟踪。"
+            "在复盘窗口内，提前地质证据较强，但施工响应尚未表现出明显对应异常，应继续结合后续揭露、支护记录和设备工况复核。"
         )
 
     if coupling_type == "response_anomaly_without_strong_geo_support":
@@ -934,7 +945,7 @@ def coupled_df_to_text(
             f"地质-施工响应耦合概览：当前范围共有 {len(df)} 个 cell，"
             f"其中 {len(valid)} 个 cell 形成 GRCI。"
             f"耦合等级统计为 {level_counts}，耦合类型统计为 {type_counts}。"
-            "GRCI 表示地质-施工响应耦合关注度，不表示灾害发生概率。"
+            "GRCI 表示复盘窗口内提前地质证据与实际施工响应之间的对应程度，不表示灾害发生概率，也不作为单独的在线预测概率。"
         ),
         "重点耦合 cell 摘要：",
     ]
@@ -946,7 +957,7 @@ def coupled_df_to_text(
         level = _level_cn(_safe_str(row.get("coupling_level"), default="unknown"))
 
         lines.append(
-            f"- {row.get('cell_start'):.1f}～{row.get('cell_end'):.1f}m："
+            f"- {_dk(row.get('cell_start'))}～{_dk(row.get('cell_end'))}："
             f"GRCI={grci:.2f}，耦合等级为{level}；"
             f"GRS_geo_base={grs:.2f}，RAI={rai:.2f}。"
             f"{row.get('coupling_explanation')}"

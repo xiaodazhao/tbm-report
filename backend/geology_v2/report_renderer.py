@@ -22,6 +22,19 @@ geology_v2.report_renderer
 from __future__ import annotations
 
 from typing import Any, Dict, List
+from utils.chainage_utils import format_chainage_dk
+
+
+# ============================================================
+# 1. 基础工具
+# ============================================================
+
+def _dk(value: Any) -> str:
+    return format_chainage_dk(value, unknown="未知里程", prefix="DK")
+
+
+def _dk_range(start: Any, end: Any) -> str:
+    return f"{_dk(start)}～{_dk(end)}"
 
 
 # ============================================================
@@ -57,10 +70,27 @@ def _section_text(report_context: Dict[str, Any], section_key: str, default: str
     return _safe_text(section.get("text"), default=default)
 
 
+def _normalize_note_text(text: str) -> str:
+    text = str(text).strip()
+    text = text.replace(
+        "GRCI 表示地质-施工响应耦合关注度，不表示灾害发生概率。",
+        "GRCI 表示复盘窗口内提前地质证据与实际施工响应的对应程度，不表示灾害发生概率或在线预测概率。",
+    )
+    text = text.replace(
+        "GRCI 表示地质-施工响应耦合关注度，不表示灾害发生概率",
+        "GRCI 表示复盘窗口内提前地质证据与实际施工响应的对应程度，不表示灾害发生概率或在线预测概率",
+    )
+    return text
+
+
 def _section_notes(report_context: Dict[str, Any], section_key: str) -> List[str]:
     sections = _as_dict(report_context.get("sections"))
     section = _as_dict(sections.get(section_key))
-    return [str(x) for x in _as_list(section.get("notes")) if str(x).strip()]
+    return [
+        _normalize_note_text(str(x))
+        for x in _as_list(section.get("notes"))
+        if str(x).strip()
+    ]
 
 
 def _constraints_text(report_context: Dict[str, Any]) -> str:
@@ -77,13 +107,25 @@ def _constraints_text(report_context: Dict[str, Any]) -> str:
 def _metadata_line(report_context: Dict[str, Any]) -> str:
     metadata = _as_dict(report_context.get("metadata"))
 
-    current_chainage = metadata.get("current_chainage")
-    chainage_range_text = metadata.get("chainage_range_text", "未指定")
     date = metadata.get("date") or metadata.get("report_date") or metadata.get("time_window") or "未指定"
+
+    current_chainage_text = metadata.get("current_chainage_dk")
+    if not current_chainage_text:
+        current_chainage = metadata.get("current_chainage")
+        current_chainage_text = _dk(current_chainage) if current_chainage is not None else "未指定"
+
+    chainage_range_text = metadata.get("chainage_range_text")
+    if not chainage_range_text or str(chainage_range_text).strip() in {"", "未指定"}:
+        chainage_min = metadata.get("chainage_min")
+        chainage_max = metadata.get("chainage_max")
+        if chainage_min is not None and chainage_max is not None:
+            chainage_range_text = _dk_range(chainage_min, chainage_max)
+        else:
+            chainage_range_text = "未指定"
 
     parts = [
         f"报告日期/时间窗：{date}",
-        f"当前里程：{current_chainage if current_chainage is not None else '未指定'}",
+        f"当前里程：{current_chainage_text}",
         f"复核范围：{chainage_range_text}",
     ]
 
@@ -125,7 +167,7 @@ def render_geology_v2_report_context(
     lines.append("一、写作约束")
     lines.append(
         "本报告上下文基于多源地质证据、前方分段剖面和地质-施工响应耦合结果构建。"
-        "其中 GRCI 表示地质-施工响应耦合关注度，不表示灾害发生概率；"
+        "其中 GRCI 表示复盘窗口内提前地质证据与实际施工响应的对应程度，不表示灾害发生概率或在线预测概率；"
         "缺少证据覆盖时只能说明证据不足，不得表述为无风险或无异常。"
     )
     if warnings:

@@ -263,6 +263,12 @@ def project_evidence_to_cells(
         if evidence_strength is None:
             evidence_strength = 0.0
 
+        # v2 可靠性修正：
+        # source_reliability / evidence_strength 是融合权重项，不允许单项超过 1。
+        # 否则 point evidence 在 spatial_weight 接近 1 时，会把 effective_weight 推到 1 以上。
+        source_reliability = float(max(0.0, min(source_reliability, 1.0)))
+        evidence_strength = float(max(0.0, min(evidence_strength, 1.0)))
+
         sigma_m = get_spatial_sigma(
             source_type_norm=source_type_norm,
             spatial_type=spatial_type,
@@ -292,6 +298,7 @@ def project_evidence_to_cells(
             )
 
             effective_weight = float(spatial_weight * source_reliability * evidence_strength)
+            effective_weight = float(max(0.0, min(effective_weight, 1.0)))
 
             if effective_weight <= 1e-12:
                 continue

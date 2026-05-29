@@ -790,11 +790,38 @@ def parse_table2_records_by_pdfplumber(pdf_path: Path, meta: Dict[str, Any]) -> 
 # =========================
 # 8. 冲突标记：结论 vs 表2
 # =========================
+
+def _extract_grade_from_raw_text(raw_text: str) -> Optional[str]:
+    """
+    从原始文本中提取“建议按X级围岩施工”的等级。
+    只用于一致性校验，不做最终裁决。
+    """
+    if not raw_text:
+        return None
+
+    flat = _flat_text(str(raw_text))
+    m = re.search(r"建议按([ⅠⅡⅢⅣⅤIVX]+)级围岩施工", flat)
+    if not m:
+        return None
+
+    return m.group(1).strip()
+
+
 def attach_grade_conflicts(records: List[EvidenceRecord]) -> List[EvidenceRecord]:
-    """Attach grade conflicts."""
+    """
+    标记“7结论”和“表2”之间的围岩等级冲突。
+
+    关键原则：
+    1. 不再写 support_grade_final；
+    2. 不覆盖单条证据自身的 support_grade；
+    3. report_conclusion 证据保持 7结论原文等级；
+    4. table2_segment 证据保持表2原文等级；
+    5. 冲突只作为 grade_conflict 元信息，交给后续融合层处理。
+    """
     conclusion_map = {}
     segment_map = {}
 
+    # 第一遍：收集同一里程段下，7结论等级和表2等级
     for rec in records:
         try:
             attrs = rec.attrs() if callable(getattr(rec, "attrs", None)) else json.loads(rec.attrs_json)
@@ -806,12 +833,19 @@ def attach_grade_conflicts(records: List[EvidenceRecord]) -> List[EvidenceRecord
 
         key = (rec.start_num, rec.end_num)
 
-        if rec.source_level == "report_conclusion" and attrs.get("fact_type") == "support_grade_conclusion":
+        if (
+            rec.source_level == "report_conclusion"
+            and attrs.get("fact_type") == "support_grade_conclusion"
+        ):
             conclusion_map[key] = attrs.get("support_grade")
 
-        if rec.source_level == "segment" and attrs.get("fact_type") == "table2_segment":
+        if (
+            rec.source_level == "segment"
+            and attrs.get("fact_type") == "table2_segment"
+        ):
             segment_map[key] = attrs.get("support_grade")
 
+    # 第二遍：只标记冲突，不覆盖原始等级
     for rec in records:
         try:
             attrs = rec.attrs() if callable(getattr(rec, "attrs", None)) else json.loads(rec.attrs_json)
@@ -822,18 +856,46 @@ def attach_grade_conflicts(records: List[EvidenceRecord]) -> List[EvidenceRecord
                 continue
 
         key = (rec.start_num, rec.end_num)
-        if key in conclusion_map and key in segment_map:
-            g1 = conclusion_map[key]
-            g2 = segment_map[key]
-            if g1 and g2 and g1 != g2:
-                attrs["grade_conflict"] = 1
-                attrs["support_grade_conclusion"] = g1
-                attrs["support_grade_table2"] = g2
-                attrs["support_grade_final"] = g2
-                rec.attrs_json = json.dumps(attrs, ensure_ascii=False)
+
+        # 关键：清理旧字段
+        # support_grade_final 会被 normalizer 优先读取，导致 grade_2 被表2等级覆盖。
+        attrs.pop("support_grade_final", None)
+
+        # 原文兜底校验：如果 raw_text 明确写了“建议按X级围岩施工”，
+        # 则该条证据自身 support_grade 必须与 raw_text 保持一致。
+        raw_grade = _extract_grade_from_raw_text(getattr(rec, "raw_text", ""))
+        if raw_grade:
+            old_grade = attrs.get("support_grade")
+            if old_grade and old_grade != raw_grade:
+                attrs["grade_parse_warning"] = (
+                    f"support_grade={old_grade} 与 raw_text 中等级 {raw_grade} 不一致，"
+                    f"已按 raw_text 修正为 {raw_grade}"
+                )
+            attrs["support_grade"] = raw_grade
+
+        g_conclusion = conclusion_map.get(key)
+        g_table2 = segment_map.get(key)
+
+        if g_conclusion and g_table2 and g_conclusion != g_table2:
+            attrs["grade_conflict"] = 1
+            attrs["support_grade_conclusion"] = g_conclusion
+            attrs["support_grade_table2"] = g_table2
+
+            # 记录当前 evidence 自己的等级，但不作为最终裁决
+            attrs["support_grade_original"] = attrs.get("support_grade")
+
+            if rec.source_level == "report_conclusion":
+                attrs["grade_conflict_role"] = "conclusion_record"
+            elif rec.source_level == "segment":
+                attrs["grade_conflict_role"] = "table2_segment_record"
+            else:
+                attrs["grade_conflict_role"] = "other_record"
+        else:
+            attrs["grade_conflict"] = 0
+
+        rec.attrs_json = json.dumps(attrs, ensure_ascii=False)
 
     return records
-
 
 # =========================
 # 9. 主入口

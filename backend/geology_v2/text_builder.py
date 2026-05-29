@@ -35,6 +35,8 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import pandas as pd
 
+from utils.chainage_utils import format_chainage_dk
+
 
 # ============================================================
 # 1. 基础工具
@@ -197,7 +199,7 @@ def geo_state_to_text(row: Any) -> str:
 
     if not has_evidence:
         return (
-            f"{cell_start:.1f}～{cell_end:.1f}m 区段未形成有效地质证据覆盖，"
+            f"{_dk_range(cell_start, cell_end)} 区段未形成有效地质证据覆盖，"
             "不宜据此判断为低风险。"
         )
 
@@ -222,7 +224,7 @@ def geo_state_to_text(row: Any) -> str:
     grs = _fmt_score(data.get("GRS_geo_base"), digits=2)
 
     return (
-        f"{cell_start:.1f}～{cell_end:.1f}m 区段融合围岩等级以 {fused_grade} 级为主，"
+        f"{_dk_range(cell_start, cell_end)} 区段融合围岩等级以 {fused_grade} 级为主，"
         f"主要关注 {main_hazards}。"
         f"地质基础关注度 GRS_geo_base={grs}，"
         f"融合置信度为 {confidence}，不确定性为{uncertainty}，"
@@ -317,60 +319,182 @@ def geo_states_to_brief_text(
 # 3. forward_profile 文本
 # ============================================================
 
-def _profile_item_to_text(item: Dict[str, Any]) -> str:
-    range_label = _safe_str(item.get("range_label"), default="未知范围")
-    start_chainage = _safe_float(item.get("start_chainage"))
-    end_chainage = _safe_float(item.get("end_chainage"))
 
-    main_hazards = _join_cn(
-        _as_list(item.get("main_hazards")),
-        max_items=5,
-        empty="未形成明确主控地质问题",
+def _dk(value: Any) -> str:
+    return format_chainage_dk(value, unknown="未知里程", prefix="DK")
+
+
+def _dk_range(start: Any, end: Any) -> str:
+    return f"{_dk(start)}～{_dk(end)}"
+
+
+GEO_FEATURE_TERMS = {
+    "围岩破碎",
+    "围岩极破碎",
+    "裂隙发育",
+    "裂隙密集",
+    "软硬不均",
+    "泥质填充",
+    "稳定性较差",
+    "反射异常",
+    "明显反射异常",
+    "较明显反射异常",
+    "软弱夹层",
+    "出水增强",
+}
+
+HAZARD_EVENT_TERMS = {
+    "掉块",
+    "坍塌",
+    "塌方",
+    "出水",
+    "线状出水",
+    "股状出水",
+    "线-股状出水",
+    "渗滴水",
+    "变形",
+}
+
+
+def _split_concerns(main_hazards: List[str]) -> tuple[List[str], List[str], List[str]]:
+    geo_features: List[str] = []
+    hazard_events: List[str] = []
+    others: List[str] = []
+
+    for item in main_hazards or []:
+        text = str(item).strip()
+        if not text:
+            continue
+
+        if text in GEO_FEATURE_TERMS:
+            geo_features.append(text)
+        elif text in HAZARD_EVENT_TERMS:
+            hazard_events.append(text)
+        else:
+            others.append(text)
+
+    return (
+        _dedup_keep_order(geo_features),
+        _dedup_keep_order(hazard_events),
+        _dedup_keep_order(others),
     )
 
-    fused_grade = _safe_str(item.get("fused_grade"), default="未明确")
+
+def _source_trace_to_text(source_trace: List[Dict[str, Any]], max_items: int = 4) -> str:
+    if not source_trace:
+        return "未附带明确证据溯源。"
+
+    parts: List[str] = []
+
+    for item in source_trace[:max_items]:
+        source_type = str(item.get("source_type") or "未知来源")
+        report_id = str(item.get("report_id") or item.get("evidence_id") or "未知报告")
+        spatial_type = str(item.get("spatial_type") or "")
+
+        r = item.get("range") or {}
+        start = r.get("start_chainage")
+        end = r.get("end_chainage")
+        center = r.get("center_chainage")
+        face = r.get("face_chainage")
+
+        if start is not None and end is not None:
+            loc = _dk_range(start, end)
+        elif center is not None:
+            loc = _dk(center)
+        else:
+            loc = "未知里程"
+
+        face_text = f"，预报掌子面{_dk(face)}" if face is not None else ""
+
+        snippet = str(item.get("raw_text_snippet") or "").strip()
+        if snippet:
+            snippet = f"，原文片段：{snippet}"
+
+        parts.append(
+            f"{source_type}/{spatial_type}，{loc}{face_text}，来源：{report_id}{snippet}"
+        )
+
+    return "；".join(parts)
+
+
+
+def _short_evidence_id(evidence_id: Any, max_chars: int = 90) -> str:
+    text = str(evidence_id or "").strip()
+    if not text:
+        return ""
+    if len(text) > max_chars:
+        return text[: max_chars - 3].rstrip() + "..."
+    return text
+
+
+def _evidence_ids_to_text(evidence_ids: List[Any], max_items: int = 5) -> str:
+    ids = []
+    seen = set()
+    for item in evidence_ids or []:
+        text = _short_evidence_id(item)
+        if not text or text in seen:
+            continue
+        ids.append(text)
+        seen.add(text)
+        if len(ids) >= max_items:
+            break
+
+    if not ids:
+        return "未附带明确证据溯源"
+
+    return "；".join([f"证据{i + 1}：{x}" for i, x in enumerate(ids)])
+
+
+def _profile_item_to_text(item: Dict[str, Any]) -> str:
+    range_label = item.get("range_label", "--")
+    start_chainage = item.get("start_chainage")
+    end_chainage = item.get("end_chainage")
+
     attention = _level_cn(
         item.get("attention_level"),
         ATTENTION_LEVEL_CN,
         default="未知关注等级",
     )
-    confidence = _fmt_score(item.get("confidence_score"), digits=2)
+
+    fused_grade = item.get("fused_grade") or "未形成明确等级"
+    confidence = _safe_float(item.get("confidence_score"), default=0.0)
     uncertainty = _level_cn(
         item.get("uncertainty_level"),
         UNCERTAINTY_LEVEL_CN,
-        default="未知",
+        default=str(item.get("uncertainty_level") or "未知"),
     )
 
-    supporting_cell_ids = _as_list(item.get("supporting_cell_ids"))
-    supporting_evidence_ids = _as_list(item.get("supporting_evidence_ids"))
+    main_hazards = [str(x) for x in item.get("main_hazards", []) if str(x).strip()]
+    geo_features, hazard_events, other_terms = _split_concerns(main_hazards)
 
-    monitoring_focus = _join_cn(
-        _as_list(item.get("monitoring_focus")),
-        max_items=3,
-        empty="结合现场揭示资料复核前方地质条件",
-    )
+    monitoring_focus = "、".join(item.get("monitoring_focus", []) or []) or "未形成明确监测重点"
+    support_actions = "、".join(item.get("support_actions", []) or []) or "未形成明确处置建议"
 
-    support_actions = _join_cn(
-        _as_list(item.get("support_actions")),
-        max_items=3,
-        empty="保持常规监测并关注证据变化",
-    )
+    supporting_cell_ids = item.get("supporting_cell_ids", []) or []
+    supporting_evidence_ids = item.get("supporting_evidence_ids", []) or []
+    source_trace = item.get("source_trace", []) or []
 
-    if not supporting_cell_ids:
-        return (
-            f"{range_label}（{start_chainage:.1f}～{end_chainage:.1f}m）："
-            "该分段未形成有效前方地质证据覆盖，不宜据此判断为低风险；"
-            f"建议：{support_actions}。"
-        )
+    concern_parts = []
+    if geo_features:
+        concern_parts.append("主要不良地质特征：" + "、".join(geo_features))
+    if hazard_events:
+        concern_parts.append("主要施工关注问题：" + "、".join(hazard_events))
+    if other_terms:
+        concern_parts.append("其他结构化关注标签：" + "、".join(other_terms))
+
+    concern_text = "；".join(concern_parts) if concern_parts else "未形成明确主控地质关注项"
+
+    source_text = _source_trace_to_text(source_trace) if source_trace else _evidence_ids_to_text(supporting_evidence_ids)
 
     return (
-        f"{range_label}（{start_chainage:.1f}～{end_chainage:.1f}m）："
-        f"地质关注等级为{attention}，融合围岩等级以 {fused_grade} 级为主，"
-        f"主要关注 {main_hazards}；"
-        f"融合置信度为 {confidence}，不确定性为{uncertainty}。"
+        f"{range_label}（{_dk_range(start_chainage, end_chainage)}）："
+        f"地质关注等级为{attention}，融合围岩等级以 {fused_grade} 级为主；"
+        f"{concern_text}；"
+        f"融合置信度为 {confidence:.2f}，不确定性为{uncertainty}。"
         f"监测重点：{monitoring_focus}。"
         f"建议措施：{support_actions}。"
         f"支撑 cell 数 {len(supporting_cell_ids)}，支撑证据数 {len(supporting_evidence_ids)}。"
+        f"主要依据：{source_text}。"
     )
 
 
@@ -397,13 +521,13 @@ def forward_profile_to_text(forward_profile: Dict[str, Any]) -> str:
 
     if not has_forward_evidence or not profile:
         return (
-            f"以前方 {lookahead_m:.0f}m 为窗口，当前里程 {current_chainage:.1f}m "
+            f"以前方 {lookahead_m:.0f}m 为窗口，当前里程 {_dk(current_chainage)} "
             "未形成有效前方地质证据覆盖。该结果不应解释为低风险，建议结合后续超前预报、掌子面揭示及施工响应继续核查。"
         )
 
     lines = [
         (
-            f"以前方 {lookahead_m:.0f}m 为窗口，当前里程 {current_chainage:.1f}m "
+            f"以前方 {lookahead_m:.0f}m 为窗口，当前里程 {_dk(current_chainage)} "
             f"的综合地质关注等级为{overall_level}。"
             "该关注等级基于多源地质证据融合得到，不表示灾害发生概率。"
         )

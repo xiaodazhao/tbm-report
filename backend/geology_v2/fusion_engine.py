@@ -80,13 +80,19 @@ GEO_STATE_COLUMNS = [
 
     "supporting_evidence_ids",
 
+    "source_trace",
+
     "GRS_geo_base",
+    
 ]
 
 
 HAZARD_LABELS = {
     "water": "出水",
-    "water_inrush": "突涌水",
+    # 注意：
+    # 不把线状出水、股状出水、渗滴水默认升级成“突涌水”。
+    # 只有 parser 明确抽取到“突涌水/突水”时，后续再单独设 explicit_water_inrush。
+    "water_inrush": "出水增强",
     "collapse": "坍塌",
     "block_fall": "掉块",
     "deformation": "变形",
@@ -430,16 +436,38 @@ def _build_grade_distribution(group: pd.DataFrame) -> Tuple[Dict[str, Dict[str, 
     return _json_clean(distribution), fused_grade
 
 
+def _event_state(row: pd.Series, state_col: str, fallback_flag_col: str) -> str:
+    """
+    读取三态字段：positive / negative / unknown。
+
+    兼容旧数据：
+    如果没有 state_col，但 fallback_flag_col == 1，则认为 positive；
+    否则 unknown。
+    """
+    value = row.get(state_col)
+
+    if not _is_missing(value):
+        text = str(value).strip().lower()
+        if text == "positive":
+            return "positive"
+        if text == "negative":
+            return "negative"
+        if text == "unknown":
+            # 对新 normalizer 输出的 unknown，仍允许旧 flag=1 兜底，
+            # 避免 HSP anomaly_point 等派生证据被 unknown 掩盖。
+            if fallback_flag_col in row and _safe_int(row.get(fallback_flag_col)) == 1:
+                return "positive"
+            return "unknown"
+
+    if fallback_flag_col in row and _safe_int(row.get(fallback_flag_col)) == 1:
+        return "positive"
+
+    return "unknown"
+
+
 def _append_valid_hazard_key(keys: List[str], key: Any) -> None:
     """
     只保留 config 中明确有权重的 hazard key。
-
-    例如：
-    - 掉块 -> block_fall，保留
-    - 裂隙密集 -> dense_joints，保留
-    - 围岩等级建议 -> 没有 hazard 权重，不保留
-
-    这样可以避免把“围岩等级建议”这种解释性标签写进 main_hazards。
     """
     if key is None:
         return
@@ -457,8 +485,9 @@ def _collect_hazard_keys(row: pd.Series) -> List[str]:
     从一条 evidence 里收集 hazard key。
 
     注意：
-    这里只保留真正 hazard；
-    不把“围岩等级建议”这类解释性标签当成 hazard。
+    1. hazard_tags 已在 normalizer 中清洗；
+    2. water/collapse/deformation 使用三态字段；
+    3. unknown 不作为 negative，也不参与 hazard 增强。
     """
     keys: List[str] = []
 
@@ -466,7 +495,11 @@ def _collect_hazard_keys(row: pd.Series) -> List[str]:
         key = normalize_hazard_tag(str(tag))
         _append_valid_hazard_key(keys, key)
 
-    if _safe_int(row.get("water_flag")) == 1:
+    water_state = _event_state(row, "water_state", "water_flag")
+    collapse_state = _event_state(row, "collapse_state", "collapse_flag")
+    deformation_state = _event_state(row, "deformation_state", "deformation_flag")
+
+    if water_state == "positive":
         water_type = _safe_str(row.get("water_type"))
         if water_type:
             key = normalize_hazard_tag(water_type) or "water"
@@ -474,10 +507,10 @@ def _collect_hazard_keys(row: pd.Series) -> List[str]:
         else:
             _append_valid_hazard_key(keys, "water")
 
-    if _safe_int(row.get("collapse_flag")) == 1:
+    if collapse_state == "positive":
         _append_valid_hazard_key(keys, "block_fall")
 
-    if _safe_int(row.get("deformation_flag")) == 1:
+    if deformation_state == "positive":
         _append_valid_hazard_key(keys, "deformation")
 
     joint = _safe_str(row.get("joint_development"))
@@ -599,7 +632,82 @@ def _source_support(group: pd.DataFrame) -> Dict[str, Dict[str, float]]:
         }
 
     return _json_clean(out)
+def _compact_raw_text(value: Any, max_chars: int = 160) -> str:
+    """
+    压缩原文片段，只用于溯源展示。
+    不在这里生成新的地质判断。
+    """
+    text = _safe_str(value)
+    if not text:
+        return ""
 
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = " ".join([line.strip() for line in text.split("\n") if line.strip()])
+    if len(text) > max_chars:
+        text = text[: max_chars - 3].rstrip() + "..."
+    return text
+
+
+def _trace_range(row: pd.Series) -> dict[str, Any]:
+    return {
+        "start_chainage": _safe_float(row.get("start_chainage"), default=None),
+        "end_chainage": _safe_float(row.get("end_chainage"), default=None),
+        "center_chainage": _safe_float(row.get("center_chainage"), default=None),
+        "face_chainage": _safe_float(row.get("face_chainage"), default=None),
+    }
+
+
+def _build_source_trace(group: pd.DataFrame, top_n: int = 12) -> list[dict[str, Any]]:
+    """
+    构造 cell 级证据溯源列表。
+
+    目的：
+    1. 后续文本能说明“来自哪一份报告/哪一段/哪条证据”；
+    2. 不允许 report_renderer 自己编造来源；
+    3. 保留 evidence_id/report_id/raw_text_snippet，便于人工审查。
+    """
+    if group is None or group.empty:
+        return []
+
+    weight_col = "effective_weight_capped" if "effective_weight_capped" in group.columns else "effective_weight"
+
+    work = group.copy()
+    work["__weight"] = pd.to_numeric(work[weight_col], errors="coerce").fillna(0.0)
+    work = work.sort_values("__weight", ascending=False)
+
+    traces: list[dict[str, Any]] = []
+    seen = set()
+
+    for _, row in work.iterrows():
+        evidence_id = _safe_str(row.get("evidence_id"))
+        if not evidence_id or evidence_id in seen:
+            continue
+        seen.add(evidence_id)
+
+        trace = {
+            "evidence_id": evidence_id,
+            "report_id": _safe_str(row.get("report_id")),
+            "source_type": _safe_str(row.get("source_type_norm")),
+            "evidence_role": _safe_str(row.get("evidence_role")),
+            "spatial_type": _safe_str(row.get("spatial_type")),
+            "range": _trace_range(row),
+            "grade": _normalize_grade(row.get("grade")),
+            "hazard_tags": _json_clean(_as_list(row.get("hazard_tags"))),
+            "attribute_tags": _json_clean(_as_list(row.get("attribute_tags"))),
+            "method_tags": _json_clean(_as_list(row.get("method_tags"))),
+            "water_state": _safe_str(row.get("water_state"), default="unknown"),
+            "collapse_state": _safe_str(row.get("collapse_state"), default="unknown"),
+            "deformation_state": _safe_str(row.get("deformation_state"), default="unknown"),
+            "effective_weight": float(_safe_float(row.get(weight_col), default=0.0)),
+            "raw_text_snippet": _compact_raw_text(row.get("raw_text")),
+        }
+
+        traces.append(_json_clean(trace))
+
+        if len(traces) >= top_n:
+            break
+
+    return traces
 
 def _confidence_score(group: pd.DataFrame, conflict_score: float) -> float:
     """
@@ -751,47 +859,62 @@ def _detect_grade_conflict(
     return _clip01(score), reasons
 
 
-def _detect_binary_flag_conflict(
+def _detect_state_conflict(
     group: pd.DataFrame,
-    flag_col: str,
+    state_col: str,
+    fallback_flag_col: str,
     label: str,
 ) -> Tuple[float, List[str]]:
     """
-    检测 water/collapse/deformation 这类判断差异。
+    检测 water/collapse/deformation 三态冲突。
 
-    注意：
-    flag=0 不直接写成“无风险”，这里只表达：
-    “部分证据提示该现象，部分证据未形成该标记”。
+    只比较：
+        positive vs negative
+
+    不比较：
+        positive vs unknown
+
+    因为 unknown 只是未提及，不能当成否定证据。
     """
     reasons: List[str] = []
 
-    if group is None or group.empty or flag_col not in group.columns:
+    if group is None or group.empty:
         return 0.0, reasons
 
     weight_col = "effective_weight_capped" if "effective_weight_capped" in group.columns else "effective_weight"
+
     work = group.copy()
-    work[flag_col] = pd.to_numeric(work[flag_col], errors="coerce").fillna(0).astype(int)
-    work["__weight"] = pd.to_numeric(work[weight_col], errors="coerce").fillna(0.0).clip(lower=0.0)
+    work["__state"] = work.apply(
+        lambda row: _event_state(row, state_col, fallback_flag_col),
+        axis=1,
+    )
 
-    positive = work[work[flag_col] == 1]
-    neutral = work[work[flag_col] == 0]
+    work["__weight"] = pd.to_numeric(
+        work[weight_col],
+        errors="coerce",
+    ).fillna(0.0).clip(lower=0.0)
 
-    if positive.empty or neutral.empty:
+    positive = work[work["__state"] == "positive"]
+    negative = work[work["__state"] == "negative"]
+
+    # unknown 不参与冲突检测。
+    if positive.empty or negative.empty:
         return 0.0, reasons
 
     positive_weight = float(positive["__weight"].sum())
-    neutral_weight = float(neutral["__weight"].sum())
+    negative_weight = float(negative["__weight"].sum())
 
     positive_sources = set(positive["source_type_norm"].astype(str).tolist()) if "source_type_norm" in work.columns else set()
-    neutral_sources = set(neutral["source_type_norm"].astype(str).tolist()) if "source_type_norm" in work.columns else set()
+    negative_sources = set(negative["source_type_norm"].astype(str).tolist()) if "source_type_norm" in work.columns else set()
 
-    if positive_weight >= 0.60 and neutral_weight >= 0.80 and len(positive_sources | neutral_sources) >= 2:
+    if positive_weight >= 0.60 and negative_weight >= 0.60:
         score = 0.45
-        if positive_sources and neutral_sources and positive_sources.isdisjoint(neutral_sources):
+
+        if positive_sources and negative_sources and positive_sources.isdisjoint(negative_sources):
             score = 0.60
 
         reasons.append(
-            f"{label}判断存在差异：部分证据提示{label}，部分证据未形成{label}标记"
+            f"{label}判断存在差异：部分证据明确提示{label}，部分证据明确否定{label}"
         )
         return score, reasons
 
@@ -803,9 +926,26 @@ def _detect_conflicts(
     grade_distribution: Dict[str, Dict[str, float]],
 ) -> Tuple[float, str, List[str]]:
     grade_score, grade_reasons = _detect_grade_conflict(group, grade_distribution)
-    water_score, water_reasons = _detect_binary_flag_conflict(group, "water_flag", "出水")
-    collapse_score, collapse_reasons = _detect_binary_flag_conflict(group, "collapse_flag", "掉块/坍塌")
-    deformation_score, deformation_reasons = _detect_binary_flag_conflict(group, "deformation_flag", "变形")
+    water_score, water_reasons = _detect_state_conflict(
+        group,
+        state_col="water_state",
+        fallback_flag_col="water_flag",
+        label="出水",
+    )
+
+    collapse_score, collapse_reasons = _detect_state_conflict(
+        group,
+        state_col="collapse_state",
+        fallback_flag_col="collapse_flag",
+        label="掉块/坍塌",
+    )
+
+    deformation_score, deformation_reasons = _detect_state_conflict(
+        group,
+        state_col="deformation_state",
+        fallback_flag_col="deformation_flag",
+        label="变形",
+    )
 
     conflict_score = max(grade_score, water_score, collapse_score, deformation_score)
     reasons = grade_reasons + water_reasons + collapse_reasons + deformation_reasons
@@ -848,7 +988,7 @@ def _empty_geo_state(cell: pd.Series) -> Dict[str, Any]:
         "conflict_reasons": [],
 
         "supporting_evidence_ids": [],
-
+        "source_trace": [],
         "GRS_geo_base": 0.0,
     }
 
@@ -861,6 +1001,8 @@ def _fuse_one_cell(cell: pd.Series, group: pd.DataFrame) -> Dict[str, Any]:
 
     supporting_ids = _dedup_keep_order(group["evidence_id"].tolist())
     source_support = _source_support(group)
+    source_trace = _build_source_trace(group)
+    source_trace = _build_source_trace(group)
 
     grade_distribution, fused_grade = _build_grade_distribution(group)
     conflict_score, conflict_level, conflict_reasons = _detect_conflicts(group, grade_distribution)
@@ -920,6 +1062,7 @@ def _fuse_one_cell(cell: pd.Series, group: pd.DataFrame) -> Dict[str, Any]:
         "conflict_reasons": _json_clean(conflict_reasons),
 
         "supporting_evidence_ids": _json_clean(supporting_ids),
+        "source_trace": _json_clean(source_trace),
 
         "GRS_geo_base": float(grs_geo_base),
     }
@@ -1010,6 +1153,8 @@ def fuse_geo_states(
     ne_cols = [
         "evidence_id",
         "report_id",
+        "report_date",
+        "issue_date",
         "evidence_role",
         "start_chainage",
         "end_chainage",
@@ -1021,11 +1166,24 @@ def fuse_geo_states(
         "joint_development",
         "rock_mass_state",
         "stability",
+
+        # 旧兼容字段。
         "water_flag",
         "water_type",
         "collapse_flag",
         "deformation_flag",
+
+        # 新三态字段。
+        "water_state",
+        "collapse_state",
+        "deformation_state",
+
+        # tag 分层。
         "hazard_tags",
+        "attribute_tags",
+        "method_tags",
+        "unknown_hazard_tags",
+
         "confidence_text",
         "raw_text",
         "attrs_obj",
@@ -1048,9 +1206,20 @@ def fuse_geo_states(
         ("water_flag", 0),
         ("collapse_flag", 0),
         ("deformation_flag", 0),
+        ("water_state", "unknown"),
+        ("collapse_state", "unknown"),
+        ("deformation_state", "unknown"),
+        ("hazard_tags", []),
+        ("attribute_tags", []),
+        ("method_tags", []),
+        ("unknown_hazard_tags", []),
     ]:
         if col not in merged.columns:
-            merged[col] = default
+            # list 默认值不能直接复用同一个对象。
+            if isinstance(default, list):
+                merged[col] = [[] for _ in range(len(merged))]
+            else:
+                merged[col] = default
 
     merged["effective_weight"] = pd.to_numeric(
         merged["effective_weight"],

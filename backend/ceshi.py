@@ -10,6 +10,7 @@ from config import EVIDENCE_DB_PATH
 
 from geology_v2.evidence_normalizer import (
     normalize_evidence_df,
+    filter_available_evidence,
     summarize_normalized_evidence,
 )
 
@@ -42,11 +43,6 @@ from geology_v2.coupling_adapter import (
     coupled_df_to_text,
 )
 
-def print_title(title: str):
-    print("\n" + "=" * 80)
-    print(title)
-    print("=" * 80)
-
 from geology_v2.report_context_builder import (
     build_geology_v2_report_context,
     report_context_to_prompt_text,
@@ -56,6 +52,41 @@ from geology_v2.report_renderer import (
     render_geology_v2_report_context,
     render_prompt_block_from_context,
 )
+
+from geology_v2.explainability import (
+    explain_geo_state,
+    explain_geo_state_text,
+    print_geo_state_explanation,
+)
+
+# =========================================================
+# 测试参数
+# =========================================================
+CURRENT_CHAINAGE = 1013220.0
+TARGET_CHAINAGE = 1013224.0
+CHAINAGE_MIN = 1013200.0
+CHAINAGE_MAX = 1013260.0
+CELL_LENGTH_M = 10.0
+LOOKAHEAD_M = 30.0
+STEP_M = 10.0
+ADVANCE_DIRECTION = 1
+
+# online 模式会过滤未来 evidence，避免掌子面素描等未来信息泄漏。
+# 如果你只是想复现旧的完整回顾结果，可以临时改成 "retrospective"。
+EVIDENCE_FILTER_MODE = "online"
+ANALYSIS_DATE = None
+
+
+# =========================================================
+# 工具函数
+# =========================================================
+
+def print_title(title: str):
+    print("\n" + "=" * 80)
+    print(title)
+    print("=" * 80)
+
+
 def safe_json_dump(obj, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -64,12 +95,53 @@ def safe_json_dump(obj, path: Path):
     )
 
 
+def print_before_after_summary(before: dict, after: dict):
+    print("=== 修改前后关键指标对比 ===")
+
+    keys = [
+        "GRS_geo_base_mean",
+        "high_attention_cell_count",
+        "main_hazard_counts",
+        "conflict_level_counts",
+    ]
+
+    for key in keys:
+        print(f"{key}:")
+        print("  before:", before.get(key))
+        print("  after :", after.get(key))
+
+
+def print_existing_columns(
+    df: pd.DataFrame,
+    cols: list[str],
+    title: str,
+    max_rows: int = 20,
+):
+    print_title(title)
+
+    if df is None or df.empty:
+        print("DataFrame 为空。")
+        return
+
+    show_cols = [c for c in cols if c in df.columns]
+
+    if not show_cols:
+        print("没有可展示的目标列。候选列 =", cols)
+        print("当前列 =", list(df.columns))
+        return
+
+    print(df[show_cols].head(max_rows).to_string())
+
+
 def main():
     # =========================================================
     # 0. 输出目录
     # =========================================================
     out_dir = Path("outputs/geology_v2_test")
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    current_chainage = CURRENT_CHAINAGE
+    target_chainage = TARGET_CHAINAGE
 
     # =========================================================
     # 1. 读取旧 evidence_df
@@ -81,19 +153,57 @@ def main():
     print("EVIDENCE_DB_PATH =", EVIDENCE_DB_PATH)
     print("evidence_df shape =", evidence_df.shape)
     print("evidence_df columns =", list(evidence_df.columns))
+    print("current_chainage =", current_chainage)
+    print("evidence filter mode =", EVIDENCE_FILTER_MODE)
 
     # =========================================================
-    # 2. 第二阶段：normalize_evidence_df
+    # 2. 第二阶段：normalize_evidence_df + 可用性过滤
     # =========================================================
-    print_title("2. 标准化 evidence_df -> normalized_df")
+    print_title("2. 标准化 evidence_df -> normalized_df，并过滤未来证据")
 
-    normalized_df = normalize_evidence_df(evidence_df)
+    normalized_df_all = normalize_evidence_df(evidence_df)
 
-    print("normalized_df shape =", normalized_df.shape)
+    print("normalized_df_all shape =", normalized_df_all.shape)
+    print(normalized_df_all.head())
+
+    normalized_summary_all = summarize_normalized_evidence(normalized_df_all)
+    print("normalized summary before availability filter:")
+    print(normalized_summary_all)
+
+    normalized_df_all.to_csv(
+        out_dir / "normalized_evidence_df_before_available_filter.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    safe_json_dump(
+        normalized_summary_all,
+        out_dir / "normalized_summary_before_available_filter.json",
+    )
+
+    normalized_df = filter_available_evidence(
+        normalized_df=normalized_df_all,
+        current_chainage=current_chainage,
+        analysis_date=ANALYSIS_DATE,
+        mode=EVIDENCE_FILTER_MODE,
+        advance_direction=ADVANCE_DIRECTION,
+        chainage_tolerance_m=1.0,
+    )
+
+    availability_filter_info = normalized_df.attrs.get("availability_filter", {})
+    print("availability filter attrs:")
+    print(availability_filter_info)
+
+    print("excluded_unavailable_prediction_count =",
+      availability_filter_info.get("excluded_unavailable_prediction_count"))
+
+    print("excluded_missing_face_chainage_count =",
+      availability_filter_info.get("excluded_missing_face_chainage_count"))
+
+    print("normalized_df after availability filter shape =", normalized_df.shape)
     print(normalized_df.head())
 
     normalized_summary = summarize_normalized_evidence(normalized_df)
-    print("normalized summary:")
+    print("normalized summary after availability filter:")
     print(normalized_summary)
 
     normalized_df.to_csv(
@@ -102,40 +212,79 @@ def main():
         encoding="utf-8-sig",
     )
     safe_json_dump(normalized_summary, out_dir / "normalized_summary.json")
+    safe_json_dump(
+        availability_filter_info,
+        out_dir / "availability_filter_info.json",
+    )
+
+    # 查看三态字段和 tag 分层字段
+    print_existing_columns(
+        normalized_df,
+        cols=[
+            "evidence_id",
+            "source_type_norm",
+            "evidence_role",
+            "spatial_type",
+            "center_chainage",
+            "face_chainage",
+            "water_flag",
+            "water_state",
+            "collapse_flag",
+            "collapse_state",
+            "deformation_flag",
+            "deformation_state",
+            "hazard_tags",
+            "attribute_tags",
+            "method_tags",
+            "unknown_hazard_tags",
+        ],
+        title="2.0 检查三态字段与 tag 分层字段",
+        max_rows=30,
+    )
 
     # 查看 HSP anomaly_point
     print_title("2.1 检查 HSP anomaly_point")
 
-    anomaly_points = normalized_df[
-        normalized_df["spatial_type"].eq("anomaly_point")
-    ].copy()
+    if normalized_df.empty or "spatial_type" not in normalized_df.columns:
+        anomaly_points = pd.DataFrame()
+    else:
+        anomaly_points = normalized_df[
+            normalized_df["spatial_type"].eq("anomaly_point")
+        ].copy()
 
     print("anomaly_point count =", len(anomaly_points))
 
     if not anomaly_points.empty:
-        print(
-            anomaly_points[
-                [
-                    "evidence_id",
-                    "source_type_norm",
-                    "spatial_type",
-                    "center_chainage",
-                    "hazard_tags",
-                ]
-            ].head(20).to_string()
-        )
+        anomaly_cols = [
+            "evidence_id",
+            "source_type_norm",
+            "spatial_type",
+            "center_chainage",
+            "collapse_flag",
+            "collapse_state",
+            "hazard_tags",
+        ]
+        anomaly_cols = [c for c in anomaly_cols if c in anomaly_points.columns]
+        print(anomaly_points[anomaly_cols].head(20).to_string())
 
     # =========================================================
     # 3. 第三阶段：build_chainage_cells
     # =========================================================
     print_title("3. 构建 10m chainage cells")
 
-    extra_min = normalized_df["start_chainage"].dropna().min()
-    extra_max = normalized_df["end_chainage"].dropna().max()
+    if "start_chainage" in normalized_df.columns:
+        extra_min = normalized_df["start_chainage"].dropna().min()
+    else:
+        extra_min = None
+
+    if "end_chainage" in normalized_df.columns:
+        extra_max = normalized_df["end_chainage"].dropna().max()
+    else:
+        extra_max = None
 
     cells_df = build_chainage_cells(
         df_plc=pd.DataFrame(),
-        cell_length=10.0,
+        cell_length=CELL_LENGTH_M,
         extra_min=extra_min,
         extra_max=extra_max,
     )
@@ -169,8 +318,14 @@ def main():
     print("cell evidence summary:")
     print(cell_evidence_summary)
 
+    print("effective_weight_max should be <= 1.0:")
+    print(cell_evidence_summary.get("effective_weight_max"))
+
     print("cell_evidence_df head:")
-    print(cell_evidence_df.head(20).to_string())
+    if not cell_evidence_df.empty:
+        print(cell_evidence_df.head(20).to_string())
+    else:
+        print("cell_evidence_df 为空。")
 
     cell_evidence_df.to_csv(
         out_dir / "cell_evidence_df.csv",
@@ -182,24 +337,31 @@ def main():
     # =========================================================
     # 5. 检查某个里程附近的投影
     # =========================================================
-    print_title("5. 检查 1013224m 附近投影")
+    print_title(f"5. 检查 {target_chainage:.1f}m 附近投影")
 
-    target_chainage = 1013224.0
+    if not cells_df.empty:
+        near_cells = cells_df[
+            (cells_df["cell_center"] >= target_chainage - 20)
+            & (cells_df["cell_center"] <= target_chainage + 20)
+        ].copy()
+    else:
+        near_cells = pd.DataFrame()
 
-    near_cells = cells_df[
-        (cells_df["cell_center"] >= target_chainage - 20)
-        & (cells_df["cell_center"] <= target_chainage + 20)
-    ].copy()
-
-    near_projection = cell_evidence_df[
-        cell_evidence_df["cell_id"].isin(near_cells["cell_id"])
-    ].sort_values(
-        ["cell_id", "effective_weight"],
-        ascending=[True, False],
-    )
+    if not cell_evidence_df.empty and not near_cells.empty:
+        near_projection = cell_evidence_df[
+            cell_evidence_df["cell_id"].isin(near_cells["cell_id"])
+        ].sort_values(
+            ["cell_id", "effective_weight"],
+            ascending=[True, False],
+        )
+    else:
+        near_projection = pd.DataFrame()
 
     print("near_cells:")
-    print(near_cells.to_string())
+    if not near_cells.empty:
+        print(near_cells.to_string())
+    else:
+        print("附近没有 cell。")
 
     print("near_projection head 80:")
     if not near_projection.empty:
@@ -242,6 +404,34 @@ def main():
     print("geo states summary:")
     print(geo_states_summary)
 
+    baseline_geo_states_summary = {
+        "high_attention_cell_count": 393,
+        "GRS_geo_base_mean": 0.6948853252836316,
+        "main_hazard_counts": {
+            "掉块": 416,
+            "围岩破碎": 393,
+            "裂隙发育": 314,
+            "软硬不均": 249,
+            "明显反射异常": 238,
+            "出水": 166,
+            "裂隙密集": 135,
+            "稳定性较差": 131,
+            "围岩极破碎": 121,
+            "突涌水": 22,
+            "反射异常": 13,
+        },
+        "conflict_level_counts": {
+            "low": 188,
+            "medium": 183,
+            "none": 74,
+        },
+    }
+
+    print_before_after_summary(
+        before=baseline_geo_states_summary,
+        after=geo_states_summary,
+    )
+
     print("geo_states_df head:")
     show_cols = [
         "cell_id",
@@ -252,13 +442,18 @@ def main():
         "main_hazards",
         "water_score",
         "collapse_score",
+        "deformation_score",
         "confidence_score",
         "uncertainty_level",
         "conflict_level",
         "GRS_geo_base",
     ]
     show_cols = [c for c in show_cols if c in geo_states_df.columns]
-    print(geo_states_df[show_cols].head(40).to_string())
+
+    if show_cols and not geo_states_df.empty:
+        print(geo_states_df[show_cols].head(40).to_string())
+    else:
+        print("geo_states_df 为空或无可展示列。")
 
     geo_states_df.to_csv(
         out_dir / "geo_states_df.csv",
@@ -270,12 +465,15 @@ def main():
     # =========================================================
     # 7. 检查 1013224m 附近融合结果
     # =========================================================
-    print_title("7. 检查 1013224m 附近 geo_states")
+    print_title(f"7. 检查 {target_chainage:.1f}m 附近 geo_states")
 
-    near_states = geo_states_df[
-        (geo_states_df["cell_center"] >= target_chainage - 30)
-        & (geo_states_df["cell_center"] <= target_chainage + 30)
-    ].copy()
+    if not geo_states_df.empty:
+        near_states = geo_states_df[
+            (geo_states_df["cell_center"] >= target_chainage - 30)
+            & (geo_states_df["cell_center"] <= target_chainage + 30)
+        ].copy()
+    else:
+        near_states = pd.DataFrame()
 
     near_state_cols = [
         "cell_id",
@@ -285,6 +483,9 @@ def main():
         "grade_distribution",
         "hazard_scores",
         "main_hazards",
+        "water_score",
+        "collapse_score",
+        "deformation_score",
         "source_type_count",
         "evidence_count",
         "confidence_score",
@@ -296,7 +497,10 @@ def main():
     ]
     near_state_cols = [c for c in near_state_cols if c in near_states.columns]
 
-    print(near_states[near_state_cols].to_string())
+    if near_state_cols and not near_states.empty:
+        print(near_states[near_state_cols].to_string())
+    else:
+        print("附近没有 geo_states。")
 
     near_states.to_csv(
         out_dir / "near_geo_states_1013224.csv",
@@ -309,14 +513,12 @@ def main():
     # =========================================================
     print_title("8. 构建 forward_profile")
 
-    current_chainage = 1013220.0
-
     forward_profile = build_forward_profile(
         geo_states_df=geo_states_df,
         current_chainage=current_chainage,
-        lookahead_m=30.0,
-        step_m=10.0,
-        advance_direction=1,
+        lookahead_m=LOOKAHEAD_M,
+        step_m=STEP_M,
+        advance_direction=ADVANCE_DIRECTION,
     )
 
     forward_summary = summarize_forward_profile(forward_profile)
@@ -340,22 +542,48 @@ def main():
 
     checks = {}
 
-    checks["normalized_not_empty"] = not normalized_df.empty
-    checks["has_face_sketch"] = "face_sketch" in set(normalized_df["source_type_norm"])
-    checks["has_TSP"] = "TSP" in set(normalized_df["source_type_norm"])
-    checks["has_HSP"] = "HSP" in set(normalized_df["source_type_norm"])
-    checks["has_anomaly_point"] = bool(
-        (normalized_df["spatial_type"] == "anomaly_point").any()
+    checks["normalized_all_not_empty"] = not normalized_df_all.empty
+    checks["normalized_available_not_empty"] = not normalized_df.empty
+    checks["availability_filter_info"] = availability_filter_info
+
+    checks["has_face_sketch"] = "face_sketch" in set(
+        normalized_df.get("source_type_norm", pd.Series(dtype=str))
     )
+    checks["has_TSP"] = "TSP" in set(
+        normalized_df.get("source_type_norm", pd.Series(dtype=str))
+    )
+    checks["has_HSP"] = "HSP" in set(
+        normalized_df.get("source_type_norm", pd.Series(dtype=str))
+    )
+    checks["has_anomaly_point"] = bool(
+        (
+            normalized_df.get("spatial_type", pd.Series(dtype=str))
+            == "anomaly_point"
+        ).any()
+    )
+
+    checks["has_water_state_col"] = "water_state" in normalized_df.columns
+    checks["has_collapse_state_col"] = "collapse_state" in normalized_df.columns
+    checks["has_deformation_state_col"] = "deformation_state" in normalized_df.columns
+    checks["has_attribute_tags_col"] = "attribute_tags" in normalized_df.columns
+    checks["has_method_tags_col"] = "method_tags" in normalized_df.columns
+    checks["has_unknown_hazard_tags_col"] = "unknown_hazard_tags" in normalized_df.columns
 
     checks["cells_not_empty"] = not cells_df.empty
     checks["cell_evidence_not_empty"] = not cell_evidence_df.empty
+    checks["cell_evidence_effective_weight_max_le_1"] = (
+        float(cell_evidence_summary.get("effective_weight_max", 0.0)) <= 1.000001
+    )
     checks["geo_states_not_empty"] = not geo_states_df.empty
 
     checks["geo_states_has_GRS_geo_base"] = "GRS_geo_base" in geo_states_df.columns
-    checks["geo_states_has_supporting_ids"] = "supporting_evidence_ids" in geo_states_df.columns
+    checks["geo_states_has_supporting_ids"] = (
+        "supporting_evidence_ids" in geo_states_df.columns
+    )
 
-    checks["forward_profile_has_3_ranges"] = len(forward_profile.get("profile", [])) == 3
+    checks["forward_profile_has_3_ranges"] = (
+        len(forward_profile.get("profile", [])) == 3
+    )
     checks["forward_profile_range_labels"] = [
         item.get("range_label") for item in forward_profile.get("profile", [])
     ]
@@ -372,8 +600,8 @@ def main():
 
     geo_brief_text = geo_states_to_brief_text(
         geo_states_df=geo_states_df,
-        chainage_min=1013200.0,
-        chainage_max=1013260.0,
+        chainage_min=CHAINAGE_MIN,
+        chainage_max=CHAINAGE_MAX,
         top_k=5,
     )
 
@@ -384,8 +612,8 @@ def main():
         forward_profile=forward_profile,
         include_geo_states_brief=True,
         include_forward_profile=True,
-        chainage_min=1013200.0,
-        chainage_max=1013260.0,
+        chainage_min=CHAINAGE_MIN,
+        chainage_max=CHAINAGE_MAX,
     )
 
     print("=== geo_brief_text ===")
@@ -412,7 +640,7 @@ def main():
         encoding="utf-8",
     )
 
-        # =========================================================
+    # =========================================================
     # 11. 第七阶段：地质-施工响应耦合 GRCI
     # =========================================================
     print_title("11. 第七阶段：地质-施工响应耦合 GRCI")
@@ -420,35 +648,43 @@ def main():
     # 说明：
     # 这里先构造一个 mock_response_df，只用于测试 coupling_adapter 是否跑通。
     # 后面接真实 PLC 或已有 RAI 时，把这里替换成真实 response_df 即可。
-    mock_response_df = geo_states_df[
-        [
-            "cell_id",
-            "cell_start",
-            "cell_end",
-            "cell_center",
-        ]
-    ].copy()
+    if not geo_states_df.empty:
+        mock_response_df = geo_states_df[
+            [
+                "cell_id",
+                "cell_start",
+                "cell_end",
+                "cell_center",
+            ]
+        ].copy()
+    else:
+        mock_response_df = pd.DataFrame(
+            columns=["cell_id", "cell_start", "cell_end", "cell_center"]
+        )
 
     mock_response_df["RAI"] = 0.0
     mock_response_df["response_support_count"] = 1
-    mock_response_df["response_metrics"] = [{} for _ in range(len(mock_response_df))]
+    mock_response_df["response_metrics"] = [
+        {} for _ in range(len(mock_response_df))
+    ]
 
     # 模拟当前 1013220～1013250m 前方 30m 施工响应偏高。
-    mask = (
-        (mock_response_df["cell_center"] >= 1013220.0)
-        & (mock_response_df["cell_center"] < 1013250.0)
-    )
+    if not mock_response_df.empty:
+        mask = (
+            (mock_response_df["cell_center"] >= current_chainage)
+            & (mock_response_df["cell_center"] < current_chainage + LOOKAHEAD_M)
+        )
 
-    # 给三个 cell 一个测试用 RAI。
-    target_cells = mock_response_df[mask].sort_values("cell_center").index.tolist()
-    test_rai_values = [0.75, 0.65, 0.55]
+        # 给三个 cell 一个测试用 RAI。
+        target_cells = mock_response_df[mask].sort_values("cell_center").index.tolist()
+        test_rai_values = [0.75, 0.65, 0.55]
 
-    for idx, rai in zip(target_cells, test_rai_values):
-        mock_response_df.at[idx, "RAI"] = rai
-        mock_response_df.at[idx, "response_metrics"] = {
-            "mock": True,
-            "note": "测试用 RAI，后续应替换为真实施工响应异常指数",
-        }
+        for idx, rai in zip(target_cells, test_rai_values):
+            mock_response_df.at[idx, "RAI"] = rai
+            mock_response_df.at[idx, "response_metrics"] = {
+                "mock": True,
+                "note": "测试用 RAI，后续应替换为真实施工响应异常指数",
+            }
 
     coupled_df = couple_geo_response(
         geo_states_df=geo_states_df,
@@ -460,8 +696,8 @@ def main():
 
     coupling_text = coupled_df_to_text(
         coupled_df=coupled_df,
-        chainage_min=1013200.0,
-        chainage_max=1013260.0,
+        chainage_min=CHAINAGE_MIN,
+        chainage_max=CHAINAGE_MAX,
         top_k=5,
     )
 
@@ -469,25 +705,30 @@ def main():
     print(coupled_summary)
 
     print("\n=== coupled_df near target ===")
-    near_coupled = coupled_df[
-        (coupled_df["cell_center"] >= 1013200.0)
-        & (coupled_df["cell_center"] <= 1013260.0)
-    ].copy()
+    if not coupled_df.empty:
+        near_coupled = coupled_df[
+            (coupled_df["cell_center"] >= CHAINAGE_MIN)
+            & (coupled_df["cell_center"] <= CHAINAGE_MAX)
+        ].copy()
+    else:
+        near_coupled = pd.DataFrame()
 
-    print(
-        near_coupled[
-            [
-                "cell_id",
-                "cell_center",
-                "GRS_geo_base",
-                "RAI",
-                "GRCI",
-                "coupling_level",
-                "coupling_type",
-                "coupling_explanation",
-            ]
-        ].to_string()
-    )
+    coupled_show_cols = [
+        "cell_id",
+        "cell_center",
+        "GRS_geo_base",
+        "RAI",
+        "GRCI",
+        "coupling_level",
+        "coupling_type",
+        "coupling_explanation",
+    ]
+    coupled_show_cols = [c for c in coupled_show_cols if c in near_coupled.columns]
+
+    if not near_coupled.empty and coupled_show_cols:
+        print(near_coupled[coupled_show_cols].to_string())
+    else:
+        print("near_coupled 为空。")
 
     print("\n=== coupling_text ===")
     print(coupling_text)
@@ -505,7 +746,7 @@ def main():
         encoding="utf-8",
     )
 
-        # =========================================================
+    # =========================================================
     # 12. 第八阶段：统一 report_context 与 report_renderer
     # =========================================================
     print_title("12. 第八阶段：统一 report_context 与 report_renderer")
@@ -522,15 +763,20 @@ def main():
         },
         face_context={
             "has_face_evidence": True,
-            "text": "测试阶段使用当前里程附近地质融合结果作为掌子面上下文占位，正式接入时应替换为掌子面素描解析结果。"
+            "text": (
+                "测试阶段使用当前里程附近地质融合结果作为掌子面上下文占位，"
+                "正式接入时应替换为掌子面素描解析结果。"
+            ),
         },
         current_chainage=current_chainage,
-        chainage_min=1013200.0,
-        chainage_max=1013260.0,
+        chainage_min=CHAINAGE_MIN,
+        chainage_max=CHAINAGE_MAX,
         metadata={
             "date": "test",
             "source": "ceshi.py",
             "note": "第八阶段 report_context 测试",
+            "evidence_filter_mode": EVIDENCE_FILTER_MODE,
+            "availability_filter_info": availability_filter_info,
         },
         include_data_preview=True,
     )
@@ -551,7 +797,14 @@ def main():
     print(list(report_context.get("texts", {}).keys()))
 
     print("\n=== report_context data_summary ===")
-    print(json.dumps(report_context.get("data_summary", {}), ensure_ascii=False, indent=2, default=str))
+    print(
+        json.dumps(
+            report_context.get("data_summary", {}),
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+    )
 
     print("\n=== rendered_report_text ===")
     print(rendered_report_text)
@@ -594,8 +847,19 @@ def main():
         print(f"{key}: {value}")
 
     safe_json_dump(context_checks, out_dir / "report_context_checks.json")
+
+    from geology_v2.explainability import print_geo_state_explanation
+
+    print_geo_state_explanation(
+        cell_id="cell_1013220_1013230",
+        geo_states_df=geo_states_df,
+        cell_evidence_df=cell_evidence_df,
+        normalized_df=normalized_df,
+        top_n_evidence=12,
+    )
+
     # =========================================================
-    # 11. 完成
+    # 13. 完成
     # =========================================================
     print_title("测试完成")
     print("输出目录:", out_dir.resolve())

@@ -1,22 +1,22 @@
 {
-  "evidence_count": 878,
+  "evidence_count": 33,
   "source_type_counts": {
-    "HSP": 570,
-    "face_sketch": 169,
-    "TSP": 139
+    "TSP": 17,
+    "HSP": 13,
+    "face_sketch": 3
   },
   "spatial_type_counts": {
-    "anomaly_point": 394,
-    "segment": 314,
-    "point": 169,
+    "segment": 20,
+    "anomaly_point": 9,
+    "point": 3,
     "overview": 1
   },
   "role_counts": {
-    "prediction": 637,
-    "observed": 169,
-    "interpreted": 71,
+    "prediction": 20,
+    "interpreted": 9,
+    "observed": 3,
     "background": 1
   },
-  "anomaly_point_count": 394,
+  "anomaly_point_count": 9,
   "parse_warning_count": 0
 }

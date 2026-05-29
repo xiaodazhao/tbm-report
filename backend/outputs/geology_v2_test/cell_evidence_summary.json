@@ -1,17 +1,17 @@
 {
-  "projection_count": 4631,
-  "cell_count": 445,
-  "evidence_count": 877,
+  "projection_count": 234,
+  "cell_count": 22,
+  "evidence_count": 32,
   "source_type_counts": {
-    "HSP": 2687,
-    "TSP": 1437,
-    "face_sketch": 507
+    "TSP": 166,
+    "HSP": 59,
+    "face_sketch": 9
   },
   "spatial_type_counts": {
-    "segment": 3144,
-    "anomaly_point": 980,
-    "point": 507
+    "segment": 202,
+    "anomaly_point": 23,
+    "point": 9
   },
-  "effective_weight_max": 1.8367800000000003,
-  "effective_weight_mean": 0.5617327503180055
+  "effective_weight_max": 0.9872815715888194,
+  "effective_weight_mean": 0.49966212843776586
 }

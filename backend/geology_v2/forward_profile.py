@@ -38,6 +38,40 @@ from geology_v2.config import ATTENTION_LEVEL_THRESHOLDS, GRADE_ORDER
 # 1. 基础工具
 # ============================================================
 
+def _as_list_safe(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple) or isinstance(value, set):
+        return list(value)
+    return [value]
+
+
+def _merge_source_trace(values, max_items: int = 12) -> list[dict]:
+    """
+    合并多个 cell 的 source_trace。
+    """
+    out = []
+    seen = set()
+
+    for value in values:
+        for item in _as_list_safe(value):
+            if not isinstance(item, dict):
+                continue
+
+            evidence_id = str(item.get("evidence_id") or "").strip()
+            if not evidence_id or evidence_id in seen:
+                continue
+
+            seen.add(evidence_id)
+            out.append(item)
+
+            if len(out) >= max_items:
+                return out
+
+    return out
+
 def _is_missing(value: Any) -> bool:
     if value is None:
         return True
@@ -418,6 +452,7 @@ def _build_one_profile_item(
             "support_actions": ["建议结合现场揭示和后续预报资料补充核查"],
             "supporting_cell_ids": [],
             "supporting_evidence_ids": [],
+            "source_trace": [],
         }
 
     has_evidence_series = part.get("has_geology_evidence", pd.Series(False, index=part.index)).astype(bool)
@@ -439,6 +474,7 @@ def _build_one_profile_item(
             "support_actions": ["建议结合现场揭示和后续预报资料补充核查"],
             "supporting_cell_ids": [],
             "supporting_evidence_ids": [],
+            "source_trace": [],
         }
 
     grs = pd.to_numeric(evidence_part.get("GRS_geo_base", 0.0), errors="coerce").fillna(0.0).clip(0, 1)
@@ -449,6 +485,11 @@ def _build_one_profile_item(
     fused_grade = _pick_fused_grade(evidence_part)
     confidence_score = _aggregate_confidence(evidence_part)
     uncertainty_level = _aggregate_uncertainty(evidence_part)
+    source_trace = _merge_source_trace(
+        evidence_part["source_trace"].tolist()
+        if "source_trace" in evidence_part.columns
+        else []
+    )
 
     return {
         "range_label": range_label,

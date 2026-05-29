@@ -5,6 +5,6 @@
   "range_levels": {
     "0-10m": "high",
     "10-20m": "high",
-    "20-30m": "high"
+    "20-30m": "medium"
   }
 }

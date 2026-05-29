@@ -54,7 +54,7 @@ from __future__ import annotations
 import math
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional
-
+from utils.chainage_utils import format_chainage_dk
 import numpy as np
 import pandas as pd
 
@@ -179,10 +179,17 @@ def _df_preview_records(df: Optional[pd.DataFrame], max_rows: int = 20) -> List[
     return _json_clean(df.head(max_rows).to_dict(orient="records"))
 
 
+def _chainage_text(value: Optional[float]) -> str:
+    """只用于文本展示，不改变内部 chainage 数值。"""
+    if value is None:
+        return "未知里程"
+    return format_chainage_dk(value, unknown="未知里程", prefix="DK")
+
+
 def _chainage_range_text(chainage_min: Optional[float], chainage_max: Optional[float]) -> str:
     if chainage_min is None or chainage_max is None:
         return "未指定"
-    return f"{float(chainage_min):.1f}～{float(chainage_max):.1f}m"
+    return f"{_chainage_text(chainage_min)}～{_chainage_text(chainage_max)}"
 
 
 # ============================================================
@@ -294,7 +301,7 @@ def _build_coupling_section(
         "summary": _json_clean(summary),
         "text": coupling_text,
         "notes": [
-            "GRCI 表示地质-施工响应耦合关注度，不表示灾害发生概率。",
+            "GRCI 表示复盘窗口内提前地质证据与实际施工响应之间的对应程度，不表示灾害发生概率，也不作为单独的在线预测概率。",
             "缺少施工响应数据时，不得据此判断施工响应正常。",
         ],
     }
@@ -444,10 +451,14 @@ def build_geology_v2_report_context(
             "【地质-施工响应耦合分析】",
             coupling_text,
             "【写作约束】",
-            "1. GRCI 只能表述为地质-施工响应耦合关注度，不得表述为灾害概率。",
+            "1. GRCI 只能表述为复盘窗口内提前地质证据与实际施工响应的对应程度，不得表述为灾害概率或在线预测概率。",
             "2. weak validation 只能表述为弱标签一致性参考，不得表述为真实准确率。",
             "3. 缺少证据只能表述为证据不足，不得表述为无风险或无异常。",
             "4. 当前掌子面、已开挖区段复核、前方预报必须分开表述。",
+            "5. 报告文本不得编造证据中未出现的地质现象；未在 source_trace/raw_text/hazard_tags 中出现的内容不得写入结论。",
+            "6. 提及地质关注项时，应尽量说明对应的报告来源、证据编号或里程段。",
+            "5. 报告文本不得编造证据中未出现的地质现象；未在 source_trace/raw_text/hazard_tags 中出现的内容不得写入结论。",
+            "6. 提及地质关注项时，应尽量说明对应的报告来源、证据编号或里程段。"
         ]
     )
 
@@ -504,6 +515,7 @@ def build_geology_v2_report_context(
         "metadata": {
             **metadata,
             "current_chainage": current_chainage,
+            "current_chainage_dk": _chainage_text(current_chainage),
             "chainage_min": chainage_min,
             "chainage_max": chainage_max,
             "chainage_range_text": _chainage_range_text(chainage_min, chainage_max),

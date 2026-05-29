@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from typing import Any, Dict, Iterable, List, Optional
 
 import pandas as pd
@@ -35,6 +36,7 @@ from geology_v2.config import (
     SOURCE_LEVEL_STRENGTH,
     SOURCE_ROLE_MAP,
     SPATIAL_TYPE_STRENGTH,
+    get_hazard_weight,
     get_source_reliability,
     normalize_hazard_tag,
     normalize_source_type,
@@ -48,6 +50,8 @@ from geology_v2.config import (
 NORMALIZED_EVIDENCE_COLUMNS = [
     "evidence_id",
     "report_id",
+    "report_date",
+    "issue_date",
 
     "source_type_raw",
     "source_type_norm",
@@ -67,12 +71,23 @@ NORMALIZED_EVIDENCE_COLUMNS = [
     "rock_mass_state",
     "stability",
 
+    # 兼容旧逻辑的 0/1 flag。
+    # 注意：0 现在只表示不是 positive，不再表示 negative。
     "water_flag",
     "water_type",
     "collapse_flag",
     "deformation_flag",
 
+    # 新增三态字段：positive / negative / unknown。
+    "water_state",
+    "collapse_state",
+    "deformation_state",
+
+    # tag 分层。
     "hazard_tags",
+    "attribute_tags",
+    "method_tags",
+    "unknown_hazard_tags",
 
     "source_reliability",
     "evidence_strength",
@@ -127,6 +142,160 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
     return None
 
+
+_CHAINAGE_PATTERN = re.compile(
+    r"(?:D?y?K|DK|K)?\s*(\d{3,5})\s*\+\s*(\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+
+def _parse_chainage_from_text(value: Any) -> Optional[float]:
+    """
+    从 evidence_id / report_id / raw_text 里兜底解析桩号。
+
+    示例：
+        DyK1013+190.2 -> 1013190.2
+        K1013+080.2   -> 1013080.2
+
+    只作为 face_chainage 缺失时的兜底，不覆盖 row.face_num。
+    """
+    if _is_missing(value):
+        return None
+
+    text = str(value)
+    match = _CHAINAGE_PATTERN.search(text)
+    if not match:
+        return None
+
+    try:
+        km_part = float(match.group(1))
+        meter_part = float(match.group(2))
+        chainage = km_part * 1000.0 + meter_part
+        if math.isfinite(chainage):
+            return float(chainage)
+    except Exception:
+        return None
+
+    return None
+
+
+def _resolve_face_chainage_for_row(
+    row: pd.Series,
+    attrs: Dict[str, Any],
+    source_type_norm: str,
+) -> Optional[float]:
+    """
+    解析报告形成时对应的掌子面里程 face_chainage。
+
+    优先级：
+    1. 原始表 row.face_num；
+    2. attrs_json 中的 face_chainage / face_num 等字段；
+    3. report_id / evidence_id / raw_text 中的 DyKxxxx+xxx.x 桩号。
+
+    主要用于 TSP/HSP 超前预报证据的 online 可用性判断。
+    HSP segment 和 HSP anomaly_point 都必须继承这个 face_chainage。
+    """
+    value = _first_non_empty(
+        row.get("face_num"),
+        row.get("face_chainage"),
+        attrs.get("face_chainage"),
+        attrs.get("face_num"),
+        attrs.get("face_mileage"),
+        attrs.get("face_chainage_m"),
+        attrs.get("current_face_chainage"),
+        attrs.get("current_chainage"),
+    )
+
+    face_chainage = _safe_float(value)
+    if face_chainage is not None:
+        return face_chainage
+
+    # HSP 旧 parser 有时没有 face_num，但 report_id/evidence_id 会带 DyK1013+190.2。
+    # TSP 如果 face_num 缺失，也允许同样兜底。
+    if source_type_norm in {"TSP", "HSP"}:
+        for key in ["report_id", "evidence_id", "raw_text"]:
+            face_chainage = _parse_chainage_from_text(row.get(key))
+            if face_chainage is not None:
+                return face_chainage
+
+    return None
+
+_CHAINAGE_PATTERN = re.compile(
+    r"(?:D?y?K|DK|K)?\s*(\d{3,5})\s*\+\s*(\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+
+def _parse_chainage_from_text(value: Any) -> Optional[float]:
+    """
+    从 evidence_id / report_id / raw_text 里兜底解析桩号。
+
+    示例：
+        DyK1013+190.2 -> 1013190.2
+        K1013+080.2   -> 1013080.2
+
+    只作为 face_chainage 缺失时的兜底，不覆盖 row.face_num。
+    """
+    if _is_missing(value):
+        return None
+
+    text = str(value)
+    match = _CHAINAGE_PATTERN.search(text)
+    if not match:
+        return None
+
+    try:
+        km_part = float(match.group(1))
+        meter_part = float(match.group(2))
+        chainage = km_part * 1000.0 + meter_part
+        if math.isfinite(chainage):
+            return float(chainage)
+    except Exception:
+        return None
+
+    return None
+
+
+def _resolve_face_chainage_for_row(
+    row: pd.Series,
+    attrs: Dict[str, Any],
+    source_type_norm: str,
+) -> Optional[float]:
+    """
+    解析报告形成时对应的掌子面里程 face_chainage。
+
+    优先级：
+    1. 原始表 row.face_num；
+    2. attrs_json 中的 face_chainage / face_num 等字段；
+    3. report_id / evidence_id / raw_text 中的 DyKxxxx+xxx.x 桩号。
+
+    主要用于 TSP/HSP 超前预报证据的 online 可用性判断。
+    HSP segment 和 HSP anomaly_point 都必须继承这个 face_chainage。
+    """
+    value = _first_non_empty(
+        row.get("face_num"),
+        row.get("face_chainage"),
+        attrs.get("face_chainage"),
+        attrs.get("face_num"),
+        attrs.get("face_mileage"),
+        attrs.get("face_chainage_m"),
+        attrs.get("current_face_chainage"),
+        attrs.get("current_chainage"),
+    )
+
+    face_chainage = _safe_float(value)
+    if face_chainage is not None:
+        return face_chainage
+
+    # HSP 旧 parser 有时没有 face_num，但 report_id/evidence_id 会带 DyK1013+190.2。
+    # TSP 如果 face_num 缺失，也允许同样兜底。
+    if source_type_norm in {"TSP", "HSP"}:
+        for key in ["report_id", "evidence_id", "raw_text"]:
+            face_chainage = _parse_chainage_from_text(row.get(key))
+            if face_chainage is not None:
+                return face_chainage
+
+    return None
 
 def _safe_int_flag(value: Any) -> int:
     """
@@ -215,6 +384,320 @@ def _dedup_keep_order(items: Iterable[Any]) -> List[str]:
             seen.add(text)
 
     return out
+
+
+# ============================================================
+# 2.1 tag 清洗与三态识别
+# ============================================================
+
+NON_HAZARD_TAGS = {
+    "围岩等级建议",
+    "建议围岩等级",
+    "设计围岩等级",
+    "施工建议",
+    "预报结论",
+    "报告结论",
+    "结论",
+    "建议",
+    "围岩级别",
+    "围岩等级",
+    "支护建议",
+    "支护参数建议",
+}
+
+NON_HAZARD_KEYWORDS = [
+    "等级建议",
+    "建议围岩",
+    "设计围岩",
+    "施工建议",
+    "支护建议",
+    "预报结论",
+    "报告结论",
+]
+
+METHOD_TAGS = {
+    "TSP",
+    "HSP",
+    "水平声波",
+    "地震波反射法",
+    "掌子面素描",
+    "洞身素描",
+    "超前地质预报",
+    "报告",
+    "剖面法",
+}
+
+METHOD_KEYWORDS = [
+    "TSP",
+    "HSP",
+    "水平声波",
+    "地震波",
+    "反射法",
+    "掌子面素描",
+    "洞身素描",
+    "超前地质预报",
+    "剖面法",
+]
+
+WATER_POSITIVE_TERMS = [
+    "突涌水",
+    "股状出水",
+    "线状出水",
+    "出水",
+    "渗水",
+    "滴水",
+    "淋水",
+    "涌水",
+    "突水",
+]
+
+WATER_NEGATIVE_TERMS = [
+    "无出水",
+    "未见出水",
+    "未发现出水",
+    "无渗水",
+    "未见渗水",
+    "未见涌水",
+    "未发现涌水",
+    "干燥",
+]
+
+COLLAPSE_POSITIVE_TERMS = [
+    "掉块",
+    "坍塌",
+    "塌方",
+    "坍方",
+    "剥落",
+    "冒落",
+]
+
+COLLAPSE_NEGATIVE_TERMS = [
+    "无掉块",
+    "未见掉块",
+    "未发现掉块",
+    "无坍塌",
+    "未见坍塌",
+    "未发现坍塌",
+    "未见塌方",
+]
+
+DEFORMATION_POSITIVE_TERMS = [
+    "大变形",
+    "挤压变形",
+    "收敛变形",
+    "变形",
+]
+
+DEFORMATION_NEGATIVE_TERMS = [
+    "无变形",
+    "未见变形",
+    "未发现变形",
+]
+
+
+def _contains_any(text: str, terms: list[str]) -> bool:
+    if not text:
+        return False
+    return any(term in text for term in terms)
+
+
+def _is_non_hazard_tag(tag: str) -> bool:
+    text = str(tag).strip()
+    if not text:
+        return True
+    if text in NON_HAZARD_TAGS:
+        return True
+    return any(keyword in text for keyword in NON_HAZARD_KEYWORDS)
+
+
+def _is_method_tag(tag: str) -> bool:
+    text = str(tag).strip()
+    if not text:
+        return False
+    if text in METHOD_TAGS:
+        return True
+    return any(keyword in text for keyword in METHOD_KEYWORDS)
+
+
+def _build_state_text(attrs: Dict[str, Any], raw_text: Any) -> str:
+    """
+    拼出用于三态识别的文本。
+    """
+    parts: list[str] = []
+
+    for key in [
+        "risk_tags",
+        "hazard_tags",
+        "source_risk_tags",
+        "water_type",
+        "joint_development",
+        "rock_mass_state",
+        "stability",
+        "description",
+        "conclusion",
+        "geo_description",
+        "raw_text",
+    ]:
+        value = attrs.get(key)
+        if isinstance(value, list):
+            parts.extend([str(x) for x in value])
+        elif not _is_missing(value):
+            parts.append(str(value))
+
+    if not _is_missing(raw_text):
+        parts.append(str(raw_text))
+
+    return "；".join(parts)
+
+
+def _event_state_from_terms(
+    attrs: Dict[str, Any],
+    raw_text: Any,
+    flag_keys: list[str],
+    positive_terms: list[str],
+    negative_terms: list[str],
+) -> str:
+    """
+    返回 positive / negative / unknown。
+
+    原则：
+    1. flag=1 -> positive；
+    2. 明确否定词 -> negative；
+    3. 明确正向词 -> positive；
+    4. 未提及 -> unknown；
+    5. flag=0 不直接当 negative。
+
+    注意：
+    必须先匹配 negative_terms，再匹配 positive_terms。
+    否则“未见出水”会因为包含“出水”被误判成 positive。
+    """
+    for key in flag_keys:
+        if key in attrs and _safe_int_flag(attrs.get(key)) == 1:
+            return "positive"
+
+    text = _build_state_text(attrs, raw_text)
+
+    # 关键：先 negative，后 positive。
+    if _contains_any(text, negative_terms):
+        return "negative"
+
+    if _contains_any(text, positive_terms):
+        return "positive"
+
+    return "unknown"
+
+
+def _state_to_flag(state: str) -> int:
+    return 1 if state == "positive" else 0
+
+
+def _split_tags(
+    attrs: Dict[str, Any],
+    source_type_norm: str,
+    parse_warnings: list[str] | None = None,
+) -> tuple[list[str], list[str], list[str], list[str]]:
+    """
+    将原始 tags 拆分为：
+    - hazard_tags：真正地质灾害/不良地质现象；
+    - attribute_tags：属性类标签，例如围岩等级建议；
+    - method_tags：方法/来源类标签，例如 TSP、HSP、水平声波；
+    - unknown_hazard_tags：疑似 hazard 但 config 暂未识别的标签，方便后续补词表。
+    """
+    if parse_warnings is None:
+        parse_warnings = []
+
+    raw_tags: list[Any] = []
+
+    for key in ["risk_tags", "hazard_tags", "source_risk_tags"]:
+        value = attrs.get(key)
+        if isinstance(value, list):
+            raw_tags.extend(value)
+        elif not _is_missing(value):
+            raw_tags.append(value)
+
+    # 从结构化字段补充正向 hazard。
+    water_type = attrs.get("water_type")
+    if not _is_missing(water_type):
+        raw_tags.append(water_type)
+
+    if _safe_int_flag(attrs.get("water_flag")) == 1:
+        raw_tags.append("出水")
+
+    if _safe_int_flag(attrs.get("collapse_flag")) == 1:
+        raw_tags.append("掉块")
+
+    if _safe_int_flag(attrs.get("deformation_flag")) == 1:
+        raw_tags.append("变形")
+
+    joint = _normalize_joint_development(attrs)
+    if joint:
+        if "密集" in joint:
+            raw_tags.append("裂隙密集")
+        elif "发育" in joint:
+            raw_tags.append("裂隙发育")
+
+    rock_mass = _normalize_rock_mass_state(attrs)
+    if rock_mass:
+        if "极破碎" in rock_mass:
+            raw_tags.append("围岩极破碎")
+        elif "破碎" in rock_mass:
+            raw_tags.append("围岩破碎")
+
+    if _safe_int_flag(attrs.get("mud_filling_flag")):
+        raw_tags.append("泥质填充")
+
+    rock_uniformity = attrs.get("rock_uniformity")
+    if not _is_missing(rock_uniformity) and "软硬不均" in str(rock_uniformity):
+        raw_tags.append("软硬不均")
+
+    stability = _normalize_stability(attrs)
+    if stability and "差" in stability:
+        raw_tags.append("稳定性较差")
+
+    anomaly_level = _safe_str(attrs.get("anomaly_level"))
+    if anomaly_level == "strong":
+        raw_tags.append("明显反射异常")
+    elif anomaly_level == "medium":
+        raw_tags.append("较明显反射异常")
+
+    hazard_tags: list[str] = []
+    attribute_tags: list[str] = []
+    method_tags: list[str] = []
+    unknown_hazard_tags: list[str] = []
+
+    if source_type_norm in {"TSP", "HSP", "face_sketch"}:
+        method_tags.append(source_type_norm)
+
+    for raw in _dedup_keep_order(raw_tags):
+        text = str(raw).strip()
+        if not text:
+            continue
+
+        if _is_method_tag(text):
+            method_tags.append(text)
+            continue
+
+        if _is_non_hazard_tag(text):
+            attribute_tags.append(text)
+            continue
+
+        normalized = normalize_hazard_tag(text)
+
+        if normalized and get_hazard_weight(normalized) > 0:
+            # 这里仍保留中文原词，方便报告展示；
+            # fusion_engine 里会再 normalize_hazard_tag。
+            hazard_tags.append(text)
+        else:
+            unknown_hazard_tags.append(text)
+            attribute_tags.append(text)
+            parse_warnings.append(f"未识别为有效 hazard 的标签：{text}")
+
+    return (
+        _dedup_keep_order(hazard_tags),
+        _dedup_keep_order(attribute_tags),
+        _dedup_keep_order(method_tags),
+        _dedup_keep_order(unknown_hazard_tags),
+    )
 
 
 def _jsonable_attrs(attrs: Dict[str, Any]) -> Dict[str, Any]:
@@ -644,7 +1127,12 @@ def _iter_hsp_anomaly_points(normalized_row: Dict[str, Any]) -> List[Dict[str, A
         item["end_chainage"] = point_chainage
         item["center_chainage"] = point_chainage
 
+        # HSP anomaly_point 必须继承原 HSP 报告形成时的 face_chainage，
+        # 不能用 anomaly point 里程覆盖。
+        item["face_chainage"] = normalized_row.get("face_chainage")
+
         item["collapse_flag"] = 1
+        item["collapse_state"] = "positive"
         item["hazard_tags"] = _dedup_keep_order(list(item.get("hazard_tags") or []) + ["掉块"])
 
         item_attrs = dict(attrs)
@@ -689,12 +1177,23 @@ def _normalize_one_row(row: pd.Series, row_idx: int) -> Dict[str, Any]:
         spatial_type = "overview"
         evidence_role = "background"
 
+    resolved_face_chainage = _resolve_face_chainage_for_row(
+        row=row,
+        attrs=attrs_obj,
+        source_type_norm=source_type_norm,
+    )
+
     start_chainage, end_chainage, center_chainage, face_chainage = _normalize_chainage_interval(
         start_num=row.get("start_num"),
         end_num=row.get("end_num"),
-        face_num=row.get("face_num"),
+        face_num=resolved_face_chainage,
         spatial_type=spatial_type,
     )
+
+    # 对 TSP/HSP 这类超前预报证据，face_chainage 表示报告形成时的掌子面位置；
+    # 即使 segment 区间中心在前方，也不能把 face_chainage 改成 center_chainage。
+    if source_type_norm in {"TSP", "HSP"}:
+        face_chainage = resolved_face_chainage
 
     confidence_text = _normalize_confidence_text(row.get("confidence"))
 
@@ -705,12 +1204,42 @@ def _normalize_one_row(row: pd.Series, row_idx: int) -> Dict[str, Any]:
     rock_mass_state = _normalize_rock_mass_state(attrs_obj)
     stability = _normalize_stability(attrs_obj)
 
-    water_flag = _safe_int_flag(attrs_obj.get("water_flag"))
     water_type = None if _is_missing(attrs_obj.get("water_type")) else str(attrs_obj.get("water_type")).strip()
-    collapse_flag = _safe_int_flag(attrs_obj.get("collapse_flag"))
-    deformation_flag = _safe_int_flag(attrs_obj.get("deformation_flag"))
 
-    hazard_tags = _normalize_hazard_tags(attrs_obj)
+    water_state = _event_state_from_terms(
+        attrs=attrs_obj,
+        raw_text=row.get("raw_text"),
+        flag_keys=["water_flag"],
+        positive_terms=WATER_POSITIVE_TERMS,
+        negative_terms=WATER_NEGATIVE_TERMS,
+    )
+
+    collapse_state = _event_state_from_terms(
+        attrs=attrs_obj,
+        raw_text=row.get("raw_text"),
+        flag_keys=["collapse_flag", "block_fall_flag"],
+        positive_terms=COLLAPSE_POSITIVE_TERMS,
+        negative_terms=COLLAPSE_NEGATIVE_TERMS,
+    )
+
+    deformation_state = _event_state_from_terms(
+        attrs=attrs_obj,
+        raw_text=row.get("raw_text"),
+        flag_keys=["deformation_flag"],
+        positive_terms=DEFORMATION_POSITIVE_TERMS,
+        negative_terms=DEFORMATION_NEGATIVE_TERMS,
+    )
+
+    # 兼容旧字段：flag 只表示 positive，不再表示 negative。
+    water_flag = _state_to_flag(water_state)
+    collapse_flag = _state_to_flag(collapse_state)
+    deformation_flag = _state_to_flag(deformation_state)
+
+    hazard_tags, attribute_tags, method_tags, unknown_hazard_tags = _split_tags(
+        attrs=attrs_obj,
+        source_type_norm=source_type_norm,
+        parse_warnings=parse_warnings,
+    )
 
     source_reliability = get_source_reliability(source_type_norm)
     evidence_strength = _compute_evidence_strength(
@@ -732,6 +1261,8 @@ def _normalize_one_row(row: pd.Series, row_idx: int) -> Dict[str, Any]:
     normalized = {
         "evidence_id": evidence_id,
         "report_id": None if _is_missing(row.get("report_id")) else str(row.get("report_id")).strip(),
+        "report_date": None if _is_missing(row.get("report_date")) else str(row.get("report_date")).strip(),
+        "issue_date": None if _is_missing(row.get("issue_date")) else str(row.get("issue_date")).strip(),
 
         "source_type_raw": source_type_raw,
         "source_type_norm": source_type_norm,
@@ -756,7 +1287,14 @@ def _normalize_one_row(row: pd.Series, row_idx: int) -> Dict[str, Any]:
         "collapse_flag": int(collapse_flag),
         "deformation_flag": int(deformation_flag),
 
+        "water_state": water_state,
+        "collapse_state": collapse_state,
+        "deformation_state": deformation_state,
+
         "hazard_tags": hazard_tags,
+        "attribute_tags": attribute_tags,
+        "method_tags": method_tags,
+        "unknown_hazard_tags": unknown_hazard_tags,
 
         "source_reliability": float(source_reliability),
         "evidence_strength": float(evidence_strength),
@@ -814,6 +1352,8 @@ def normalize_evidence_df(evidence_df: pd.DataFrame) -> pd.DataFrame:
         "source_type",
         "source_level",
         "report_id",
+        "report_date",
+        "issue_date",
         "start_num",
         "end_num",
         "face_num",
@@ -863,6 +1403,196 @@ def normalize_evidence_df(evidence_df: pd.DataFrame) -> pd.DataFrame:
     # object 列中的 list/dict 保持原样，后续统一由 serialize_for_json 处理。
     return out
 
+
+
+
+def filter_available_evidence(
+    normalized_df: pd.DataFrame,
+    current_chainage: float,
+    analysis_date: Optional[str] = None,
+    mode: str = "online",
+    advance_direction: int = 1,
+    chainage_tolerance_m: float = 1.0,
+) -> pd.DataFrame:
+    """
+    过滤当前时刻可用的地质证据，避免未来信息泄漏。
+
+    参数：
+        normalized_df:
+            normalize_evidence_df 输出。
+
+        current_chainage:
+            当前掌子面 / 当前掘进里程。
+
+        analysis_date:
+            可选。分析日期，格式建议 YYYY-MM-DD。
+            如果 normalized_df 中有 issue_date 或 report_date，则过滤晚于 analysis_date 的报告。
+
+        mode:
+            online:
+                在线模式，必须过滤未来证据。
+            retrospective:
+                回顾分析模式，保留全部证据。
+
+        advance_direction:
+            掘进方向。
+            >=0 表示里程增大方向；
+            <0 表示里程减小方向。
+
+        chainage_tolerance_m:
+            里程容差。避免 0.2m 这类记录误差被当成未来泄漏。
+
+    online 规则：
+        1. observed 仍按 center/face/start chainage 判断是否位于当前掌子面前方；
+        2. TSP/HSP 的 prediction / interpreted / background 都视为 forecast_like，
+           必须按 face_chainage 判断报告是否已经可用；
+        3. forecast_like 缺少 face_chainage 时，online 模式保守排除，
+           并统计 excluded_missing_face_chainage_count；
+        4. analysis_date 不为空时，issue_date/report_date 晚于 analysis_date 的证据排除。
+    """
+    if normalized_df is None or normalized_df.empty:
+        return normalized_df
+
+    if str(mode).lower() == "retrospective":
+        out = normalized_df.copy()
+        out.attrs["availability_filter"] = {
+            "mode": "retrospective",
+            "current_chainage": float(current_chainage),
+            "analysis_date": analysis_date,
+            "input_count": int(len(out)),
+            "output_count": int(len(out)),
+            "excluded_count": 0,
+            "excluded_future_observed_count": 0,
+            "excluded_unavailable_prediction_count": 0,
+            "excluded_missing_face_chainage_count": 0,
+            "excluded_future_forecast_like_count": 0,
+            "excluded_future_report_count": 0,
+        }
+        return out
+
+    if str(mode).lower() != "online":
+        raise ValueError(f"Unsupported evidence filter mode: {mode}")
+
+    df = normalized_df.copy()
+    current = float(current_chainage)
+    direction = 1 if float(advance_direction or 1) >= 0 else -1
+    tolerance = max(float(chainage_tolerance_m or 0.0), 0.0)
+
+    keep = pd.Series(True, index=df.index)
+
+    role = df.get("evidence_role", pd.Series("unknown", index=df.index)).astype(str)
+    source_type = df.get("source_type_norm", pd.Series("unknown", index=df.index)).astype(str)
+
+    # --------------------------------------------------------
+    # 1. observed：未来掌子面素描 / 钻孔揭示不得使用。
+    # --------------------------------------------------------
+    observed_chainage = pd.to_numeric(
+        df.get("center_chainage", pd.Series(index=df.index, dtype=float)),
+        errors="coerce",
+    )
+
+    if "face_chainage" in df.columns:
+        observed_chainage = observed_chainage.fillna(
+            pd.to_numeric(df["face_chainage"], errors="coerce")
+        )
+
+    if "start_chainage" in df.columns:
+        observed_chainage = observed_chainage.fillna(
+            pd.to_numeric(df["start_chainage"], errors="coerce")
+        )
+
+    observed_like = role.eq("observed")
+
+    if direction >= 0:
+        future_observed = (
+            observed_like
+            & observed_chainage.notna()
+            & (observed_chainage > current + tolerance)
+        )
+    else:
+        future_observed = (
+            observed_like
+            & observed_chainage.notna()
+            & (observed_chainage < current - tolerance)
+        )
+
+    keep &= ~future_observed
+
+    # --------------------------------------------------------
+    # 2. forecast_like：TSP/HSP 的 prediction / interpreted / background
+    #    都是“报告形成后才可用”的证据，统一按 face_chainage 判断。
+    # --------------------------------------------------------
+    face_chainage = pd.to_numeric(
+        df.get("face_chainage", pd.Series(index=df.index, dtype=float)),
+        errors="coerce",
+    )
+
+    forecast_like = (
+        source_type.isin({"TSP", "HSP"})
+        & role.isin({"prediction", "interpreted", "background"})
+    )
+
+    missing_face_chainage = forecast_like & face_chainage.isna()
+
+    if direction >= 0:
+        future_forecast_like = (
+            forecast_like
+            & face_chainage.notna()
+            & (face_chainage > current + tolerance)
+        )
+    else:
+        future_forecast_like = (
+            forecast_like
+            & face_chainage.notna()
+            & (face_chainage < current - tolerance)
+        )
+
+    unavailable_prediction = missing_face_chainage | future_forecast_like
+
+    keep &= ~unavailable_prediction
+
+    # --------------------------------------------------------
+    # 3. analysis_date：报告日期晚于分析日期的排除。
+    # --------------------------------------------------------
+    future_report = pd.Series(False, index=df.index)
+
+    if analysis_date is not None:
+        analysis_ts = pd.to_datetime(analysis_date, errors="coerce")
+
+        if pd.notna(analysis_ts):
+            date_col = None
+            if "issue_date" in df.columns:
+                date_col = "issue_date"
+            elif "report_date" in df.columns:
+                date_col = "report_date"
+
+            if date_col is not None:
+                dates = pd.to_datetime(df[date_col], errors="coerce")
+                future_report = dates.notna() & (dates > analysis_ts)
+                keep &= ~future_report
+
+    out = df[keep].copy()
+
+    out.attrs["availability_filter"] = {
+        "mode": "online",
+        "current_chainage": current,
+        "analysis_date": analysis_date,
+        "advance_direction": direction,
+        "chainage_tolerance_m": tolerance,
+        "input_count": int(len(df)),
+        "output_count": int(len(out)),
+        "excluded_count": int(len(df) - len(out)),
+        "excluded_future_observed_count": int(future_observed.sum()),
+
+        # 字段名保留 prediction，兼容 ceshi.py 现有打印；
+        # 实际含义已扩展为 TSP/HSP forecast_like unavailable。
+        "excluded_unavailable_prediction_count": int(unavailable_prediction.sum()),
+        "excluded_missing_face_chainage_count": int(missing_face_chainage.sum()),
+        "excluded_future_forecast_like_count": int(future_forecast_like.sum()),
+        "excluded_future_report_count": int(future_report.sum()),
+    }
+
+    return out
 
 # ============================================================
 # 7. 便捷检查函数，可选使用

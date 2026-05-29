@@ -1,18 +1,16 @@
 {
-  "cell_count": 445,
-  "has_response_cell_count": 445,
-  "computed_grci_cell_count": 445,
+  "cell_count": 22,
+  "has_response_cell_count": 22,
+  "computed_grci_cell_count": 22,
   "coupling_level_counts": {
-    "low": 369,
-    "medium": 48,
-    "none": 27,
+    "low": 18,
+    "medium": 3,
     "high": 1
   },
   "coupling_type_counts": {
-    "geo_dominant_no_obvious_response": 407,
-    "low_coupling": 35,
+    "geo_dominant_no_obvious_response": 19,
     "geo_response_coupled": 3
   },
-  "GRCI_max": 0.8330045984135557,
-  "GRCI_mean": 0.3840981847523779
+  "GRCI_max": 0.8230437679469687,
+  "GRCI_mean": 0.4839714579730177
 }
