@@ -1,0 +1,44 @@
+.DS_Store
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Node / frontend build cache
+Frontend/node_modules/
+Frontend/dist/
+
+# Local environment files
+.env
+backend/.env
+Frontend/.env
+!.env.example
+!backend/.env.example
+!Frontend/.env.example
+
+# Generated reports / debug artifacts
+outputs/
+backend/outputs/
+backend/data/logs/
+backend/data/result/
+backend/data/result_daily_twin/
+backend/data/analysis_history/
+all_python_code.txt
+backend/all_python_code.txt
+apply_geology_v2_main_integration_patch.py
+geology_*.json
+report_*.json
+backend/geology_*.json
+backend/report_*.json
+backend/report_body.json
+*_raw.txt
+backend/*_raw.txt
+backend/geology_pretty.json
+backend/tempCodeRunnerFile.py
+代码.py
+
+# Local backup / scratch files
+*.bak_*
