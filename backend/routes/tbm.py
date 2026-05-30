@@ -203,102 +203,58 @@ def _build_state_payload(result: dict) -> dict:
 
 
 def _build_geology_payload(result: dict) -> dict:
-    """Build geology payload."""
+    """Build geology endpoint payload.
+
+    注意：
+    - 保留旧 geology 字段；
+    - 额外返回 geology_v2 字段；
+    - 即使 result 中 geology_v2 为空，也要返回对应 key，方便前端/测试判断。
+    """
     segment_df = result.get("segment_df", pd.DataFrame())
     typical_df = result.get("typical_segments_df", pd.DataFrame())
 
-    preferred_cols = [
-        "segment",
-        "segment_start_first",
-        "segment_end_first",
-        "GRS",
-        "geo_risk_score",
-        "GRS_base",
-        "GRS_corrected",
-        "GRS_smooth",
-        "GRS_final",
-        "correction",
-        "correction_factor",
-        "GRS_mean",
-        "GRS_max",
-        "RAI",
-        "response_anomaly_index",
-        "stop_anomaly",
-        "efficiency_anomaly",
-        "param_anomaly",
-        "anomaly_type",
-        "anomaly_type_score",
-        "GRCI",
-        "coupling_index",
-        "coupling_class",
-        "coupling_type",
-        "delta_RAI",
-        "delta_GRS",
-        "grci_class_code",
-        "grci_class_label",
-        "sync_coupling",
-        "lag_coupling",
-        "lag_response",
-        "response_change_coupling",
-        "response_consistency",
-        "weak_anomaly_label",
-        "weak_anomaly_reasons",
-        "risk_mode",
-        "risk_score_max",
-        "active_source_count_max",
-        "hazard_mode",
-        "fused_grade_mode",
-        "推进速度_mean",
-        "推进速度_std",
-        "推力_mean",
-        "刀盘扭矩_mean",
-        "efficiency",
-        "geo_risk_norm",
-        "source_evidence_norm",
-        "load_response_norm",
-        "speed_decay_norm",
-        "risk_response_coupling_index",
-        "coupling_label",
-        "coupling_interpretation",
-        "interpretation",
-    ]
+    def _df_to_records(df):
+        try:
+            if df is not None and hasattr(df, "empty") and not df.empty:
+                return df.to_dict(orient="records")
+        except Exception:
+            pass
+        return []
 
-    if not segment_df.empty:
-        keep_cols = [col for col in preferred_cols if col in segment_df.columns]
-        if keep_cols:
-            segment_df = segment_df[keep_cols].copy()
-        if "segment_start_first" in segment_df.columns:
-            segment_df = segment_df.sort_values("segment_start_first").reset_index(drop=True)
+    payload = {
+        # 旧版地质摘要
+        "record_summary": serialize_for_json(result.get("geo_summary_record", {})),
+        "segment_summary": serialize_for_json(result.get("geo_summary_segment", {})),
+        "segment_table": serialize_for_json(_df_to_records(segment_df)),
+        "typical_segments": serialize_for_json(_df_to_records(typical_df)),
 
-    if not typical_df.empty:
-        keep_cols = [col for col in preferred_cols if col in typical_df.columns]
-        if keep_cols:
-            typical_df = typical_df[keep_cols].copy()
-        if "segment_start_first" in typical_df.columns:
-            typical_df = typical_df.sort_values("segment_start_first").reset_index(drop=True)
-
-    return {
-        "record_summary": serialize_for_json(result["geo_summary_record"]),
-        "segment_summary": serialize_for_json(result["geo_summary_segment"]),
-        "segment_table": serialize_for_json(
-            segment_df.to_dict(orient="records") if not segment_df.empty else []
-        ),
-        "typical_segments": serialize_for_json(
-            typical_df.to_dict(orient="records") if not typical_df.empty else []
-        ),
+        # 旧版 GRS / RAI / GRCI 耦合分析
         "coupling_summary": serialize_for_json(result.get("coupling_summary", {})),
         "coupling_validation": serialize_for_json(result.get("coupling_validation", {})),
+        "weak_label_validation": serialize_for_json(result.get("weak_label_validation", {})),
         "coupling_output_paths": serialize_for_json(result.get("coupling_output_paths", {})),
         "high_attention_segments": serialize_for_json(result.get("high_attention_segments", [])),
+        "top_grci_segments": serialize_for_json(result.get("top_grci_segments", [])),
+        "top_grs_segments": serialize_for_json(result.get("top_grs_segments", [])),
+        "top_rai_segments": serialize_for_json(result.get("top_rai_segments", [])),
+
+        # 旧版前方风险 / 掌子面 / 数字孪生状态
+        "forward_risk_summary": serialize_for_json(result.get("forward_risk_summary", {})),
+        "face_description": serialize_for_json(result.get("face_description", {})),
         "digital_twin_state": serialize_for_json(result.get("digital_twin_state", {})),
         "cst_state": serialize_for_json(result.get("cst_state", {})),
+
+        # geology_v2：严格证据过滤 + cell 融合 + forward_profile + report_context
         "geology_v2_context": serialize_for_json(result.get("geology_v2_context", {})),
-        "geology_v2_data_summary": serialize_for_json(result.get("geology_v2_data_summary", {})),
         "geology_v2_prompt_block": result.get("geology_v2_prompt_block", ""),
         "geology_v2_rendered_text": result.get("geology_v2_rendered_text", ""),
+        "geology_v2_data_summary": serialize_for_json(result.get("geology_v2_data_summary", {})),
+        "geology_v2_texts": serialize_for_json(result.get("geology_v2_texts", {})),
         "geology_v2_forward_profile": serialize_for_json(result.get("geology_v2_forward_profile", {})),
         "geology_v2_warnings": serialize_for_json(result.get("geology_v2_warnings", [])),
     }
+
+    return payload
 
 
 def _build_history_payload(current_date: str, result: dict, limit: int) -> dict:

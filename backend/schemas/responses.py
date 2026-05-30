@@ -91,6 +91,9 @@ class EvidenceImportPayload(BaseModel):
 
 
 class GeologyPayload(BaseModel):
+    # 允许后续继续扩展 geology 字段，避免新增字段被 FastAPI response_model 过滤
+    model_config = ConfigDict(extra="allow")
+
     record_summary: dict[str, Any] = Field(default_factory=dict)
     segment_summary: dict[str, Any] = Field(default_factory=dict)
     segment_table: list[dict[str, Any]] = Field(default_factory=list)
@@ -111,6 +114,14 @@ class GeologyPayload(BaseModel):
     digital_twin_state: dict[str, Any] = Field(default_factory=dict)
     cst_state: dict[str, Any] = Field(default_factory=dict)
 
+    # geology_v2：严格证据过滤 + cell 融合 + forward_profile + report_context
+    geology_v2_context: dict[str, Any] = Field(default_factory=dict)
+    geology_v2_prompt_block: str = ""
+    geology_v2_rendered_text: str = ""
+    geology_v2_data_summary: dict[str, Any] = Field(default_factory=dict)
+    geology_v2_texts: dict[str, Any] = Field(default_factory=dict)
+    geology_v2_forward_profile: dict[str, Any] = Field(default_factory=dict)
+    geology_v2_warnings: list[str] = Field(default_factory=list)
 
 class DigitalTwinPayload(BaseModel):
     date: str | None = None
