@@ -1,0 +1,15 @@
+{
+  "schema_version": "tbm_report_config_v1",
+  "cell_length_m": 10.0,
+  "lookahead_m": 30.0,
+  "review_back_m": 20.0,
+  "review_forward_m": 40.0,
+  "advance_direction": 1,
+  "evidence_filter_mode": "online",
+  "availability_tolerance_m": 1.0,
+  "max_key_cells": 5,
+  "max_source_trace_per_cell": 8,
+  "max_forward_segments": 3,
+  "max_report_trace_items": 30,
+  "default_date": null
+}

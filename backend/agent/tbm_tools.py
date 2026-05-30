@@ -189,13 +189,19 @@ class TBMTools:
             return analysis
 
         result = analysis["metadata"]["raw_result"]
+        forward_summary = result.get("forward_risk_summary", {}) or {}
         return ok(
             {
                 "date": analysis["data"]["date"],
-                "forward_risk": serialize_for_json(result.get("forward_risk_summary", {})),
+                "forward_risk": serialize_for_json(forward_summary),
+                "forward_attention": serialize_for_json(forward_summary),
+                "forward_attention_level": forward_summary.get("forward_advice_level", forward_summary.get("advice_level")),
+                "high_attention_count": forward_summary.get("forward_high_source_risk_evidence_count", forward_summary.get("high_risk_count", 0)),
+                "high_source_risk_evidence_count": forward_summary.get("forward_high_source_risk_evidence_count", forward_summary.get("high_risk_count", 0)),
                 "forward_risk_text": result.get("forward_risk_text", ""),
+                "semantics_note": "这里的关注等级表示证据融合关注程度，不等同于灾害发生概率。",
             },
-            "Analyzed forward risk.",
+            "Analyzed forward attention hints.",
             tool="analyze_forward_risk",
         )
 
@@ -207,11 +213,12 @@ class TBMTools:
 
         result = analysis["metadata"]["raw_result"]
         cst_state = result.get("cst_state", {}) or {}
+        twin_state = result.get("twin_state", {}) or cst_state
         return ok(
             {
                 "date": analysis["data"]["date"],
                 "digital_twin_state": serialize_for_json(result.get("digital_twin_state", {})),
-                "twin_state": serialize_for_json(cst_state),
+                "twin_state": serialize_for_json(twin_state),
                 "events": serialize_for_json(cst_state.get("events", []) if isinstance(cst_state, dict) else []),
                 "diff_from_previous": serialize_for_json(cst_state.get("diff_from_previous", {}) if isinstance(cst_state, dict) else {}),
                 "summary": {
@@ -220,6 +227,11 @@ class TBMTools:
                     "face_chainage": (cst_state.get("spatial_reference", {}) or {}).get("face_chainage") if isinstance(cst_state, dict) else None,
                     "forward_level": (cst_state.get("forward_state", {}) or {}).get("forward_advice_level") if isinstance(cst_state, dict) else None,
                 },
+                "twin_state_summary": {
+                    "ok": bool((twin_state or {}).get("ok")) if isinstance(twin_state, dict) else False,
+                    "warning_count": len((twin_state or {}).get("warnings", []) or []) if isinstance(twin_state, dict) else 0,
+                },
+                "report_quality_summary": serialize_for_json(result.get("report_quality", {})),
             },
             "Built digital twin state.",
             tool="get_digital_twin_state",
@@ -338,6 +350,7 @@ class TBMTools:
                     "has_geology": geo.get("has_geology", False),
                     "high_geo_attention_segment_count": geo.get("high_geo_attention_segment_count", geo.get("high_risk_segment_count", 0)),
                     "multi_report_source_segment_count": geo.get("multi_report_source_segment_count", geo.get("multi_source_segment_count", 0)),
+                    "high_attention_count": geo.get("high_geo_attention_segment_count", geo.get("high_risk_segment_count", 0)),
                 },
                 "forward_risk": {
                     "has_forward_risk": forward.get("has_forward_risk", False),
@@ -345,13 +358,25 @@ class TBMTools:
                     "forward_high_source_risk_evidence_count": forward.get("forward_high_source_risk_evidence_count", forward.get("high_risk_count", 0)),
                     "forward_main_hazard_tags": forward.get("forward_main_hazard_tags", forward.get("main_hazards", [])),
                 },
+                "forward_attention": {
+                    "has_forward_attention": forward.get("has_forward_risk", False),
+                    "forward_attention_level": forward.get("forward_advice_level", forward.get("advice_level")),
+                    "high_attention_count": forward.get("forward_high_source_risk_evidence_count", forward.get("high_risk_count", 0)),
+                    "forward_main_hazard_tags": forward.get("forward_main_hazard_tags", forward.get("main_hazards", [])),
+                    "semantics_note": "关注等级表示证据融合关注程度，不等同于灾害发生概率。",
+                },
                 "coupling": {
                     "has_coupling": coupling.get("has_coupling", False),
                     "summary_text": coupling.get("summary_text"),
                     "level_counts": coupling.get("level_counts", {}),
                 },
                 "digital_twin_state": twin,
-                "twin_state": result.get("cst_state", {}),
+                "twin_state": result.get("twin_state", result.get("cst_state", {})),
                 "twin_event_count": len((result.get("cst_state", {}) or {}).get("events", []) or []),
+                "twin_state_summary": {
+                    "ok": bool((result.get("twin_state", {}) or {}).get("ok")) if isinstance(result.get("twin_state", {}), dict) else False,
+                    "warning_count": len(((result.get("twin_state", {}) or {}).get("warnings", []) or [])) if isinstance(result.get("twin_state", {}), dict) else 0,
+                },
+                "report_quality_summary": result.get("report_quality", {}),
             }
         )

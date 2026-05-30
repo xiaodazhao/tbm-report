@@ -1,20 +1,25 @@
+from typing import Any
+
 import pandas as pd
 
 from analysis.dataprocess import (
-    annotate_routine_ring_building_stops, annotate_operation_mode, load_and_process, segments_to_text, compute_stats, stats_to_text
+    annotate_routine_ring_building_stops, annotate_operation_mode, load_and_process, segments_to_text, compute_stats, stats_to_text,
+    build_operation_context,
 )
 from analysis.excavation_state import (
     detect_excavation_state, excavation_state_segments, explain_excavation_states,
     excavation_state_to_text, excavation_state_efficiency, excavation_state_stats,
-    excavation_state_stats_to_text
+    excavation_state_stats_to_text, build_cluster_context
 )
-from analysis.gas_analysis import compute_gas_stats, gas_stats_to_text
+from analysis.gas_analysis import compute_gas_stats, gas_stats_to_text, build_gas_context
+from analysis.plc_cell_response import build_cell_response_df, summarize_cell_response
+from analysis.plc_quality_checker import check_plc_quality
 from analysis.forward_risk_advisor import (
     generate_forward_risk_summary,
     forward_risk_to_text,
 )
 from analysis.geology_response_coupling import run_coupling_analysis
-from config import EVIDENCE_DB_PATH, RESULT_DIR
+from config import BACKEND_DIR, EVIDENCE_DB_PATH, RESULT_DIR
 from geology.geology_fusion_backend import attach_geology_labels, load_evidence_db
 from geology.geology_summary import (
     summarize_geology_record_level,
@@ -30,12 +35,22 @@ from llm.summary_contract import (
     LLM_SUMMARY_SCHEMA_VERSION,
     build_response_anomaly_summary,
 )
+from llm.prompt_evidence_pack import build_prompt_evidence_pack
 from services.digital_twin_state import build_digital_twin_state
 from services.cst_update_service import build_or_update_cst
+from services.run_metadata_service import build_run_metadata
+from services.twin_state_builder import build_twin_state
 from utils.chainage_utils import format_chainage_dk
 from utils.serialization import serialize_for_json
 
 from geology_v2.pipeline import run_geology_v2_context, geology_v2_prompt_block
+
+
+RUN_METADATA_CONFIG_PATHS = [
+    str(BACKEND_DIR / "configs" / "tbm_report_config.json"),
+    str(BACKEND_DIR / "configs" / "prompt_policy.json"),
+    str(BACKEND_DIR / "configs" / "quality_checker_policy.json"),
+]
 
 def semantic_efficiency_to_text(eff_df: pd.DataFrame) -> str:
     """
@@ -508,9 +523,12 @@ def _run_geology_analysis(df: pd.DataFrame, context: dict | None = None) -> dict
 
 def _run_operation_analysis(df_geo: pd.DataFrame) -> dict:
     """Run operation analysis."""
-    segments = load_and_process(df_geo)
+    df_operation = annotate_operation_mode(df_geo)
+    df_operation = annotate_routine_ring_building_stops(df_operation)
+    segments = load_and_process(df_operation)
     stats = compute_stats(segments)
     return {
+        "df_operation": df_operation,
         "segments": segments,
         "seg_text": segments_to_text(segments),
         "stats": stats,
@@ -835,6 +853,69 @@ def _build_llm_summary(
     return summary
 
 
+def _build_prompt_evidence_pack_summary(pack: dict[str, Any] | None) -> dict[str, Any]:
+    """Build a small debug-safe summary for PromptEvidencePack."""
+    pack = pack if isinstance(pack, dict) else {}
+    operation = pack.get("operation_evidence", {}) if isinstance(pack.get("operation_evidence"), dict) else {}
+    geology = pack.get("geology_evidence", {}) if isinstance(pack.get("geology_evidence"), dict) else {}
+    forward = pack.get("forward_evidence", {}) if isinstance(pack.get("forward_evidence"), dict) else {}
+    return {
+        "schema_version": pack.get("schema_version"),
+        "ok": bool(pack.get("ok", False)),
+        "has_operation_evidence": bool(
+            operation.get("dominant_mode")
+            or operation.get("dominant_mode_cn")
+            or operation.get("key_segments")
+        ),
+        "has_geology_evidence": bool(
+            geology.get("current_window_summary")
+            or geology.get("key_cells")
+        ),
+        "has_forward_evidence": bool(forward.get("segments")),
+        "source_trace_count": len(pack.get("source_trace", []) or []),
+        "warning_count": len(pack.get("warnings", []) or []),
+    }
+
+
+def _build_pending_report_quality_summary() -> dict[str, Any]:
+    """Build a placeholder report quality object before report text exists."""
+    return {
+        "schema_version": "report_quality_v2",
+        "ok": False,
+        "score": 0,
+        "violations": [],
+        "warnings": ["report_text 尚未生成，analyze_tbm_data 仅返回待检查占位对象。"],
+        "stats": {
+            "claim_count": 0,
+            "grounded_claim_count": 0,
+            "unsupported_claim_count": 0,
+            "grounding_rate": 0.0,
+            "section_count": 0,
+            "missing_section_count": 0,
+        },
+        "grounding_summary": {
+            "claim_count": 0,
+            "grounded_claim_count": 0,
+            "grounding_rate": 0.0,
+            "unsupported_claim_count": 0,
+        },
+        "claim_results": None,
+    }
+
+
+def _build_pending_report_trace_summary() -> dict[str, Any]:
+    """Build a placeholder report trace summary before report text exists."""
+    return {
+        "schema_version": "report_trace_summary_v1",
+        "trace_available": False,
+        "claim_trace_count": 0,
+        "grounded_claim_count": 0,
+        "unsupported_claim_count": 0,
+        "trace_coverage": 0.0,
+        "warnings": ["report_text 尚未生成，analyze_tbm_data 仅返回待溯源占位摘要。"],
+    }
+
+
 # ============================================================
 # analyze_tbm_data 是后端核心分析总入口
 #
@@ -859,19 +940,88 @@ def _build_llm_summary(
 def analyze_tbm_data(df: pd.DataFrame, context: dict | None = None):
     """Analyze tbm data."""
     context = context or {}
+    run_metadata = build_run_metadata(
+        context=context,
+        source_path=context.get("source_path"),
+        evidence_db_path=str(EVIDENCE_DB_PATH),
+        config_paths=RUN_METADATA_CONFIG_PATHS,
+        llm_model=context.get("llm_model"),
+    )
+    plc_quality_report = check_plc_quality(df, date=context.get("date"))
     # 1. 地质融合：把 evidence_db 和 PLC 里程对齐
     geology_result = _run_geology_analysis(df, context=context)
     # 2. 基础工况：判断停机、过渡、稳定掘进、异常扭矩
     operation_result = _run_operation_analysis(geology_result["df_geo"])
     # 3. 聚类状态：用推力、扭矩、转速、推进速度做 KMeans
-    state_result = _run_state_analysis(geology_result["df_geo"])
+    state_result = _run_state_analysis(operation_result["df_operation"])
     # 4. 气体分析：统计 CO2/H2S/SO2/NO2/NO/CH4
-    gas_result = _run_gas_analysis(geology_result["df_geo"], state_result["df_state"])
+    gas_result = _run_gas_analysis(operation_result["df_operation"], state_result["df_state"])
+
+    operation_context = {
+        "ok": False,
+        "warnings": ["operation_context 未生成。"],
+    }
+    cluster_context = {
+        "ok": False,
+        "warnings": ["cluster_context 未生成。"],
+    }
+    gas_context = {
+        "ok": False,
+        "warnings": ["gas_context 未生成。"],
+    }
+    cell_response_summary = {
+        "ok": False,
+        "warnings": ["cell_response_summary 未生成。"],
+    }
+    cell_response_df = pd.DataFrame()
+
+    try:
+        operation_context = build_operation_context(
+            operation_result.get("df_operation", geology_result["df_geo"]),
+            segments=operation_result.get("segments"),
+            stats=operation_result.get("stats"),
+            quality_report=plc_quality_report,
+        )
+    except Exception as exc:
+        operation_context = {"ok": False, "warnings": [f"operation_context 构建失败：{exc}"]}
+
+    try:
+        cluster_context = build_cluster_context(
+            state_result.get("df_state"),
+            segments=state_result.get("state_segments"),
+            state_labels=state_result.get("state_labels"),
+            eff_df=state_result.get("eff_df"),
+            state_stats=state_result.get("state_stats"),
+        )
+    except Exception as exc:
+        cluster_context = {"ok": False, "warnings": [f"cluster_context 构建失败：{exc}"]}
+
+    try:
+        gas_context = build_gas_context(
+            gas_result.get("gas_stats", {}),
+            quality_report=plc_quality_report,
+        )
+    except Exception as exc:
+        gas_context = {"ok": False, "warnings": [f"gas_context 构建失败：{exc}"]}
+
+    try:
+        cell_response_df = build_cell_response_df(
+            operation_result.get("df_operation", geology_result["df_geo"]),
+            cell_length=10.0,
+        )
+        cell_response_summary = summarize_cell_response(cell_response_df)
+    except Exception as exc:
+        cell_response_summary = {"ok": False, "warnings": [f"cell_response_summary 构建失败：{exc}"]}
 
     warnings = [
+        *plc_quality_report.get("warnings", []),
         *geology_result.get("warnings", []),
         *state_result.get("warnings", []),
         *gas_result.get("warnings", []),
+        *(operation_context.get("warnings", []) if isinstance(operation_context, dict) else []),
+        *(cluster_context.get("warnings", []) if isinstance(cluster_context, dict) else []),
+        *(gas_context.get("warnings", []) if isinstance(gas_context, dict) else []),
+        *(cell_response_summary.get("warnings", []) if isinstance(cell_response_summary, dict) else []),
     ]
 
     risk_prob_text = risk_probability_to_text(geology_result["df_geo"])
@@ -937,6 +1087,55 @@ def analyze_tbm_data(df: pd.DataFrame, context: dict | None = None):
         cst_state=cst_state,
     )
     llm_summary = _apply_geology_v2_to_llm_summary(llm_summary, geology_result)
+    llm_summary["plc_quality_report"] = serialize_for_json(plc_quality_report)
+    llm_summary["operation_context"] = serialize_for_json(operation_context)
+    llm_summary["cluster_context"] = serialize_for_json(cluster_context)
+    llm_summary["gas_context"] = serialize_for_json(gas_context)
+    llm_summary["cell_response_summary"] = serialize_for_json(cell_response_summary)
+    llm_summary["run_metadata"] = serialize_for_json(run_metadata)
+
+    twin_state = {
+        "schema_version": "twin_state_v1",
+        "ok": False,
+        "warnings": ["twin_state 未生成。"],
+    }
+    history_context = context.get("history_context") if isinstance(context.get("history_context"), dict) else {}
+    try:
+        twin_state = build_twin_state(
+            date=context.get("date") or run_metadata.get("analysis_date"),
+            context=context,
+            operation_context=operation_context,
+            cluster_context=cluster_context,
+            gas_context=gas_context,
+            geology_context=geology_result.get("geology_v2_context", {}),
+            coupling_summary=geology_result["coupling_summary"],
+            forward_context=geology_result.get("geology_v2_forward_profile") or geology_result["forward_risk_summary"],
+            plc_quality_report=plc_quality_report,
+            cell_response_summary=cell_response_summary,
+            run_metadata=run_metadata,
+            history_context=history_context,
+        )
+    except Exception as exc:
+        twin_state = {
+            "schema_version": "twin_state_v1",
+            "ok": False,
+            "warnings": [f"twin_state 构建失败：{exc}"],
+        }
+
+    llm_summary["twin_state"] = serialize_for_json(twin_state)
+
+    try:
+        prompt_evidence_pack = build_prompt_evidence_pack(
+            twin_state=twin_state,
+            llm_summary=llm_summary,
+        )
+    except Exception as exc:
+        prompt_evidence_pack = {
+            "schema_version": "prompt_evidence_pack_v1",
+            "ok": False,
+            "warnings": [f"prompt_evidence_pack 构建失败：{exc}"],
+        }
+    llm_summary["prompt_evidence_pack"] = serialize_for_json(prompt_evidence_pack)
 
     # Keep structural Twin/CST state independent from LLM summary/prompt text.
     # Only a lightweight reference is kept to avoid recursive references and semantic drift.
@@ -952,6 +1151,8 @@ def analyze_tbm_data(df: pd.DataFrame, context: dict | None = None):
     "stats": operation_result["stats"],  # 基础工况统计结果，例如工作时长、停机时长、异常段数量等
     "stats_text": operation_result["stats_text"],  # 基础工况统计的文本描述，主要给 LLM 报告使用
     "operation_mode_summary": _build_operation_mode_summary(operation_result["stats"]),  # 基础工况结构化摘要，用于统一描述 operation_mode 层面的状态
+    "plc_quality_report": serialize_for_json(plc_quality_report),  # 单日 PLC 数据质量报告，包括时间/里程/缺失率/气体字段诊断
+    "operation_context": serialize_for_json(operation_context),  # PLC 基础工况结构化上下文，保留关键工况段和位置摘要
     "df_geo": geology_result["df_geo"],  # 融合地质信息后的 TBM 数据表，在原始 PLC 数据基础上增加地质风险、围岩、灾害标签等字段
     "df_state": state_result["df_state"],  # 融合施工状态后的数据表，在 df_geo 基础上增加 state_id 等聚类状态字段
     "state_labels": state_result["state_labels"],  # 聚类施工状态的语义标签，例如高负载低速、稳定推进、低负载快速推进等
@@ -968,8 +1169,10 @@ def analyze_tbm_data(df: pd.DataFrame, context: dict | None = None):
         n_valid=state_result["n_valid"],
         state_cfg=state_result["state_cfg"],
     ),
+    "cluster_context": serialize_for_json(cluster_context),  # 聚类施工状态结构化上下文，补充状态占比、稳定性和效率特征
     "gas_stats": gas_result["gas_stats"],  # 气体监测结构化统计结果，包括全天、掘进期、停机期及状态级气体统计
     "gas_text": gas_result["gas_text"],  # 气体监测分析文本，主要给 LLM 报告使用
+    "gas_context": serialize_for_json(gas_context),  # 气体结构化上下文，区分 concentration / alarm_flag / unknown
     "geo_summary_record": geology_result["geo_summary_record"],  # 记录级地质摘要，通常对应每条 PLC 记录附近的地质融合信息
     "geo_summary_segment": geology_result["geo_summary_segment"],  # 区段级地质摘要，按里程区段汇总后的地质风险、围岩、灾害关注信息
     "geo_summary": geology_result["geo_summary_segment"],  # 地质摘要的兼容字段，实际等同于 geo_summary_segment
@@ -996,9 +1199,17 @@ def analyze_tbm_data(df: pd.DataFrame, context: dict | None = None):
         coupling_summary=geology_result["coupling_summary"],
         high_attention_segments=geology_result["high_attention_segments"],
     ),
+    "cell_response_summary": serialize_for_json(cell_response_summary),  # 按 10m cell 聚合的 PLC 响应摘要，不默认暴露完整 DataFrame
     "digital_twin_state": digital_twin_state,  # 数字孪生状态快照，描述当前 TBM 施工、地质、风险、气体等综合状态
     "cst_state": cst_state,  # Construction State Twin 结构化状态对象，比 digital_twin_state 更适合做状态更新和历史对比
+    "twin_state": serialize_for_json(twin_state),  # 阶段 3 正式 TwinState，对 operation/cluster/gas/geology/coupling/forward/quality 做统一收口
+    "run_metadata": run_metadata,  # 本次分析的轻量可复现元信息，包括源文件/hash/配置版本等
     "llm_summary": llm_summary,  # 给 LLM 报告生成使用的统一结构化摘要
+    "prompt_evidence_pack_summary": serialize_for_json(
+        _build_prompt_evidence_pack_summary(prompt_evidence_pack)
+    ),  # PromptEvidencePack 的轻量摘要，默认不暴露完整 pack
+    "report_quality": serialize_for_json(_build_pending_report_quality_summary()),  # 阶段 4 报告可信检查占位对象，真实内容在 report 生成后补齐
+    "report_trace_summary": serialize_for_json(_build_pending_report_trace_summary()),  # 阶段 4 报告主张溯源摘要占位对象，真实内容在 report 生成后补齐
     "face_geo_text": geology_result["face_geo_text"],  # 当前掌子面地质描述文本，主要给 LLM 报告使用
     "risk_prob_text": risk_prob_text,  # 补充风险剖面文本，注意这里不是严格概率，应理解为风险/关注度描述
     "geology_v2_context": geology_result.get("geology_v2_context", {}),  # geology_v2 统一报告上下文

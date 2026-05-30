@@ -365,7 +365,7 @@ class TBMSupervisorAgent:
             geology_tools.append("analyze_forward_risk")
         if self._has_any(q, ["profile", "risk profile", "speed profile", "风险剖面", "速度剖面", "沿程"]):
             geology_tools.append("risk_profile")
-        if needs_explanation and (context.last_focus_segment or "耦合" in q or "高风险" in q or "异常" in q):
+        if needs_explanation and (context.last_focus_segment or "耦合" in q or "高风险" in q or "高关注" in q or "异常" in q):
             geology_tools.append("analyze_geology")
         if needs_recommendation and (context.last_forward_level or "前方" in q or "建议" in q):
             geology_tools.append("analyze_forward_risk")
@@ -491,8 +491,8 @@ class TBMSupervisorAgent:
         fwd = data.get("forward_risk", {})
         return [
             f"{agent}: 工作 {op.get('work_total_min', 0):.1f} min，停机 {op.get('stop_total_min', 0):.1f} min，异常次数 {op.get('abnormal_count', 0)}。",
-            f"{agent}: 地质高风险区段 {geo.get('high_risk_segment_count', 0)} 个，多源证据区段 {geo.get('multi_source_segment_count', 0)} 个。",
-            f"{agent}: 前方风险等级={fwd.get('advice_level')}，高风险证据数量={fwd.get('high_risk_count', 0)}。",
+            f"{agent}: 地质高关注区段 {geo.get('high_geo_attention_segment_count', geo.get('high_risk_segment_count', 0))} 个，多源证据区段 {geo.get('multi_report_source_segment_count', geo.get('multi_source_segment_count', 0))} 个。",
+            f"{agent}: 前方关注等级={fwd.get('forward_advice_level', fwd.get('advice_level'))}，来源内高关注证据数量={fwd.get('forward_high_source_risk_evidence_count', fwd.get('high_risk_count', 0))}。前方提示不是当前掌子面已经发生的事实。",
         ]
 
     @staticmethod
@@ -518,16 +518,17 @@ class TBMSupervisorAgent:
         summary = data.get("segment_summary", {})
         coupling = data.get("coupling_summary", {})
         return [
-            f"{agent}: 地质匹配={summary.get('has_geology', False)}，高风险区段={summary.get('high_risk_segment_count', 0)}，多源证据区段={summary.get('multi_source_segment_count', 0)}。",
-            f"{agent}: 耦合分析={coupling.get('has_coupling', False)}，{coupling.get('summary_text', '')}",
+            f"{agent}: 地质匹配={summary.get('has_geology', False)}，高关注区段={summary.get('high_geo_attention_segment_count', summary.get('high_risk_segment_count', 0))}，多源证据区段={summary.get('multi_report_source_segment_count', summary.get('multi_source_segment_count', 0))}。",
+            f"{agent}: 耦合分析={coupling.get('has_coupling', False)}，{coupling.get('summary_text', '')} GRCI 为地质-施工响应耦合关注度，是复盘解释指标，不是预测概率。",
         ]
 
     @staticmethod
     def _answer_forward(agent: str, data: dict[str, Any]) -> list[str]:
         """Internal helper for answer forward."""
-        fwd = data.get("forward_risk", {})
+        fwd = data.get("forward_attention", data.get("forward_risk", {}))
         return [
-            f"{agent}: 前方风险等级={fwd.get('advice_level')}，前探距离={fwd.get('lookahead_m')} m，高风险数量={fwd.get('high_risk_count', 0)}。",
+            f"{agent}: 前方关注等级={fwd.get('forward_attention_level', fwd.get('forward_advice_level', fwd.get('advice_level')))}，前探距离={fwd.get('lookahead_m')} m，来源内高关注证据数量={fwd.get('high_attention_count', fwd.get('forward_high_source_risk_evidence_count', fwd.get('high_risk_count', 0)))}。",
+            "这里的关注等级表示证据融合关注程度，不等同于灾害发生概率。",
             data.get("forward_risk_text", ""),
         ]
 
@@ -538,7 +539,7 @@ class TBMSupervisorAgent:
         high_segments = profile.get("high_segments", []) if isinstance(profile, dict) else []
         speed_profile = data.get("speed_profile", [])
         return [
-            f"{agent}: 风险高关注区段={len(high_segments)} 个，速度剖面点数={len(speed_profile)}。"
+            f"{agent}: 高关注区段={len(high_segments)} 个，速度剖面点数={len(speed_profile)}。"
         ]
 
     @staticmethod
@@ -623,7 +624,7 @@ class TBMSupervisorAgent:
         if follow_up and context.last_focus_segment:
             context_bits.append(f"上一轮重点区段 {context.last_focus_segment}")
         if follow_up and context.last_forward_level:
-            context_bits.append(f"上一轮前方风险等级 {context.last_forward_level}")
+            context_bits.append(f"上一轮前方关注等级 {context.last_forward_level}")
 
         if not context_bits:
             return normalized
@@ -749,6 +750,7 @@ class TBMSupervisorAgent:
                 "operation": data.get("operation", {}),
                 "geology": data.get("geology", {}),
                 "forward_risk": data.get("forward_risk", {}),
+                "forward_attention": data.get("forward_attention", {}),
                 "coupling": data.get("coupling", {}),
             }
         if tool == "analyze_operation":
@@ -780,19 +782,21 @@ class TBMSupervisorAgent:
                 "record_has_geology": (data.get("record_summary") or {}).get("has_geology", False),
                 "segment_count": data.get("segment_count", 0),
                 "high_risk_segment_count": (data.get("segment_summary") or {}).get("high_risk_segment_count", 0),
+                "high_attention_count": (data.get("segment_summary") or {}).get("high_geo_attention_segment_count", (data.get("segment_summary") or {}).get("high_risk_segment_count", 0)),
                 "multi_source_segment_count": (data.get("segment_summary") or {}).get("multi_source_segment_count", 0),
                 "top_coupling_segment": top.get("segment"),
                 "top_coupling_index": top.get("risk_response_coupling_index"),
                 "top_coupling_label": top.get("coupling_label"),
             }
         if tool == "analyze_forward_risk":
-            fwd = data.get("forward_risk", {})
+            fwd = data.get("forward_attention", data.get("forward_risk", {}))
             return {
                 "date": data.get("date"),
-                "has_forward_risk": fwd.get("has_forward_risk", False),
-                "advice_level": fwd.get("advice_level"),
+                "has_forward_risk": fwd.get("has_forward_attention", fwd.get("has_forward_risk", False)),
+                "advice_level": fwd.get("forward_attention_level", fwd.get("forward_advice_level", fwd.get("advice_level"))),
                 "lookahead_m": fwd.get("lookahead_m"),
                 "high_risk_count": fwd.get("high_risk_count", 0),
+                "high_attention_count": fwd.get("high_attention_count", fwd.get("forward_high_source_risk_evidence_count", fwd.get("high_risk_count", 0))),
                 "main_hazards": fwd.get("main_hazards", []),
             }
         if tool == "risk_profile":
@@ -850,16 +854,18 @@ class TBMSupervisorAgent:
             elif tool == "analyze_day":
                 op = data.get("operation", {})
                 geo = data.get("geology", {})
-                fwd = data.get("forward_risk", {})
+                fwd = data.get("forward_attention", data.get("forward_risk", {}))
                 coupling = data.get("coupling", {})
                 highlights["work_total_min"] = op.get("work_total_min", 0)
                 highlights["stop_total_min"] = op.get("stop_total_min", 0)
                 highlights["abnormal_count"] = op.get("abnormal_count", 0)
                 highlights["has_geology"] = geo.get("has_geology", False)
                 highlights["geology_high_risk_segment_count"] = geo.get("high_risk_segment_count", 0)
+                highlights["geology_high_attention_segment_count"] = geo.get("high_geo_attention_segment_count", geo.get("high_risk_segment_count", 0))
                 highlights["geology_multi_source_segment_count"] = geo.get("multi_source_segment_count", 0)
-                highlights["forward_advice_level"] = fwd.get("advice_level")
+                highlights["forward_advice_level"] = fwd.get("forward_attention_level", fwd.get("forward_advice_level", fwd.get("advice_level")))
                 highlights["forward_high_risk_count"] = fwd.get("high_risk_count", 0)
+                highlights["forward_high_attention_count"] = fwd.get("high_attention_count", fwd.get("forward_high_source_risk_evidence_count", fwd.get("high_risk_count", 0)))
                 highlights["forward_main_hazards"] = fwd.get("main_hazards", [])
                 highlights["has_coupling"] = coupling.get("has_coupling", False)
             elif tool == "analyze_gas":
@@ -871,15 +877,17 @@ class TBMSupervisorAgent:
                 top = top_segments[0] if top_segments else {}
                 highlights["has_geology"] = segment_summary.get("has_geology", False)
                 highlights["geology_high_risk_segment_count"] = segment_summary.get("high_risk_segment_count", 0)
+                highlights["geology_high_attention_segment_count"] = segment_summary.get("high_geo_attention_segment_count", segment_summary.get("high_risk_segment_count", 0))
                 highlights["geology_multi_source_segment_count"] = segment_summary.get("multi_source_segment_count", 0)
                 highlights["top_coupling_segment"] = top.get("segment")
                 highlights["top_coupling_label"] = top.get("coupling_label")
                 highlights["top_coupling_index"] = top.get("risk_response_coupling_index")
             elif tool == "analyze_forward_risk":
-                fwd = data.get("forward_risk", {})
-                highlights["forward_advice_level"] = fwd.get("advice_level")
+                fwd = data.get("forward_attention", data.get("forward_risk", {}))
+                highlights["forward_advice_level"] = fwd.get("forward_attention_level", fwd.get("forward_advice_level", fwd.get("advice_level")))
                 highlights["forward_main_hazards"] = fwd.get("main_hazards", [])
                 highlights["forward_high_risk_count"] = fwd.get("high_risk_count", 0)
+                highlights["forward_high_attention_count"] = fwd.get("high_attention_count", fwd.get("forward_high_source_risk_evidence_count", fwd.get("high_risk_count", 0)))
             elif tool == "get_digital_twin_state":
                 twin = data.get("digital_twin_state", {})
                 pos = twin.get("position_state", {})

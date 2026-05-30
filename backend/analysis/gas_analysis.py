@@ -40,6 +40,35 @@ GAS_UNIT_ASSUMPTIONS = {
 
 GAS_ANALYSIS_SCHEMA_VERSION = "gas_analysis_v2"
 
+
+def _safe_float(value):
+    """Return a finite float or None."""
+    try:
+        number = float(value)
+    except Exception:
+        return None
+    return number if np.isfinite(number) else None
+
+
+def _clean_json_value(value):
+    """Recursively clean values for JSON serialization."""
+    if isinstance(value, dict):
+        return {str(key): _clean_json_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clean_json_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_clean_json_value(item) for item in value]
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if pd.isna(value):
+        return None
+    if hasattr(value, "item"):
+        try:
+            return _clean_json_value(value.item())
+        except Exception:
+            pass
+    return value
+
 # =========================
 # 3. 单一 DataFrame 的气体统计
 # =========================
@@ -225,3 +254,83 @@ def gas_stats_to_text(stats: dict):
             render(f"施工状态 {state} 气体统计", s)
 
     return "\n".join(lines)
+
+
+def build_gas_context(
+    gas_stats: dict,
+    quality_report: dict | None = None,
+) -> dict:
+    """Build a structured gas context while keeping legacy gas_text/gas_stats intact."""
+    warnings: list[str] = []
+    quality_report = quality_report if isinstance(quality_report, dict) else {}
+    diagnostics = quality_report.get("gas_field_diagnostics", {}) if isinstance(quality_report, dict) else {}
+    gas_all = gas_stats.get("all", {}) if isinstance(gas_stats, dict) else {}
+
+    gas_summaries = []
+    exceed_gases: list[str] = []
+    exceed_event_count_total = 0
+
+    for gas_name in GAS_COLUMNS:
+        stats_item = gas_all.get(gas_name, {}) if isinstance(gas_all, dict) else {}
+        diag = diagnostics.get(gas_name, {}) if isinstance(diagnostics, dict) else {}
+        field_type_guess = diag.get("value_type_guess", "unknown")
+        unit_assumption = diag.get("unit_assumption") or stats_item.get("unit_assumption")
+        exceed_event_count = int(stats_item.get("exceed_event_count", 0) or 0)
+        threshold = _safe_float(stats_item.get("threshold"))
+        exceed_segments_preview = []
+
+        if field_type_guess == "alarm_flag":
+            interpretation_caution = "该字段疑似报警量，应按报警事件解释，不宜直接作为浓度值。"
+            threshold = None
+            exceed_event_count = 0
+            if diag.get("warning"):
+                warnings.append(f"{gas_name}: {diag.get('warning')}")
+        elif field_type_guess == "unknown":
+            interpretation_caution = "气体字段单位或含义未确认，需谨慎解释。"
+            threshold = None
+            exceed_event_count = 0
+            if diag.get("warning"):
+                warnings.append(f"{gas_name}: {diag.get('warning')}")
+        else:
+            interpretation_caution = "该字段按浓度值解释，但仍需结合原始数据字典确认单位。"
+            if exceed_event_count > 0:
+                exceed_gases.append(gas_name)
+                exceed_event_count_total += exceed_event_count
+                for seg in (stats_item.get("exceed_segments") or [])[:3]:
+                    exceed_segments_preview.append(
+                        {
+                            "start": seg.get("start").strftime("%Y-%m-%d %H:%M:%S") if hasattr(seg.get("start"), "strftime") else str(seg.get("start")) if seg.get("start") else None,
+                            "end": seg.get("end").strftime("%Y-%m-%d %H:%M:%S") if hasattr(seg.get("end"), "strftime") else str(seg.get("end")) if seg.get("end") else None,
+                            "duration_sec": _safe_float(seg.get("duration_sec")),
+                        }
+                    )
+
+        gas_summaries.append(
+            {
+                "gas": gas_name,
+                "canonical_gas": gas_name.replace("检测", ""),
+                "field_type_guess": field_type_guess,
+                "unit_assumption": unit_assumption,
+                "mean": _safe_float(stats_item.get("mean")),
+                "max": _safe_float(stats_item.get("max")),
+                "min": _safe_float(stats_item.get("min")),
+                "threshold": threshold if field_type_guess == "concentration" else None,
+                "exceed_event_count": exceed_event_count if field_type_guess == "concentration" else 0,
+                "exceed_segments_preview": exceed_segments_preview,
+                "interpretation_caution": interpretation_caution,
+            }
+        )
+
+    return _clean_json_value(
+        {
+            "schema_version": "gas_context_v1",
+            "gas_field_diagnostics": diagnostics,
+            "exceed_summary": {
+                "has_exceedance": bool(exceed_gases),
+                "exceed_gases": exceed_gases,
+                "exceed_event_count_total": exceed_event_count_total,
+            },
+            "gas_summaries": gas_summaries,
+            "warnings": warnings,
+        }
+    )

@@ -222,6 +222,8 @@ def normalize_llm_summary(llm_summary: dict[str, Any] | None) -> dict[str, Any]:
         )
     )
     cst_state = _as_dict(_non_empty(summary.get("cst_state"), summary.get("CST"), summary.get("Construction State Twin")))
+    explicit_twin_state = _as_dict(_non_empty(summary.get("twin_state")))
+    prompt_evidence_pack = _as_dict(_non_empty(summary.get("prompt_evidence_pack")))
     history_comparison = _as_dict(
         _non_empty(
             summary.get("history_comparison"),
@@ -262,6 +264,12 @@ def normalize_llm_summary(llm_summary: dict[str, Any] | None) -> dict[str, Any]:
         twin_text = _safe_text(summary.get("digital_twin_text"), default=NO_TEXT)
     prompt_text_inputs.setdefault("digital_twin_text", twin_text)
 
+    plc_quality_report = _as_dict(summary.get("plc_quality_report"))
+    operation_context = _as_dict(summary.get("operation_context"))
+    cluster_context = _as_dict(summary.get("cluster_context"))
+    gas_context = _as_dict(summary.get("gas_context"))
+    cell_response_summary = _as_dict(summary.get("cell_response_summary"))
+
     return {
         "schema_version": summary.get("schema_version") or LLM_SUMMARY_SCHEMA_VERSION,
         "operation_mode_summary": operation_summary or {
@@ -285,8 +293,14 @@ def normalize_llm_summary(llm_summary: dict[str, Any] | None) -> dict[str, Any]:
         "weak_label_validation": _as_dict(_non_empty(summary.get("weak_label_validation"), coupling_summary.get("weak_label_validation"), summary.get("coupling_validation"))),
         "digital_twin_state": digital_twin_state,
         "cst_state": cst_state,
-        "twin_state": cst_state or digital_twin_state,
+        "twin_state": explicit_twin_state or cst_state or digital_twin_state,
+        "prompt_evidence_pack": prompt_evidence_pack,
         "history_comparison": history_comparison,
+        "plc_quality_report": plc_quality_report,
+        "operation_context": operation_context,
+        "cluster_context": cluster_context,
+        "gas_context": gas_context,
+        "cell_response_summary": cell_response_summary,
         "prompt_text_inputs": prompt_text_inputs,
     }
 
@@ -358,6 +372,49 @@ def build_prompt_payload(
                 f"- 响应异常：{_safe_text(response_summary.get('summary_text'))}",
             ]
         )
+
+    operation_context = _as_dict(normalized.get("operation_context"))
+    cluster_context = _as_dict(normalized.get("cluster_context"))
+    gas_context = _as_dict(normalized.get("gas_context"))
+    plc_quality_report = _as_dict(normalized.get("plc_quality_report"))
+    cell_response_summary = _as_dict(normalized.get("cell_response_summary"))
+    twin_state = _as_dict(normalized.get("twin_state"))
+    prompt_evidence_pack = _as_dict(normalized.get("prompt_evidence_pack"))
+    plc_lines = []
+    if twin_state:
+        plc_lines.append("- 已提供 TwinState，结构化状态应优先于自然语言兜底文本。")
+    if prompt_evidence_pack:
+        plc_lines.append("- 已提供 PromptEvidencePack，prompt 生成应优先使用结构化证据包。")
+    if plc_quality_report:
+        plc_lines.append(
+            f"- PLC 数据质量：样本数={plc_quality_report.get('row_count', 0)}，"
+            f"数据质量告警数={len(plc_quality_report.get('warnings', []) or [])}。"
+        )
+    if operation_context:
+        op_summary = _as_dict(operation_context.get("operation_mode_summary"))
+        plc_lines.append(
+            f"- 基础工况：主导工况={op_summary.get('dominant_mode_cn') or op_summary.get('dominant_mode') or '暂无'}，"
+            f"工作={op_summary.get('work_total_min', 0)} min，停机={op_summary.get('stop_total_min', 0)} min。"
+        )
+    if cluster_context:
+        cluster_quality = _as_dict(cluster_context.get("cluster_quality"))
+        plc_lines.append(
+            f"- 聚类状态：状态数={cluster_context.get('n_states', 0)}，"
+            f"有效样本={cluster_quality.get('valid_sample_count', 0)}，"
+            f"稳定性={'是' if cluster_quality.get('is_stable_enough') else '否'}。"
+        )
+    if gas_context:
+        exceed_summary = _as_dict(gas_context.get("exceed_summary"))
+        plc_lines.append(
+            f"- 气体状态：超阈值字段数={len(exceed_summary.get('exceed_gases', []) or [])}，"
+            f"超阈值事件总数={exceed_summary.get('exceed_event_count_total', 0)}。"
+        )
+    if cell_response_summary:
+        plc_lines.append(
+            f"- Cell 响应摘要：高响应 cell 数={cell_response_summary.get('high_response_cell_count', 0)}。"
+        )
+    if plc_lines:
+        summary_block = summary_block + "\n" + "\n".join(plc_lines)
 
     return {
         "normalized_summary": normalized,

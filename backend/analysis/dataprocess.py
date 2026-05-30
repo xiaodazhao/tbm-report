@@ -1,5 +1,11 @@
-# dataprocess.py
 import pandas as pd
+
+from utils.chainage_utils import format_chainage_dk
+
+try:
+    from analysis.plc_contract import resolve_plc_columns
+except Exception:  # pragma: no cover
+    resolve_plc_columns = None
 
 
 COMMON_TIME_COLUMNS = ["运行时间-time", "timestamp", "time", "datetime", "date_time"]
@@ -426,3 +432,229 @@ def stats_to_text(stats):
 短稳定掘进（<60s）：{len(stats['short_works'])} 段
 短异常扭矩（<60s）：{len(stats['short_abnormals'])} 段
 """.strip()
+
+
+def _json_number(value):
+    """Return a finite Python float or None for JSON serialization."""
+    try:
+        number = float(value)
+    except Exception:
+        return None
+    if pd.isna(number):
+        return None
+    return number
+
+
+def _segment_reason(segment: dict, longest_stop: dict | None, longest_work: dict | None) -> str:
+    """Return a stable reason label for one key operation segment."""
+    if not isinstance(segment, dict):
+        return "long_duration"
+    if longest_stop is segment or (
+        longest_stop
+        and segment.get("start") == longest_stop.get("start")
+        and segment.get("end") == longest_stop.get("end")
+        and segment.get("state") == longest_stop.get("state")
+    ):
+        return "longest_stop"
+    if longest_work is segment or (
+        longest_work
+        and segment.get("start") == longest_work.get("start")
+        and segment.get("end") == longest_work.get("end")
+        and segment.get("state") == longest_work.get("state")
+    ):
+        return "longest_work"
+    if segment.get("state") == "abnormal":
+        return "abnormal_event"
+    return "long_duration"
+
+
+def build_operation_context(
+    df: pd.DataFrame,
+    segments: list[dict] | pd.DataFrame | None = None,
+    stats: dict | None = None,
+    quality_report: dict | None = None,
+    max_segments: int = 12,
+) -> dict:
+    """Build a structured operation-context object while preserving legacy text flows."""
+    warnings: list[str] = []
+    frame = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame(df)
+    if frame.empty:
+        return {
+            "schema_version": "operation_context_v1",
+            "data_quality": quality_report or {},
+            "position": {
+                "start_chainage": None,
+                "end_chainage": None,
+                "start_chainage_dk": None,
+                "end_chainage_dk": None,
+                "advance_length_m": None,
+            },
+            "operation_mode_summary": {
+                "dominant_mode": None,
+                "dominant_mode_cn": None,
+                "work_total_min": 0.0,
+                "stop_total_min": 0.0,
+                "transition_total_min": 0.0,
+                "abnormal_total_min": 0.0,
+                "work_count": 0,
+                "stop_count": 0,
+                "transition_count": 0,
+                "abnormal_count": 0,
+                "work_ratio": 0.0,
+                "stop_ratio": 0.0,
+            },
+            "key_operation_segments": [],
+            "short_event_summary": {
+                "short_stop_count": 0,
+                "short_transition_count": 0,
+                "short_work_count": 0,
+                "short_abnormal_count": 0,
+            },
+            "routine_stop_summary": {
+                "candidate_row_count": 0,
+                "candidate_ratio": 0.0,
+                "mean_score": None,
+            },
+            "warnings": ["operation_context 输入数据为空。"],
+        }
+
+    if "operation_mode" not in frame.columns:
+        frame = annotate_operation_mode(frame)
+
+    if "routine_ring_building_candidate" not in frame.columns:
+        frame = annotate_routine_ring_building_stops(frame)
+
+    if segments is None:
+        segments = load_and_process(frame)
+    if stats is None:
+        stats = compute_stats(segments if isinstance(segments, list) else [])
+
+    if isinstance(segments, pd.DataFrame):
+        segment_list = segments.to_dict(orient="records")
+    elif isinstance(segments, list):
+        segment_list = [item for item in segments if isinstance(item, dict)]
+    else:
+        segment_list = []
+
+    if callable(resolve_plc_columns):
+        resolved = resolve_plc_columns(frame)
+        chainage_col = "chainage" if "chainage" in frame.columns else resolved.get("chainage_col")
+    else:
+        chainage_col = "chainage" if "chainage" in frame.columns else _find_first_existing(frame, COMMON_CHAINAGE_COLUMNS)
+
+    chainage_series = pd.to_numeric(frame[chainage_col], errors="coerce").dropna() if chainage_col in frame.columns else pd.Series(dtype=float)
+    if chainage_series.empty:
+        warnings.append("未识别到有效里程列，operation_context.position 将为空。")
+        start_chainage = None
+        end_chainage = None
+        advance_length = None
+    else:
+        start_chainage = _json_number(chainage_series.iloc[0])
+        end_chainage = _json_number(chainage_series.iloc[-1])
+        advance_length = _json_number(chainage_series.iloc[-1] - chainage_series.iloc[0])
+
+    work_total_min = float(stats.get("work_total_min", 0) or 0)
+    stop_total_min = float(stats.get("stop_total_min", 0) or 0)
+    transition_total_min = float(stats.get("transition_total_min", 0) or 0)
+    abnormal_total_min = float(stats.get("abnormal_total_min", 0) or 0)
+    total_min = work_total_min + stop_total_min + transition_total_min + abnormal_total_min
+    duration_map = {
+        "work": work_total_min,
+        "stop": stop_total_min,
+        "transition": transition_total_min,
+        "abnormal": abnormal_total_min,
+    }
+    dominant_mode = max(duration_map.items(), key=lambda item: item[1])[0] if total_min > 0 else None
+    dominant_mode_cn = {
+        "stop": "停机",
+        "work": "稳定掘进",
+        "transition": "启动/过渡",
+        "abnormal": "异常扭矩",
+    }.get(dominant_mode)
+
+    longest_stop = stats.get("longest_stop") if isinstance(stats, dict) else None
+    longest_work = stats.get("longest_work") if isinstance(stats, dict) else None
+    ranked_segments = sorted(
+        segment_list,
+        key=lambda item: float(item.get("duration_sec", 0) or 0),
+        reverse=True,
+    )
+    selected_segments: list[dict] = []
+    seen_keys = set()
+    seed_segments = [longest_stop, longest_work] + [seg for seg in ranked_segments if seg.get("state") == "abnormal"] + ranked_segments
+    for segment in seed_segments:
+        if not isinstance(segment, dict):
+            continue
+        key = (segment.get("start"), segment.get("end"), segment.get("state"))
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        selected_segments.append(
+            {
+                "start": segment.get("start").strftime("%Y-%m-%d %H:%M:%S") if hasattr(segment.get("start"), "strftime") else str(segment.get("start")) if segment.get("start") else None,
+                "end": segment.get("end").strftime("%Y-%m-%d %H:%M:%S") if hasattr(segment.get("end"), "strftime") else str(segment.get("end")) if segment.get("end") else None,
+                "operation_mode": segment.get("operation_mode") or segment.get("state") or "unknown",
+                "operation_mode_cn": segment.get("operation_mode_cn") or _condition_code_to_cn(int(segment.get("state_code", segment.get("operation_mode_code", -1)))) if (segment.get("state_code") is not None or segment.get("operation_mode_code") is not None) else "未知",
+                "duration_min": _json_number((float(segment.get("duration_sec", 0) or 0) / 60.0)),
+                "sample_count": int(segment.get("sample_count", 0) or 0) if segment.get("sample_count") is not None else None,
+                "reason": _segment_reason(segment, longest_stop, longest_work),
+            }
+        )
+        if len(selected_segments) >= max(int(max_segments), 0):
+            break
+
+    short_stop_count = len(stats.get("short_stops", [])) if isinstance(stats, dict) else 0
+    short_transition_count = len(stats.get("short_transitions", [])) if isinstance(stats, dict) else 0
+    short_work_count = len(stats.get("short_works", [])) if isinstance(stats, dict) else 0
+    short_abnormal_count = len(stats.get("short_abnormals", [])) if isinstance(stats, dict) else 0
+
+    if "routine_ring_building_candidate" in frame.columns:
+        candidate_series = pd.to_numeric(frame["routine_ring_building_candidate"], errors="coerce").fillna(0).clip(0, 1)
+        score_series = pd.to_numeric(frame.get("routine_ring_building_score"), errors="coerce") if "routine_ring_building_score" in frame.columns else pd.Series(dtype=float)
+        candidate_row_count = int(candidate_series.sum())
+        candidate_ratio = float(candidate_series.mean()) if len(candidate_series) else 0.0
+        mean_score = _json_number(score_series[candidate_series > 0].mean()) if not score_series.empty else None
+    else:
+        candidate_row_count = 0
+        candidate_ratio = 0.0
+        mean_score = None
+        warnings.append("未找到 routine_ring_building_candidate 字段，routine_stop_summary 使用空值。")
+
+    return {
+        "schema_version": "operation_context_v1",
+        "data_quality": quality_report or {},
+        "position": {
+            "start_chainage": start_chainage,
+            "end_chainage": end_chainage,
+            "start_chainage_dk": format_chainage_dk(start_chainage) if start_chainage is not None else None,
+            "end_chainage_dk": format_chainage_dk(end_chainage) if end_chainage is not None else None,
+            "advance_length_m": advance_length,
+        },
+        "operation_mode_summary": {
+            "dominant_mode": dominant_mode,
+            "dominant_mode_cn": dominant_mode_cn,
+            "work_total_min": work_total_min,
+            "stop_total_min": stop_total_min,
+            "transition_total_min": transition_total_min,
+            "abnormal_total_min": abnormal_total_min,
+            "work_count": int(stats.get("work_count", 0) or 0),
+            "stop_count": int(stats.get("stop_count", 0) or 0),
+            "transition_count": int(stats.get("transition_count", 0) or 0),
+            "abnormal_count": int(stats.get("abnormal_count", 0) or 0),
+            "work_ratio": float(work_total_min / total_min) if total_min > 0 else 0.0,
+            "stop_ratio": float(stop_total_min / total_min) if total_min > 0 else 0.0,
+        },
+        "key_operation_segments": selected_segments,
+        "short_event_summary": {
+            "short_stop_count": short_stop_count,
+            "short_transition_count": short_transition_count,
+            "short_work_count": short_work_count,
+            "short_abnormal_count": short_abnormal_count,
+        },
+        "routine_stop_summary": {
+            "candidate_row_count": candidate_row_count,
+            "candidate_ratio": candidate_ratio,
+            "mean_score": mean_score,
+        },
+        "warnings": warnings,
+    }

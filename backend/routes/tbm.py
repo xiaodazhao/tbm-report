@@ -8,6 +8,9 @@ import pandas as pd
 from fastapi import APIRouter, FastAPI
 
 from agent.supervisor_agent import TBMSupervisorAgent
+from config import BACKEND_DIR, EVIDENCE_DB_PATH
+from llm.report_quality_checker import check_report_quality
+from llm.report_trace_builder import build_report_trace, summarize_report_trace
 from llm.summary_contract import normalize_llm_summary
 from llm.llm_api import call_llm
 from llm.prompt_builder import build_prompt
@@ -22,11 +25,12 @@ from schemas.responses import (
     GeologyPayload,
     HistoryMemoryPayload,
     ReportPayload,
+    ReportDebugPayload,
     RiskProfilePayload,
     StatePayload,
     SummaryPayload,
 )
-from services.analysis_cache_service import get_or_compute_file_cache
+from services.analysis_cache_service import CACHE_KEY_VERSION, build_analysis_cache_key, get_or_compute_file_cache
 from services.evidence_import_service import import_evidence_files
 from services.twin_query_service import (
     compare_twin_snapshots,
@@ -40,6 +44,7 @@ from services.history_memory_service import (
     load_history_records,
     save_history_record,
 )
+from services.run_metadata_service import build_run_metadata
 from services.sqlite_storage_service import load_agent_messages, load_agent_session
 from utils.api_response import api_error, api_success
 from utils.io_utils import get_all_csv_paths, get_csv_path_by_date, get_latest_csv_path, load_csv, load_csv_by_date
@@ -48,6 +53,11 @@ from utils.time_window_utils import load_df_by_time
 
 
 DAILY_ANALYSIS_CACHE_NAMESPACE = "tbm_daily_analysis"
+RUN_METADATA_CONFIG_PATHS = [
+    str(BACKEND_DIR / "configs" / "tbm_report_config.json"),
+    str(BACKEND_DIR / "configs" / "prompt_policy.json"),
+    str(BACKEND_DIR / "configs" / "quality_checker_policy.json"),
+]
 # Backward compatibility for summaries persisted before the UTF-8 cleanup.
 LEGACY_VALID_SAMPLE_KEYS = ["有效状态样本数", "鏈夋晥鐘舵€佹牱鏈暟"]
 LEGACY_STATE_CONFIG_KEYS = ["状态识别配置", "鐘舵€佽瘑鍒厤缃�"]
@@ -89,6 +99,10 @@ def _summary_value(summary: dict | None, keys: list[str], default: Any):
         if key in summary and summary[key] is not None:
             return summary[key]
     return default
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
 
 
 def _stringify_dict_keys(value: Any) -> Any:
@@ -268,6 +282,102 @@ def _build_history_payload(current_date: str, result: dict, limit: int) -> dict:
         "history_comparison": serialize_for_json(history_comparison),
     }
 
+
+def _build_cache_meta(path: Path, resolved_date: str | None, analysis_mode: str) -> tuple[dict[str, Any], str]:
+    run_metadata = build_run_metadata(
+        context={"date": resolved_date, "analysis_mode": analysis_mode, "source_name": path.name},
+        source_path=str(path),
+        evidence_db_path=str(EVIDENCE_DB_PATH),
+        config_paths=RUN_METADATA_CONFIG_PATHS,
+    )
+    cache_key = build_analysis_cache_key(
+        DAILY_ANALYSIS_CACHE_NAMESPACE,
+        source_path=str(path),
+        date=resolved_date,
+        run_metadata=run_metadata,
+        analysis_mode=analysis_mode,
+    )
+    cache_key_version = CACHE_KEY_VERSION if f":{CACHE_KEY_VERSION}:" in cache_key else "legacy"
+    meta = _build_analysis_meta(path, False, resolved_date)
+    meta.update(
+        {
+            "cache_key_version": cache_key_version,
+            "source_file_hash": run_metadata.get("source_file_hash"),
+            "evidence_db_hash": run_metadata.get("evidence_db_hash"),
+            "config_hashes": run_metadata.get("config_hashes"),
+        }
+    )
+    return meta, cache_key
+
+
+def _build_report_quality_summary(quality: dict[str, Any] | None) -> dict[str, Any]:
+    quality = quality if isinstance(quality, dict) else {}
+    grounding_summary = quality.get("grounding_summary", {}) if isinstance(quality.get("grounding_summary"), dict) else {}
+    return {
+        "ok": bool(quality.get("ok", False)),
+        "score": int(quality.get("score", 0) or 0),
+        "grounding_rate": float(grounding_summary.get("grounding_rate", 0.0) or 0.0),
+        "violation_count": len(quality.get("violations", []) or []),
+    }
+
+
+def _run_report_quality_pipeline(
+    report_text: str,
+    *,
+    result: dict[str, Any],
+    llm_summary: dict[str, Any],
+    include_claim_results: bool = False,
+    include_full_trace: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], list[str]]:
+    warnings: list[str] = []
+    try:
+        twin_state = result.get("twin_state", {})
+        prompt_evidence_pack = llm_summary.get("prompt_evidence_pack", {})
+        geology_context = result.get("geology_v2_context", {}) or llm_summary.get("geology_v2_context", {})
+        quality = check_report_quality(
+            report_text,
+            llm_summary=llm_summary,
+            geology_context=geology_context,
+            twin_state=twin_state,
+            prompt_evidence_pack=prompt_evidence_pack,
+            include_claim_results=include_claim_results,
+        )
+        trace = build_report_trace(
+            report_text,
+            grounding_result=None,
+            twin_state=twin_state,
+            geology_context=geology_context,
+        )
+        trace_summary = summarize_report_trace(trace)
+        if not include_full_trace:
+            trace = {}
+        return quality, trace, trace_summary, warnings
+    except Exception as exc:
+        warnings.append(f"report quality pipeline failed: {exc}")
+        quality = {
+            "schema_version": "report_quality_v2",
+            "ok": False,
+            "score": 0,
+            "violations": [],
+            "warnings": warnings.copy(),
+            "grounding_summary": {
+                "claim_count": 0,
+                "grounded_claim_count": 0,
+                "grounding_rate": 0.0,
+                "unsupported_claim_count": 0,
+            },
+        }
+        trace_summary = {
+            "schema_version": "report_trace_summary_v1",
+            "trace_available": False,
+            "claim_trace_count": 0,
+            "grounded_claim_count": 0,
+            "unsupported_claim_count": 0,
+            "trace_coverage": 0.0,
+            "warnings": warnings.copy(),
+        }
+        return quality, {}, trace_summary, warnings
+
 # 这里定义 /api/tbm 下的所有接口
 def register_tbm_routes(
     app: FastAPI,
@@ -292,6 +402,7 @@ def register_tbm_routes(
         """Get daily analysis."""
         path = _resolve_daily_path(date)
         resolved_date = date or _date_from_csv_path(path)
+        meta, cache_key = _build_cache_meta(path, resolved_date, "daily")
         result, cache_hit = get_or_compute_file_cache(
             DAILY_ANALYSIS_CACHE_NAMESPACE,
             path,
@@ -306,8 +417,9 @@ def register_tbm_routes(
                     "persist_cst": True,
                 },
             ),
+            cache_key=cache_key,
         )
-        meta = _build_analysis_meta(path, cache_hit, resolved_date)
+        meta["cache_hit"] = cache_hit
         return path, result, _collect_warnings(result), meta, resolved_date
 
     def _internal_error(prefix: str, exc: Exception, *, status_code: int = 500, meta: dict | None = None):
@@ -491,6 +603,18 @@ def register_tbm_routes(
             )
 
             report = call_llm(prompt)
+            quality, _, trace_summary, quality_warnings = _run_report_quality_pipeline(
+                report,
+                result=result,
+                llm_summary=llm_summary,
+                include_claim_results=False,
+                include_full_trace=False,
+            )
+            result["report_quality"] = serialize_for_json(quality)
+            result["report_trace_summary"] = serialize_for_json(trace_summary)
+            warnings.extend(quality_warnings)
+            meta["report_quality_score"] = quality.get("score")
+            meta["report_grounding_rate"] = _as_dict(quality.get("grounding_summary")).get("grounding_rate", 0.0)
             _debug_success(
                 "report.daily",
                 started,
@@ -498,13 +622,84 @@ def register_tbm_routes(
                 warning_count=len(warnings),
                 cache_hit=meta.get("cache_hit"),
             )
-            return api_success({"report": report}, warnings=warnings, meta=meta)
+            return api_success(
+                {
+                    "report": report,
+                    "report_quality_summary": _build_report_quality_summary(quality),
+                },
+                warnings=warnings,
+                meta=meta,
+            )
         except FileNotFoundError as exc:
             _debug_failure("report.daily", started, exc, date=req.date)
             return api_error(str(exc), status_code=404, error_code="DATA_FILE_NOT_FOUND")
         except Exception as exc:
             _debug_failure("report.daily", started, exc, date=req.date)
             return _internal_error("日报生成失败", exc, meta={"requested_date": req.date})
+
+    @router.post("/report_debug", response_model=ApiEnvelope[ReportDebugPayload])
+    def generate_daily_report_debug(req: DailyReportRequest):
+        """Generate daily report with TwinState / PromptEvidencePack / grounding debug payload."""
+        started = _debug_start("report.debug", date=req.date)
+        try:
+            _, result, warnings, meta, _ = _get_daily_analysis(req.date)
+            current_record = build_history_record(req.date, result)
+            history_records = load_history_records(limit=10, before_date=req.date)
+            history_comparison = build_history_comparison(current_record, history_records)
+
+            llm_summary = deepcopy(result["llm_summary"])
+            llm_summary["history_comparison"] = history_comparison
+            llm_summary.setdefault("prompt_text_inputs", {})
+            llm_summary["prompt_text_inputs"]["history_comparison_text"] = (
+                history_comparison.get("comparison_text") or "暂无历史对比信息。"
+            )
+            llm_summary["施工历史记忆对比"] = history_comparison
+
+            prompt = build_prompt(
+                seg_text=result["seg_text"],
+                stats_text=result["stats_text"],
+                state_text=result["state_text"],
+                eff_text=result["eff_text"],
+                state_stats_text=result["state_stats_text"],
+                gas_text=result["gas_text"],
+                geo_text=result["geo_text"],
+                face_geo_text=result["face_geo_text"],
+                llm_summary=llm_summary,
+                risk_prob_text=result["risk_prob_text"],
+            )
+            report = call_llm(prompt)
+            quality, trace, trace_summary, quality_warnings = _run_report_quality_pipeline(
+                report,
+                result=result,
+                llm_summary=llm_summary,
+                include_claim_results=True,
+                include_full_trace=True,
+            )
+            result["report_quality"] = serialize_for_json(quality)
+            result["report_trace_summary"] = serialize_for_json(trace_summary)
+            warnings.extend(quality_warnings)
+            meta["report_quality_score"] = quality.get("score")
+            meta["report_grounding_rate"] = _as_dict(quality.get("grounding_summary")).get("grounding_rate", 0.0)
+            _debug_success("report.debug", started, date=req.date, cache_hit=meta.get("cache_hit"))
+            return api_success(
+                {
+                    "report": report,
+                    "twin_state": serialize_for_json(result.get("twin_state", {})),
+                    "prompt_evidence_pack": serialize_for_json(llm_summary.get("prompt_evidence_pack", {})),
+                    "report_quality": serialize_for_json(quality),
+                    "report_trace": serialize_for_json(trace),
+                    "run_metadata": serialize_for_json(result.get("run_metadata", {})),
+                    "report_quality_summary": _build_report_quality_summary(quality),
+                },
+                warnings=warnings,
+                meta=meta,
+            )
+        except FileNotFoundError as exc:
+            _debug_failure("report.debug", started, exc, date=req.date)
+            return api_error(str(exc), status_code=404, error_code="DATA_FILE_NOT_FOUND")
+        except Exception as exc:
+            _debug_failure("report.debug", started, exc, date=req.date)
+            return _internal_error("日报调试生成失败", exc, meta={"requested_date": req.date})
 
     @router.get("/summary", response_model=ApiEnvelope[SummaryPayload])
     def tbm_summary(date: Optional[str] = None):
@@ -605,11 +800,12 @@ def register_tbm_routes(
         try:
             _, result, warnings, meta, resolved_date = _get_daily_analysis(date)
             cst_state = result.get("cst_state", {}) or {}
+            twin_state = result.get("twin_state", {}) or cst_state
             payload = {
                 "date": resolved_date,
                 "digital_twin_state": serialize_for_json(result.get("digital_twin_state", {})),
                 "cst_state": serialize_for_json(cst_state),
-                "twin_state": serialize_for_json(cst_state),
+                "twin_state": serialize_for_json(twin_state),
                 "twin_events": serialize_for_json(cst_state.get("events", []) if isinstance(cst_state, dict) else []),
                 "twin_diff": serialize_for_json(cst_state.get("diff_from_previous", {}) if isinstance(cst_state, dict) else {}),
                 "coupling_summary": serialize_for_json(result.get("coupling_summary", {})),

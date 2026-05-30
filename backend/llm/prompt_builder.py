@@ -4,6 +4,10 @@ import json
 import math
 from typing import Any
 
+from llm.prompt_evidence_pack import (
+    build_prompt_evidence_pack,
+    render_prompt_evidence_pack_text,
+)
 from llm.summary_contract import build_prompt_payload
 
 
@@ -689,6 +693,82 @@ def build_geology_v2_structured_prompt_block(llm_summary: dict) -> str:
     return "\n".join(lines)
 
 
+def build_plc_structured_prompt_block(llm_summary: dict) -> str:
+    """Build a concise PLC structured-evidence block without exposing raw tables."""
+    if not isinstance(llm_summary, dict):
+        return "未提供 PLC 结构化状态证据。"
+
+    plc_quality_report = _as_dict(llm_summary.get("plc_quality_report"))
+    operation_context = _as_dict(llm_summary.get("operation_context"))
+    cluster_context = _as_dict(llm_summary.get("cluster_context"))
+    gas_context = _as_dict(llm_summary.get("gas_context"))
+    cell_response_summary = _as_dict(llm_summary.get("cell_response_summary"))
+
+    if not any([plc_quality_report, operation_context, cluster_context, gas_context, cell_response_summary]):
+        return "未提供 PLC 结构化状态证据。"
+
+    lines = ["【PLC 结构化状态证据】"]
+
+    if plc_quality_report:
+        time_info = _as_dict(plc_quality_report.get("time"))
+        chainage_info = _as_dict(plc_quality_report.get("chainage"))
+        lines.append(
+            f"- 数据质量：样本数={plc_quality_report.get('row_count', 0)}，"
+            f"时间列={time_info.get('time_col') or '未知'}，"
+            f"里程列={chainage_info.get('chainage_col') or '未知'}，"
+            f"主 warnings={_compact_join(plc_quality_report.get('warnings', []), max_items=4)}。"
+        )
+        lines.append(
+            "- 若 plc_quality_report 存在 warnings，施工响应解释必须写“需结合数据质量谨慎解释”。"
+        )
+
+    if operation_context:
+        op_summary = _as_dict(operation_context.get("operation_mode_summary"))
+        lines.append(
+            f"- 基础工况：主导工况={op_summary.get('dominant_mode_cn') or op_summary.get('dominant_mode') or '暂无'}，"
+            f"工作={op_summary.get('work_total_min', 0)} min，停机={op_summary.get('stop_total_min', 0)} min，"
+            f"异常扭矩={op_summary.get('abnormal_total_min', 0)} min。"
+        )
+        lines.append("- operation_mode 是基础工况，不等同于 cluster_state。")
+
+    if cluster_context:
+        cluster_quality = _as_dict(cluster_context.get("cluster_quality"))
+        lines.append(
+            f"- 聚类状态：状态数={cluster_context.get('n_states', 0)}，"
+            f"有效样本={cluster_quality.get('valid_sample_count', 0)}，"
+            f"稳定性={'足够' if cluster_quality.get('is_stable_enough') else '有限'}。"
+        )
+        lines.append("- cluster_state 是施工参数聚类状态，不等同于真实地质状态。")
+
+    if gas_context:
+        exceed_summary = _as_dict(gas_context.get("exceed_summary"))
+        gas_summaries = gas_context.get("gas_summaries", []) or []
+        caution_types = sorted(
+            {
+                str(item.get("gas"))
+                for item in gas_summaries
+                if item.get("field_type_guess") in {"alarm_flag", "unknown"}
+            }
+        )
+        lines.append(
+            f"- 气体状态：超阈值字段={_compact_join(exceed_summary.get('exceed_gases', []), max_items=6)}，"
+            f"超阈值事件总数={exceed_summary.get('exceed_event_count_total', 0)}。"
+        )
+        if caution_types:
+            lines.append(
+                f"- 以下气体字段存在 alarm_flag/unknown 语义，禁止写成确定浓度超限：{_compact_join(caution_types, max_items=8)}。"
+            )
+
+    if cell_response_summary:
+        lines.append(
+            f"- Cell 响应摘要：cell 总数={cell_response_summary.get('cell_count', 0)}，"
+            f"高响应 cell 数={cell_response_summary.get('high_response_cell_count', 0)}。"
+        )
+        lines.append("- RAI_proxy 只是 PLC 侧响应异常预览，不替代正式 RAI/GRCI。")
+
+    return "\n".join(lines)
+
+
 def _format_key_cell(row: dict) -> str:
     """Format one key geology cell into controlled prompt text."""
     range_dk = (
@@ -1038,8 +1118,45 @@ def build_prompt(
     )
     texts = payload["texts"]
     summary_block = payload["summary_block"]
+    normalized_summary = payload["normalized_summary"]
+    twin_state = _as_dict(llm_summary.get("twin_state")) or _as_dict(normalized_summary.get("twin_state"))
+    prompt_evidence_pack = _as_dict(llm_summary.get("prompt_evidence_pack")) or _as_dict(
+        normalized_summary.get("prompt_evidence_pack")
+    )
+    if not prompt_evidence_pack:
+        prompt_evidence_pack = build_prompt_evidence_pack(
+            twin_state=twin_state,
+            llm_summary=llm_summary,
+        )
+    evidence_pack_text = render_prompt_evidence_pack_text(prompt_evidence_pack)
+    has_priority_pack = bool(prompt_evidence_pack.get("ok"))
 
-    geology_v2_structured_block = build_geology_v2_structured_prompt_block(llm_summary)
+    geology_v2_structured_block = (
+        build_geology_v2_structured_prompt_block(llm_summary)
+        if not has_priority_pack
+        else "已提供 PromptEvidencePack，本轮报告应优先使用结构化证据包；旧 geology_v2 结构块仅作回退参考。"
+    )
+    plc_structured_block = (
+        build_plc_structured_prompt_block(llm_summary)
+        if not has_priority_pack
+        else "已提供 PromptEvidencePack，本轮报告应优先使用结构化证据包；旧 PLC 结构块仅作回退参考。"
+    )
+    legacy_structured_input_block = (
+        f"""
+补充结构化 fallback：
+
+结构化 CST 摘要：
+{summary_block}
+
+PLC 结构化状态证据：
+{plc_structured_block}
+
+地质融合结构化证据包：
+{geology_v2_structured_block}
+""".strip()
+        if not has_priority_pack
+        else "补充结构化 fallback：已省略，避免与 PromptEvidencePack 重复。"
+    )
 
     return f"""
 你现在要撰写一份正式的《TBM 综合施工工况分析报告》。
@@ -1066,9 +1183,9 @@ def build_prompt(
 
 地质相关内容必须按以下优先级使用：
 
-第一优先级：【地质融合结构化证据包】
-- 这是 prompt_builder 根据 geology_v2_context、geology_v2_data_summary、geology_v2_forward_profile 生成的结构化证据包。
-- 地质结论、前方提示、GRCI 解释应优先依据该证据包。
+第一优先级：【结构化证据包】
+- 这是 prompt_builder 根据 TwinState、PromptEvidencePack、geology_v2_context、coupling_summary 等结构化结果压缩生成的主输入。
+- 地质结论、前方提示、GRCI 解释、PLC 施工状态解释应优先依据该证据包。
 
 第二优先级：当前掌子面描述
 - 只用于当前掌子面或最近邻掌子面现场揭示/素描信息。
@@ -1131,6 +1248,10 @@ def build_prompt(
 3. response_anomaly：
    - 区段级施工响应异常，包括 RAI、响应异常、效率异常、停机异常等。
    - 只能说明施工响应存在异常或波动，不能直接写成地质灾害已经发生。
+
+4. RAI_proxy：
+   - 只是 PLC 侧响应异常预览。
+   - 不能替代正式 RAI 或 GRCI。
 
 ====================
 五、GRS / RAI / GRCI 解释口径
@@ -1241,6 +1362,8 @@ def build_prompt(
    “建议结合现场气体检测制度提高复核频次”
 4. 不得自行推断通风系统故障、瓦斯突出风险、爆炸风险或需要立即采取防爆措施，除非输入明确给出。
 5. 对气体建议应保持在“监测、复核、通风核查、报警记录核查、现场安全规程核查”层面，不要升级为专项处置结论。
+6. 如果气体字段语义为 alarm_flag，不得写成浓度超限。
+7. 如果气体字段语义为 unknown，不得写成确定超限。
 
 ====================
 九、建议章节
@@ -1272,11 +1395,12 @@ def build_prompt(
 十、输入资料
 ====================
 
-结构化 CST 摘要：
-{summary_block}
+结构化证据包：
+{evidence_pack_text}
 
-地质融合结构化证据包：
-{geology_v2_structured_block}
+{legacy_structured_input_block}
+
+以下自然语言摘要仅作为兜底表达，若与结构化证据包冲突，以结构化证据包为准。
 
 基础工况分段：
 {_text(texts, "operation_segments_text")}

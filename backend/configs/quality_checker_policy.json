@@ -1,0 +1,36 @@
+{
+  "checker_policy_version": "quality_checker_policy_v1",
+  "forbidden_terms": [
+    "灾害概率",
+    "风险概率",
+    "必然发生",
+    "已证实灾害",
+    "确定发生塌方",
+    "防爆措施"
+  ],
+  "strong_hazard_terms": [
+    "突涌水",
+    "塌方",
+    "岩爆",
+    "瓦斯突出"
+  ],
+  "section_requirements": [
+    "综合结论摘要",
+    "总体施工运行概况",
+    "基础工况统计分析",
+    "聚类施工状态与效率分析",
+    "当前掌子面描述",
+    "已开挖区段地质与响应异常复核",
+    "气体监测分析",
+    "前方风险提示",
+    "结论与建议"
+  ],
+  "score_weights": {
+    "forbidden_error": 15,
+    "warning": 5,
+    "missing_section": 3,
+    "unsupported_claim": 8,
+    "low_grounding_rate": 10
+  },
+  "minimum_ok_score": 80
+}

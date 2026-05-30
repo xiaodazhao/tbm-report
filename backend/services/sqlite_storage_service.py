@@ -443,9 +443,19 @@ def load_evidence_dataframe_from_db(csv_fallback_path: Path | None = None) -> pd
     return pd.DataFrame([json.loads(row["payload_json"]) for row in rows])
 
 
-def load_file_cache_blob(namespace: str, source_path: str, mtime_ns: int, file_size: int) -> bytes | None:
+def load_file_cache_blob(
+    namespace: str,
+    source_path: str,
+    mtime_ns: int,
+    file_size: int,
+    *,
+    cache_key: str | None = None,
+) -> bytes | None:
     """Load file cache blob."""
     ensure_storage_initialized()
+    lookup_path = str(cache_key or source_path)
+    lookup_mtime = 0 if cache_key else int(mtime_ns)
+    lookup_size = 0 if cache_key else int(file_size)
     with _connect() as conn:
         row = conn.execute(
             """
@@ -453,7 +463,7 @@ def load_file_cache_blob(namespace: str, source_path: str, mtime_ns: int, file_s
             FROM file_cache_entries
             WHERE namespace = ? AND source_path = ? AND mtime_ns = ? AND file_size = ?
             """,
-            (namespace, source_path, int(mtime_ns), int(file_size)),
+            (namespace, lookup_path, lookup_mtime, lookup_size),
         ).fetchone()
     return bytes(row["payload_blob"]) if row else None
 
@@ -464,9 +474,14 @@ def save_file_cache_blob(
     mtime_ns: int,
     file_size: int,
     value: Any,
+    *,
+    cache_key: str | None = None,
 ) -> None:
     """Save file cache blob."""
     ensure_storage_initialized()
+    lookup_path = str(cache_key or source_path)
+    lookup_mtime = 0 if cache_key else int(mtime_ns)
+    lookup_size = 0 if cache_key else int(file_size)
     payload = sqlite3.Binary(pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL))
     with _connect() as conn:
         conn.execute(
@@ -479,7 +494,7 @@ def save_file_cache_blob(
                 payload_blob = excluded.payload_blob,
                 updated_at = excluded.updated_at
             """,
-            (namespace, source_path, int(mtime_ns), int(file_size), payload, _now_text()),
+            (namespace, lookup_path, lookup_mtime, lookup_size, payload, _now_text()),
         )
 
 
@@ -488,9 +503,14 @@ def prune_stale_file_cache_entries(
     source_path: str,
     keep_mtime_ns: int,
     keep_file_size: int,
+    *,
+    cache_key: str | None = None,
 ) -> None:
     """Prune stale file cache entries."""
     ensure_storage_initialized()
+    lookup_path = str(cache_key or source_path)
+    lookup_mtime = 0 if cache_key else int(keep_mtime_ns)
+    lookup_size = 0 if cache_key else int(keep_file_size)
     with _connect() as conn:
         conn.execute(
             """
@@ -498,7 +518,7 @@ def prune_stale_file_cache_entries(
             WHERE namespace = ? AND source_path = ?
               AND NOT (mtime_ns = ? AND file_size = ?)
             """,
-            (namespace, source_path, int(keep_mtime_ns), int(keep_file_size)),
+            (namespace, lookup_path, lookup_mtime, lookup_size),
         )
 
 

@@ -69,6 +69,18 @@ class StatePayload(BaseModel):
 
 class ReportPayload(BaseModel):
     report: str = ""
+    report_quality_summary: dict[str, Any] = Field(default_factory=dict)
+
+
+class ReportDebugPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    report: str = ""
+    twin_state: dict[str, Any] = Field(default_factory=dict)
+    prompt_evidence_pack: dict[str, Any] = Field(default_factory=dict)
+    report_quality: dict[str, Any] = Field(default_factory=dict)
+    report_trace: dict[str, Any] = Field(default_factory=dict)
+    run_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class EvidenceImportPayload(BaseModel):

@@ -535,11 +535,13 @@ def build_or_update_cst(
 ) -> dict[str, Any]:
     """Create the current TwinState/CST and optionally persist SQLite + JSON snapshot."""
     context = context or {}
-    previous_cst = load_previous_cst_for_context(
-        date=context.get("date"),
-        analysis_mode=context.get("analysis_mode") or "daily",
-        end_time=context.get("time_end"),
-    )
+    previous_cst = None
+    if persist:
+        previous_cst = load_previous_cst_for_context(
+            date=context.get("date"),
+            analysis_mode=context.get("analysis_mode") or "daily",
+            end_time=context.get("time_end"),
+        )
     snapshot = build_cst_snapshot(analysis_result, case_id=case_id, context=context)
     cst_state = update_cst(previous_cst, snapshot, context=context)
     if persist and cst_state.get("state_key"):
