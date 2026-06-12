@@ -233,6 +233,31 @@ def _is_non_technical_claim_text(text: str) -> bool:
         return True
 
     compact = raw.strip().strip("*").strip()
+    normalized_title = re.sub(r"^\s*(#+\s*)?\d+[\.\、]\s*", "", compact).strip()
+    normalized_title = re.sub(r"（.*?）", "", normalized_title).strip()
+    if normalized_title in {
+        "综合结论摘要",
+        "总体施工运行概况",
+        "今日施工运行概况",
+        "基础工况统计分析",
+        "PLC 工况统计分析",
+        "聚类施工状态与效率分析",
+        "当前掌子面描述",
+        "已开挖区段地质与响应异常复核",
+        "气体监测分析",
+        "前方风险提示",
+        "当前掌子面前方关注提示",
+        "结论与建议",
+    }:
+        return True
+    if compact.startswith("该结果只描述当日 PLC 参数状态分组"):
+        return True
+    if compact.startswith("当前掌子面描述只作为空间定位"):
+        return True
+    if compact.startswith("报告不得把 GRCI"):
+        return True
+    if "这些 cell 使用 GRS_geo_base" in compact and "不进入 high_grci_cells" in compact:
+        return True
         # 报告元信息 / 声明 / 编制信息，不进入 grounding 分母
     if compact.startswith("报告编制"):
         return True

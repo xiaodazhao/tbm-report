@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 class DailyReportRequest(BaseModel):
     date: str  # YYYY-MM-DD
+    use_llm: bool = True
 
     @field_validator("date")
     @classmethod

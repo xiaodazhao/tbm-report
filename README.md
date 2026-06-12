@@ -1,154 +1,225 @@
-# 数字孪生和大语言模型协同驱动的 TBM 施工报告自动化生成
+# TBM 施工日报生成工作台
 
-这是一个面向 TBM 隧道施工场景的研究型全栈系统。项目目标不是让大语言模型直接读取原始 `CSV + PDF`，而是先把 TBM 施工数据、超前地质预报和掌子面素描组织成统一、可解释、可追溯的 `Construction State Twin`，再由大语言模型生成日报、时段报告和问答解释。
+本仓库当前整理为一个以后端单主线 pipeline 为核心、配套干净前端工作台的 TBM 施工日报研究原型。
 
-## 文档导航
+当前有效主线：
 
-- [项目总说明](docs/research_overview.md)
-- [最终版方法框架](docs/final_method_framework.md)
-- [实验操作教程](docs/experiment_tutorial.md)
-- [论文实验部分草稿](docs/experiment_section_draft.md)
-- [论文大纲建议](docs/paper_outline.md)
-- [后端清单](docs/backend_inventory.md)
-- [Agent 设计说明](docs/agent_v2.md)
-- [证据导入说明](docs/evidence_import.md)
-
-如果你想快速了解项目，优先阅读 [项目总说明](docs/research_overview.md)。
-
-## 当前主线
-
-1. 读取 TBM 日运行 `CSV`
-2. 解析 `TSP / HSP / 掌子面素描` PDF
-3. 按统一里程轴做地质-施工融合
-4. 计算区段级 `GRS / RAI / GRCI`
-5. 构建 `Construction State Twin`
-6. 基于 `CST` 生成 state-aware prompt
-7. 生成日报、时段报告和 Agent 问答结果
-
-## 当前版本的核心状态层
-
-项目当前已经实现了正式的 `recursive CST v2`：
-
-- 有统一 `CST schema`
-- 主分析链正式产出 `cst_state`
-- `CST` 会持久化到 `SQLite`
-- 会读取 `t-1` 做递推更新
-- 记录 `changed_fields / state_confidence / state_stability / trend_label`
-- 维护 `persistent_hazards / persistent_attention_segments`
-- API、Agent、实验脚本共用同一状态对象
-
-这意味着项目已经从“分析结果集合”升级成“围绕正式状态对象组织的系统”。
-
-## 当前算法版本
-
-- `GRS`
-  - 区段地质关注度表征
-  - 基于分量归一化与平权聚合
-  - 加入高斯衰减平滑与响应修正
-- `RAI`
-  - 区段施工响应异常表征
-  - 基于 `Isolation Forest`
-  - 对常规环级停顿做异常惩罚折减
-- `GRCI`
-  - 地质关注与施工响应的耦合验证指标
-  - 综合同步、滞后、变化和一致性信息
-
-## 项目定位
-
-这个项目更准确的定位不是“TBM 风险识别系统”，而是：
-
-**一个面向 TBM 施工报告自动化生成的 Construction State Twin + LLM 协同框架。**
-
-其中：
-
-- `Construction State Twin` 负责状态组织、时空对齐、证据约束和历史递推
-- `LLM` 负责正式工程文本生成
-
-## 技术栈
-
-- 前端：React、Vite、Recharts、Axios
-- 后端：FastAPI、Pydantic、Pandas、scikit-learn
-- 数据：CSV、PDF、SQLite
-- 测试：pytest
-
-## 快速启动
-
-### 1. 配置环境变量
-
-```powershell
-copy .env.example backend/.env
+```text
+backend/routes/report.py
+-> backend/pipeline/daily_report_pipeline.py::run_daily_report_pipeline
+-> ConstructionStateCell
+-> Prompt Evidence Pack
+-> Report
+-> Quality / Trace
 ```
 
-### 2. 启动后端
+旧前端、旧论文实验脚本、旧顶层文档和旧后端模块均已归档，不参与当前主流程。
+
+## 当前主目录
+
+```text
+tbm-report/
+├── backend/      当前有效后端研究原型
+├── frontend/     当前有效前端日报生成工作台
+├── _archive/     历史材料归档，不参与当前主流程
+├── README.md     当前说明
+├── .gitignore
+└── pytest.ini
+```
+
+## 后端主线
+
+当前后端从 PLC 日运行数据和多源地质证据出发，完成：
+
+1. 读取日运行 PLC CSV 与地质证据库；
+2. 分析 PLC 工况、聚类施工状态、气体监测和施工响应；
+3. 通过 `geology_v2` 完成地质证据标准化、online 过滤、cell 投影和融合；
+4. 构建 10m `ConstructionStateCell`；
+5. 计算 `GRS_geo_base / RAI / GRCI`；
+6. 构建当前掌子面前方 `forward_profile`；
+7. 构建 Prompt Evidence Pack；
+8. 生成 no-LLM 模板报告或 LLM fallback 报告；
+9. 执行 Quality / Trace 核验；
+10. 通过 API 或导出脚本输出结果。
+
+详细说明：
+
+- [后端 README](backend/README.md)
+- [字段契约](backend/docs/backend_field_contract.md)
+- [方法定义](backend/docs/method_definition.md)
+- [指标定义](backend/docs/metrics_definition.md)
+- [范围与限制](backend/docs/scope_and_limitations.md)
+- [目录归档计划](backend/docs/archive_plan.md)
+
+## 前端工作台
+
+当前前端是从头重做的 Vue 3 工作台，位于：
+
+```text
+frontend/
+```
+
+前端只调用当前后端四个 API：
+
+```text
+GET  /api/tbm/health
+GET  /api/tbm/dates
+POST /api/tbm/report
+POST /api/tbm/report/debug
+```
+
+页面：
+
+- `/report`：日报生成页；
+- `/cells`：高关注区段页；
+- `/forward`：前方关注提示页；
+- `/debug`：调试与追溯页。
+
+启动前端：
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+构建前端：
+
+```powershell
+cd frontend
+npm run build
+```
+
+## 核心语义
+
+- `ConstructionStateCell` 是当前系统的核心对象。
+- `GRS_geo_base` 表示地质证据关注度。
+- `RAI` 表示 PLC 施工响应异常度。
+- `GRCI` 表示已掘 cell 的地质-施工响应耦合关注度。
+- `GRCI` 不是灾害概率。
+- `GRCI` 不是前方风险。
+- 没有 PLC response 或没有 RAI 的 cell 不计算正式 GRCI。
+- forward cell 使用 `forward_profile / GRS_geo_base / source_trace`，不进入 `high_grci_cells`。
+
+## 当前 API
+
+当前只维护以下核心接口：
+
+```text
+GET  /api/tbm/health
+GET  /api/tbm/dates
+POST /api/tbm/report
+POST /api/tbm/report/debug
+```
+
+旧接口、Agent 接口、旧 `routes/tbm.py` 均已归档，不参与当前主流程。
+
+## 配置后端
+
+复制后端环境变量模板：
+
+```powershell
+copy backend\.env.example backend\.env
+```
+
+至少配置：
+
+```env
+DATA_ROOT=G:/我的云端硬盘/TBM9
+USE_LLM=false
+```
+
+如果数据目录是只读环境，可设置：
+
+```env
+ENSURE_DIRS_ON_IMPORT=false
+```
+
+## 运行后端
 
 ```powershell
 cd backend
-pip install -r requirements.txt
 uvicorn app:app --reload --port 8000
 ```
 
-后端地址：
+访问：
 
 ```text
-http://127.0.0.1:8000
 http://127.0.0.1:8000/docs
 ```
 
-### 3. 启动前端
-
-```powershell
-cd Frontend
-npm install
-npm.cmd run dev
-```
-
-前端地址：
-
-```text
-http://127.0.0.1:5173
-```
-
-## 常用接口
-
-- `GET /api/tbm/dates`
-- `GET /api/tbm/summary`
-- `GET /api/tbm/state`
-- `GET /api/tbm/gas`
-- `GET /api/tbm/geology`
-- `GET /api/tbm/risk_profile`
-- `GET /api/tbm/digital_twin_state`
-- `GET /api/tbm/history_memory`
-- `POST /api/tbm/report`
-- `POST /api/tbm/report_by_time`
-- `POST /api/tbm/agent_v2`
-- `GET /api/tbm/agent_v2/session`
-- `POST /api/tbm/evidence/import`
-
-## 论文实验目录
-
-根目录的 [experiments](experiments/README.md) 用于承载论文实验脚本、配置和输出。当前已经覆盖：
-
-- case 冻结
-- `CST` 状态导出
-- `Template / Direct-LLM / CST-LLM` 报告生成
-- 主实验评分与指标汇总
-- 追溯实验
-- 消融实验
-- 多源贡献实验
-- 轻量级状态连续性分析
-
-## 验证
-
-后端测试：
+## 后端回归测试
 
 ```powershell
 cd backend
-python -m pytest tests
+python -m pytest tests -q
 ```
 
-前端构建：
+## 多日期 no-LLM smoke test
 
 ```powershell
-cd Frontend
-npm.cmd run build
+cd backend
+python scripts/smoke_test_daily_pipeline.py --dates 2023-12-30,2023-12-28,2023-09-15 --no-llm --out outputs/smoke_summary.json
 ```
+
+该脚本会输出：
+
+- 当日里程范围；
+- cell response 数量；
+- `ConstructionStateCell` 数量；
+- `GRCI_available` 数量；
+- high GRCI cell 数量；
+- forward cell 数量；
+- Evidence Pack `key_cells` 数量；
+- Quality / Trace 指标；
+- warnings。
+
+## 导出完整中间结果
+
+```powershell
+cd backend
+python scripts/export_daily_pipeline_outputs.py --dates 2023-12-30,2023-12-28 --no-llm --out-dir outputs/pipeline_exports
+```
+
+每个日期会导出：
+
+- `report.txt`
+- `prompt.txt`
+- `evidence_pack.json`
+- `quality.json`
+- `trace.json`
+- `construction_state_cells.json`
+- `construction_state_cells.csv`
+- `forward_profile.json`
+- `high_grci_cells.json`
+- `warnings.json`
+- `summary.json`
+
+## 归档内容
+
+根目录 `_archive/` 保存历史材料：
+
+- `_archive/old_frontend/`：旧前端工程，仍依赖旧接口和 Agent，不参与当前主线；
+- `_archive/root_old_docs/`：旧论文草稿、旧技术路线和旧说明文档；
+- `_archive/root_old_experiments/`：旧论文实验脚本；
+- `_archive/local_ignored_snapshots/`：本地代码快照，不建议提交到 GitHub。
+
+后端内部 `_archive/` 保存旧后端模块：
+
+- `backend/_archive/legacy_previous/`：旧 Agent、旧 routes、旧 services、旧 geology、旧 segment GRCI、旧 prompt builder 等。
+
+当前主流程禁止从任何 `_archive/` 目录 import 代码。
+
+## 当前边界
+
+当前仓库不做：
+
+- Agent 问答；
+- 旧接口兼容；
+- 真实外部 LLM 接入；
+- TSP/HSP 原始探测信号重新解释；
+- TBM 物理仿真数字孪生；
+- 地质灾害概率预测；
+- 正式论文实验批量评价。
+
+这些能力如需参考历史版本，请查看 `_archive/`。

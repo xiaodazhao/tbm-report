@@ -2,12 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import CORS_ALLOW_CREDENTIALS, CORS_ALLOW_ORIGINS
-from routes.tbm import register_tbm_routes
-from services.tbm_analysis_service import (
-    analyze_tbm_data,
-    build_risk_profile,
-    build_speed_profile,
-)
+from routes.report import register_report_routes
 
 
 # =========================
@@ -25,14 +20,9 @@ app.add_middleware(
 
 
 # =========================
-# API 路由注册
+# API 路由注册：只保留日报主 pipeline 接口
 # =========================
-register_tbm_routes(
-    app,
-    analyze_tbm_data=analyze_tbm_data,
-    build_risk_profile=build_risk_profile,
-    build_speed_profile=build_speed_profile,
-)
+register_report_routes(app)
 
 
 # 启动：

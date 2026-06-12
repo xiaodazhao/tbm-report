@@ -4,7 +4,6 @@ import glob
 import pandas as pd
 
 from config import APP_DB_PATH, DATA_DIR, EVIDENCE_DB_PATH
-from geology.geology_fusion_backend import load_evidence_db
 
 
 def get_all_csv_paths() -> list[Path]:
@@ -91,7 +90,9 @@ def load_evidence() -> pd.DataFrame:
             f"找不到证据库文件：{EVIDENCE_DB_PATH}\n"
             f"请先运行：python scripts/build_evidence_db.py"
         )
-    return load_evidence_db(EVIDENCE_DB_PATH)
+    if not EVIDENCE_DB_PATH.exists():
+        return pd.DataFrame()
+    return pd.read_csv(EVIDENCE_DB_PATH)
 
 
 def check_data_environment() -> dict:

@@ -277,6 +277,9 @@ def _get_key_cells(
         geology_context=geology_context,
         prompt_evidence_pack=prompt_evidence_pack,
     )
+    if not cells:
+        geology_evidence = _as_dict(_as_dict(prompt_evidence_pack).get("geology_evidence"))
+        cells = _as_list(geology_evidence.get("selected_cells"))
     return [item for item in cells if isinstance(item, dict)]
 
 

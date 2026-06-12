@@ -36,6 +36,7 @@ CONTEXT_PATHS = {
         ("twin_state", TWIN_STATE_SECTIONS["geology"], "key_cells"),
         ("geology_context", "key_cells"),
         ("prompt_evidence_pack", PROMPT_EVIDENCE_SECTIONS["geology"], "key_cells"),
+        ("prompt_evidence_pack", PROMPT_EVIDENCE_SECTIONS["geology"], "selected_cells"),
     ],
     "forward_segments": [
         ("twin_state", TWIN_STATE_SECTIONS["forward"], "segments"),

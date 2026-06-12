@@ -1,0 +1,2 @@
+"""Daily report pipeline package."""
+
