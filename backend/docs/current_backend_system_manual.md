@@ -486,8 +486,8 @@ exceed_event_count_total: 1
 当前案例中：
 
 ```text
-geo_states_df cell 数：157
-construction_state_cells 数：157
+geo_states_df cell 数：14
+construction_state_cells 数：14
 ```
 
 `geo_states_df` 的地质融合字段已经合入 `ConstructionStateCell`，包括：
@@ -653,7 +653,7 @@ DyK1014+545...20231224_hsp_3_collapse_point_0
 
 - PLC 读取 4098 行，当日推进 15m。
 - `cell_response_df` 覆盖 2 个当日施工响应 cell。
-- `geo_states_df` / `construction_state_cells` 覆盖 157 个地质 cell。
+- `geo_states_df` / `construction_state_cells` 覆盖当前日报 `report_scope` 内 14 个 cell。
 - 只有 2 个 cell 同时具备 GRS、RAI 和 PLC response，因此只有 2 个正式 GRCI。
 - 前方 3 个 cell 使用 forward_profile 和 GRS，不进入 high GRCI。
 - Evidence Pack 中 `key_cells` 与 `selected_cells` 数量一致，均为 13。

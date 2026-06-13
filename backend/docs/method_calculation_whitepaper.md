@@ -1790,11 +1790,11 @@ RAI = 0.40*0.615351 + 0.25*0.003903 + 0.20*1.0 + 0.10*0 + 0.05*0
 当前导出 summary：
 
 ```text
-construction_state_cells_row_count = 157
-geo_states_df cell 数 = 157
+construction_state_cells_row_count = 14
+geo_states_df cell 数 = 14
 ```
 
-说明地质链路形成了 157 个 10m cell，而当日 PLC 施工响应只覆盖其中 2 个。
+说明当前日报主链路只保留 `report_scope` 内 14 个 10m cell，其中当日 PLC 施工响应覆盖 2 个 `daily_review` cell。
 
 这正是当前方法的关键区别：
 
