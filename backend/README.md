@@ -18,7 +18,7 @@ routes.report
 参与当前主流程的核心目录：
 
 - `routes/report.py`：当前唯一报告 API。
-- `pipeline/`：日报主 pipeline，入口为 `run_daily_report_pipeline(date, use_llm=True)`。
+- `pipeline/`：日报主 pipeline，入口为 `run_daily_report_pipeline(date, use_llm=False)`，默认 `generation_mode=template`。
 - `plc/`：PLC 工况、气体、施工响应和 cell 响应聚合。
 - `geology_v2/`：当前唯一地质证据结构化、投影、融合和 forward profile 链路。
 - `coupling/`：cell 级 `GRS / RAI / GRCI` 计算。
@@ -98,6 +98,49 @@ python scripts/export_daily_pipeline_outputs.py --dates 2023-12-30,2023-12-28 --
 - `high_grci_cells.json`
 - `warnings.json`
 - `summary.json`
+
+## Evidence Pack 约束 LLM 生成
+
+默认报告生成模式仍然是 `template`，即不调用外部 LLM。LLM 只允许接在 Evidence Pack 之后，用于文本生成和修订，不参与 PLC 处理、地质证据筛选、ConstructionStateCell 构建或 `RAI / GRS / GRCI` 计算。
+
+支持的 `generation_mode`：
+
+- `template`：稳定模板报告，默认模式。
+- `evidence_pack_llm`：基于 Evidence Pack 构建约束 prompt，生成 LLM 初稿，并运行 Quality / Trace。
+- `evidence_pack_llm_with_revision`：先生成初稿，再根据 Quality / Trace 反馈构建 revision prompt，修订后再次运行 Quality / Trace。
+
+独立脚本：
+
+```bash
+cd backend
+python scripts/run_llm_report_generation.py --dates 2023-12-30 --generation-mode evidence_pack_llm --mock-llm --out-dir outputs/llm_exports
+python scripts/run_llm_report_generation.py --dates 2023-12-30 --generation-mode evidence_pack_llm_with_revision --mock-llm --out-dir outputs/llm_exports
+```
+
+真实 DeepSeek / OpenAI-compatible 调用使用：
+
+```bash
+python scripts/run_llm_report_generation.py --dates 2023-12-30 --generation-mode evidence_pack_llm --provider openai_or_compatible --model deepseek-chat --out-dir outputs/llm_exports
+```
+
+注意：真实 LLM 调用会把 Evidence Pack 派生内容发送到外部模型服务，应在确认数据可外发后再运行。
+
+LLM 审计导出文件包括：
+
+- `llm_mode.json`
+- `llm_prompt.txt`
+- `llm_request.json`
+- `llm_raw_response.txt`
+- `llm_report_draft.txt`
+- `llm_quality_before_revision.json`
+- `llm_trace_before_revision.json`
+- `llm_revision_prompt.txt`
+- `llm_revision_request.json`
+- `llm_revision_response.txt`
+- `llm_report_final.txt`
+- `llm_quality_after_revision.json`
+- `llm_trace_after_revision.json`
+- `llm_summary.json`
 
 ## 启动 FastAPI
 

@@ -443,7 +443,7 @@ def test_method_metrics_contains_required_keys():
 
 def test_report_api_returns_core_fields(monkeypatch):
     fake = _fake_result()
-    monkeypatch.setattr(report_routes, "run_daily_report_pipeline", lambda date, use_llm=True: fake)
+    monkeypatch.setattr(report_routes, "run_daily_report_pipeline", lambda date, use_llm=True, **kwargs: fake)
 
     app = FastAPI()
     report_routes.register_report_routes(app)
@@ -459,13 +459,15 @@ def test_report_api_returns_core_fields(monkeypatch):
         "trace_summary",
         "forward_profile",
         "high_grci_cells",
+        "generation_mode",
+        "llm_summary",
         "warnings",
     }
 
 
 def test_report_debug_api_returns_intermediate_fields(monkeypatch):
     fake = _fake_result()
-    monkeypatch.setattr(report_routes, "run_daily_report_pipeline", lambda date, use_llm=True: fake)
+    monkeypatch.setattr(report_routes, "run_daily_report_pipeline", lambda date, use_llm=True, **kwargs: fake)
 
     app = FastAPI()
     report_routes.register_report_routes(app)
@@ -483,6 +485,8 @@ def test_report_debug_api_returns_intermediate_fields(monkeypatch):
         "prompt_text",
         "quality",
         "trace",
+        "generation_mode",
+        "llm_generation",
     ]:
         assert key in payload
 
@@ -490,25 +494,51 @@ def test_report_debug_api_returns_intermediate_fields(monkeypatch):
 def test_run_daily_report_pipeline_no_llm_does_not_call_llm(monkeypatch):
     _patch_minimal_pipeline(monkeypatch)
 
-    def fail_if_called(_prompt):
+    def fail_if_called(**_kwargs):
         raise AssertionError("LLM should not be called when use_llm=False")
 
-    monkeypatch.setattr(daily_pipeline, "call_llm_result", fail_if_called)
+    monkeypatch.setattr(daily_pipeline, "generate_llm_report", fail_if_called)
     result = daily_pipeline.run_daily_report_pipeline("2023-01-01", use_llm=False)
     assert result.report_text
-    assert "LLM disabled" in result.warnings
+    assert result.generation_mode == "template"
+    assert result.llm_generation == {}
 
 
-def test_run_daily_report_pipeline_llm_failure_falls_back_with_warning(monkeypatch):
+def test_run_daily_report_pipeline_llm_generation_uses_optional_mode(monkeypatch):
     _patch_minimal_pipeline(monkeypatch)
     monkeypatch.setattr(
         daily_pipeline,
-        "call_llm_result",
-        lambda _prompt: {"ok": False, "text": "", "warnings": ["mock llm failure"]},
+        "generate_llm_report",
+        lambda **_kwargs: {
+            "report_final": "mock llm report",
+            "prompt": "mock llm prompt",
+            "quality_after_revision": {
+                "ok": True,
+                "score": 100,
+                "stats": {
+                    "claim_count": 0,
+                    "grounded_claim_count": 0,
+                    "unsupported_claim_count": 0,
+                    "grounding_rate": 0.0,
+                },
+                "grounding_summary": {
+                    "claim_count": 0,
+                    "grounded_claim_count": 0,
+                    "unsupported_claim_count": 0,
+                    "grounding_rate": 0.0,
+                },
+                "claim_results": [],
+            },
+            "trace_after_revision": {"trace_available": True},
+            "warnings": ["mock llm warning"],
+            "summary": {"passed": True},
+        },
     )
     result = daily_pipeline.run_daily_report_pipeline("2023-01-01", use_llm=True)
-    assert result.report_text
-    assert "mock llm failure" in result.warnings
+    assert result.report_text == "mock llm report"
+    assert result.prompt_text == "mock llm prompt"
+    assert result.generation_mode == "evidence_pack_llm"
+    assert "mock llm warning" in result.warnings
 
 
 def test_smoke_config_snapshot_exposes_config_warning(monkeypatch):
@@ -528,6 +558,8 @@ def _fake_result():
         trace_summary={"trace_coverage": 1.0},
         forward_profile={"profile": []},
         high_grci_cells=[],
+        generation_mode="template",
+        llm_generation={},
         warnings=[],
         operation_summary={},
         cluster_summary={},

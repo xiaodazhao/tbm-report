@@ -30,7 +30,15 @@ def register_report_routes(app: FastAPI) -> None:
 
     @app.post("/api/tbm/report")
     def build_report(request: DailyReportRequest) -> dict:
-        result = run_daily_report_pipeline(request.date, use_llm=request.use_llm)
+        result = run_daily_report_pipeline(
+            request.date,
+            use_llm=request.use_llm,
+            generation_mode=request.generation_mode,
+            llm_provider=request.llm_provider,
+            llm_model=request.llm_model,
+            mock_llm=request.mock_llm,
+            enable_revision=request.enable_revision,
+        )
         return {
             "date": result.date,
             "report_text": result.report_text,
@@ -38,12 +46,22 @@ def register_report_routes(app: FastAPI) -> None:
             "trace_summary": result.trace_summary,
             "forward_profile": result.forward_profile,
             "high_grci_cells": result.high_grci_cells,
+            "generation_mode": result.generation_mode,
+            "llm_summary": (result.llm_generation or {}).get("summary", {}),
             "warnings": result.warnings,
         }
 
     @app.post("/api/tbm/report/debug")
     def build_report_debug(request: DailyReportRequest) -> dict:
-        result = run_daily_report_pipeline(request.date, use_llm=request.use_llm)
+        result = run_daily_report_pipeline(
+            request.date,
+            use_llm=request.use_llm,
+            generation_mode=request.generation_mode,
+            llm_provider=request.llm_provider,
+            llm_model=request.llm_model,
+            mock_llm=request.mock_llm,
+            enable_revision=request.enable_revision,
+        )
         return {
             "date": result.date,
             "operation_summary": result.operation_summary,
@@ -62,6 +80,7 @@ def register_report_routes(app: FastAPI) -> None:
             "trace_summary": result.trace_summary,
             "forward_profile": result.forward_profile,
             "high_grci_cells": result.high_grci_cells,
+            "generation_mode": result.generation_mode,
+            "llm_generation": result.llm_generation,
             "warnings": result.warnings,
         }
-

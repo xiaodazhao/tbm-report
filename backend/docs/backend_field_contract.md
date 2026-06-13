@@ -29,6 +29,8 @@ routes.report
 | `forward_profile` | 当前掌子面前方关注 profile 和 forward attention cells。 |
 | `prompt_evidence_pack` | 注入 prompt、报告、质量检查和 trace 的结构化证据包。 |
 | `prompt_text` | 由 Evidence Pack 构建的 prompt。 |
+| `generation_mode` | 报告生成模式，支持 `template`、`evidence_pack_llm`、`evidence_pack_llm_with_revision`；默认 `template`。 |
+| `llm_generation` | LLM 模式审计结果，包括 prompt、request、response、draft/final report、revision、Quality / Trace 前后结果和 summary；template 模式为空。 |
 | `quality` | 完整报告质量检查结果。 |
 | `quality_summary` | 报告质量核心指标摘要。 |
 | `trace` | 完整 claim-to-evidence trace。 |

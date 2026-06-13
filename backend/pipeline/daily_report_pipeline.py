@@ -11,7 +11,7 @@ from geology_v2.fusion_engine import fuse_geo_states
 from geology_v2.evidence_normalizer import summarize_normalized_evidence
 from geology_v2.pipeline import run_geology_v2_context
 from llm.evidence_pack import build_prompt_evidence_pack, build_template_report
-from llm.llm_api import call_llm_result
+from llm.llm_report_generator import generate_llm_report, normalize_generation_mode
 from llm.report_prompt import build_prompt
 from llm.report_quality_checker import check_report_quality
 from llm.report_trace_builder import build_report_trace, summarize_report_trace
@@ -28,8 +28,14 @@ from twin.twin_state import build_twin_state
 
 def run_daily_report_pipeline(
     date: str,
-    use_llm: bool = True,
+    use_llm: bool = False,
     *,
+    generation_mode: str | None = None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
+    mock_llm: bool = False,
+    enable_revision: bool | None = None,
+    max_revision_rounds: int = 1,
     cell_length: float = 10.0,
     lookahead_m: float = 30.0,
     advance_direction: int = 1,
@@ -37,6 +43,9 @@ def run_daily_report_pipeline(
 ) -> DailyReportResult:
     """Run the only retained daily TBM report pipeline."""
     warnings: list[str] = []
+    active_generation_mode = normalize_generation_mode(
+        generation_mode or ("evidence_pack_llm" if use_llm else "template")
+    )
     inputs = load_daily_inputs(date)
     warnings.extend(inputs.warnings)
     active_date = inputs.date or date
@@ -130,10 +139,7 @@ def run_daily_report_pipeline(
         warnings=warnings,
     )
     prompt_text = build_prompt(prompt_evidence_pack)
-
-    llm_result = call_llm_result(prompt_text) if use_llm else {"ok": False, "text": "", "warnings": ["LLM disabled"]}
-    warnings.extend(llm_result.get("warnings", []))
-    report_text = llm_result.get("text") if llm_result.get("ok") else build_template_report(prompt_evidence_pack)
+    template_report = build_template_report(prompt_evidence_pack)
 
     twin_state = build_twin_state(
         date=active_date,
@@ -147,13 +153,42 @@ def run_daily_report_pipeline(
         warnings=warnings,
     )
 
-    quality = check_report_quality(
+    llm_generation = {}
+    if active_generation_mode == "template":
+        report_text = template_report
+    else:
+        llm_generation = generate_llm_report(
+            date=active_date,
+            prompt_evidence_pack=prompt_evidence_pack,
+            twin_state=twin_state,
+            generation_mode=active_generation_mode,
+            provider_name=llm_provider,
+            model=llm_model,
+            mock_llm=mock_llm,
+            enable_revision=enable_revision,
+            max_revision_rounds=max_revision_rounds,
+            fallback_report=template_report,
+        )
+        warnings.extend(llm_generation.get("warnings", []))
+        if llm_generation.get("prompt"):
+            prompt_text = llm_generation.get("prompt", prompt_text)
+        report_text = llm_generation.get("report_final") or template_report
+
+    quality = (
+        llm_generation.get("quality_after_revision")
+        if llm_generation
+        else None
+    ) or check_report_quality(
         report_text,
         twin_state=twin_state,
         prompt_evidence_pack=prompt_evidence_pack,
         include_claim_results=True,
     )
-    trace = build_report_trace(
+    trace = (
+        llm_generation.get("trace_after_revision")
+        if llm_generation
+        else None
+    ) or build_report_trace(
         report_text,
         grounding_result={
             "claim_results": quality.get("claim_results") or [],
@@ -211,6 +246,8 @@ def run_daily_report_pipeline(
                 priority_cells=priority_cells,
             )
         ),
+        generation_mode=active_generation_mode,
+        llm_generation=json_safe(llm_generation),
         warnings=list(dict.fromkeys(str(item) for item in warnings if item)),
     )
 

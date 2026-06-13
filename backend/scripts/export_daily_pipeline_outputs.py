@@ -23,6 +23,11 @@ def main() -> None:
     parser.add_argument("--dates", help="Comma-separated dates.")
     parser.add_argument("--no-llm", action="store_true", help="Keep LLM disabled. This is the default.")
     parser.add_argument("--use-llm", action="store_true", help="Allow LLM call; fallback remains enabled.")
+    parser.add_argument("--generation-mode", choices=["template", "evidence_pack_llm", "evidence_pack_llm_with_revision"], help="Optional generation mode.")
+    parser.add_argument("--llm-provider", help="LLM provider, e.g. mock or openai_or_compatible.")
+    parser.add_argument("--llm-model", help="LLM model name.")
+    parser.add_argument("--mock-llm", action="store_true", help="Use deterministic mock LLM.")
+    parser.add_argument("--enable-revision", action="store_true", help="Enable LLM revision when generation mode supports it.")
     parser.add_argument("--out-dir", default="outputs/pipeline_exports", help="Output directory.")
     args = parser.parse_args()
 
@@ -35,7 +40,18 @@ def main() -> None:
 
     summary_rows = []
     for date in dates:
-        summary_rows.append(_export_one(date, out_dir=out_dir, use_llm=use_llm))
+        summary_rows.append(
+            _export_one(
+                date,
+                out_dir=out_dir,
+                use_llm=use_llm,
+                generation_mode=args.generation_mode,
+                llm_provider=args.llm_provider,
+                llm_model=args.llm_model,
+                mock_llm=args.mock_llm,
+                enable_revision=args.enable_revision if args.enable_revision else None,
+            )
+        )
 
     summary_path = out_dir / "export_summary.json"
     _write_json(summary_path, {"results": summary_rows})
@@ -53,11 +69,29 @@ def _parse_dates(date: str | None, dates: str | None) -> list[str]:
     return list(dict.fromkeys(out))
 
 
-def _export_one(date: str, *, out_dir: Path, use_llm: bool) -> dict[str, Any]:
+def _export_one(
+    date: str,
+    *,
+    out_dir: Path,
+    use_llm: bool,
+    generation_mode: str | None = None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
+    mock_llm: bool = False,
+    enable_revision: bool | None = None,
+) -> dict[str, Any]:
     target = out_dir / date
     target.mkdir(parents=True, exist_ok=True)
     try:
-        result = run_daily_report_pipeline(date, use_llm=use_llm)
+        result = run_daily_report_pipeline(
+            date,
+            use_llm=use_llm,
+            generation_mode=generation_mode,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
+            mock_llm=mock_llm,
+            enable_revision=enable_revision,
+        )
         cells = [cell.model_dump() for cell in result.construction_state_cells]
         summary = {
             "date": result.date,
@@ -79,6 +113,8 @@ def _export_one(date: str, *, out_dir: Path, use_llm: bool) -> dict[str, Any]:
             "error_type_counts": result.quality.get("error_type_counts", {}),
             "support_type_distribution": result.trace.get("support_type_distribution", {}),
             "warnings": result.warnings,
+            "generation_mode": result.generation_mode,
+            "llm_summary": (result.llm_generation or {}).get("summary", {}),
         }
 
         (target / "report.txt").write_text(result.report_text or "", encoding="utf-8")
@@ -100,6 +136,7 @@ def _export_one(date: str, *, out_dir: Path, use_llm: bool) -> dict[str, Any]:
         _write_json(target / "cell_evidence_df.json", result.cell_evidence_records)
         _write_json(target / "warnings.json", result.warnings)
         _write_json(target / "summary.json", summary)
+        _write_llm_outputs(target, result.llm_generation)
 
         csv_rows = [_csv_safe(item) for item in cells]
         pd.DataFrame(csv_rows).to_csv(target / "construction_state_cells.csv", index=False, encoding="utf-8-sig")
@@ -123,6 +160,31 @@ def _export_one(date: str, *, out_dir: Path, use_llm: bool) -> dict[str, Any]:
 
 def _write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+
+def _write_llm_outputs(target: Path, llm_generation: dict[str, Any]) -> None:
+    if not llm_generation:
+        return
+    _write_json(target / "llm_mode.json", {
+        "generation_mode": llm_generation.get("generation_mode"),
+        "provider": llm_generation.get("provider"),
+        "model": llm_generation.get("model"),
+        "passed": llm_generation.get("passed"),
+        "error_message": llm_generation.get("error_message"),
+    })
+    (target / "llm_prompt.txt").write_text(llm_generation.get("prompt", "") or "", encoding="utf-8")
+    _write_json(target / "llm_request.json", llm_generation.get("request", {}))
+    (target / "llm_raw_response.txt").write_text(llm_generation.get("raw_response", "") or "", encoding="utf-8")
+    (target / "llm_report_draft.txt").write_text(llm_generation.get("report_draft", "") or "", encoding="utf-8")
+    _write_json(target / "llm_quality_before_revision.json", llm_generation.get("quality_before_revision", {}))
+    _write_json(target / "llm_trace_before_revision.json", llm_generation.get("trace_before_revision", {}))
+    (target / "llm_revision_prompt.txt").write_text(llm_generation.get("revision_prompt", "") or "", encoding="utf-8")
+    _write_json(target / "llm_revision_request.json", llm_generation.get("revision_request", {}))
+    (target / "llm_revision_response.txt").write_text(llm_generation.get("revision_response", "") or "", encoding="utf-8")
+    (target / "llm_report_final.txt").write_text(llm_generation.get("report_final", "") or "", encoding="utf-8")
+    _write_json(target / "llm_quality_after_revision.json", llm_generation.get("quality_after_revision", {}))
+    _write_json(target / "llm_trace_after_revision.json", llm_generation.get("trace_after_revision", {}))
+    _write_json(target / "llm_summary.json", llm_generation.get("summary", {}))
 
 
 def _write_csv(path: Path, rows: Any) -> None:

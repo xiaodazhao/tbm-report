@@ -110,4 +110,6 @@ class DailyReportResult(BaseModel):
     forward_attention_cells: list[dict[str, Any]] = Field(default_factory=list)
     local_background_cells: list[dict[str, Any]] = Field(default_factory=list)
     method_metrics: dict[str, Any] = Field(default_factory=dict)
+    generation_mode: str = "template"
+    llm_generation: dict[str, Any] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
