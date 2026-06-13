@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from coupling.grs_rai_grci import build_construction_state_cells, compute_cell_grci, high_grci_cells
 from llm.evidence_pack import build_prompt_evidence_pack
+from llm.report_trace_builder import build_report_trace
 from llm.report_grounding_checker import _get_key_cells
 import pipeline.daily_report_pipeline as daily_pipeline
 import routes.report as report_routes
@@ -48,7 +49,38 @@ def test_evidence_pack_exposes_key_cells_for_grounding_checker():
     geology_evidence = pack["geology_evidence"]
     assert len(geology_evidence["key_cells"]) > 0
     assert geology_evidence["key_cells"] == geology_evidence["selected_cells"]
+    assert geology_evidence["excavated_review_cells"]
+    assert "forward_attention_cells" in geology_evidence
+    assert "background_context_cells" in geology_evidence
+    assert pack["excavated_review_evidence"]["review_cells"]
+    assert "forward_attention_cells" in pack["forward_attention_evidence"]
+    assert "background_context_cells" in pack["background_context_evidence"]
     assert len(_get_key_cells({}, {}, pack)) > 0
+
+
+def test_report_trace_preserves_semantic_support_type():
+    trace = build_report_trace(
+        "cell_0_10：GRCI复核优先级为 medium。",
+        grounding_result={
+            "claim_results": [
+                {
+                    "claim_id": "claim_1",
+                    "claim_text": "cell_0_10：GRCI复核优先级为 medium。",
+                    "claim_type": "coupling",
+                    "grounded": True,
+                    "support_type": "coupling_context",
+                    "trace_support_type": "coupling_review_support",
+                    "messages": ["找到可支撑的结构化证据。"],
+                }
+            ],
+            "warnings": [],
+        },
+    )
+
+    assert trace["traced_claims"]
+    claim = trace["traced_claims"][0]
+    assert claim["support_type"] == "coupling_context"
+    assert claim["trace_support_type"] == "coupling_review_support"
 
 
 def test_compute_cell_grci_requires_plc_response_and_rai():

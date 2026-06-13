@@ -87,7 +87,7 @@ TSP、HSP、掌子面素描和其他地质资料在当前系统中都被视为�
 
 - `GRS_geo_base`：cell 级地质证据关注度。
 - `RAI`：cell 级施工响应异常度。
-- `GRCI`：已掘 cell 中地质证据关注度与施工响应异常度的耦合关注度。
+- `GRCI`：已掘 cell 中地质证据关注度与施工响应异常度的共现复核关注度，用于复核优先级排序，不直接表达因果。
 
 重要限制：
 
@@ -110,8 +110,15 @@ Evidence Pack 包含：
 - 地质证据；
 - 前方关注证据；
 - 已掘区段耦合复核证据；
+- 背景地质 context cell；
 - source trace；
 - generation constraints。
+
+Evidence Pack 内部会区分三类 cell：
+
+- `excavated_review_evidence.review_cells`：已掘复核 cell，可用于 GRCI 复核说明；
+- `forward_attention_evidence.forward_attention_cells`：前方关注 cell，只能用于提示/关注说明，不使用 GRCI；
+- `background_context_evidence.background_context_cells`：背景 context cell，只能作为地质背景支撑。
 
 ## 8. Quality / Trace 的作用
 
@@ -123,7 +130,7 @@ Quality 检查报告是否满足：
 - 没有把前方提示写成已发生事实；
 - claim 尽量能被 Evidence Pack 支撑。
 
-Trace 将报告中的 claim 连接到 Evidence Pack 和 source trace，用于人工复核和后续论文实验导出。
+Trace 将报告中的 claim 连接到 Evidence Pack 和 source trace，用于人工复核和后续论文实验导出。Trace 中的 `support_type` 表示 grounding checker 命中的原始支撑来源，`trace_support_type` 进一步说明该支撑是统计支撑、预测证据支撑、现场观察支撑、前方提示支撑，还是已掘区段复核支撑。
 
 ## 9. 当前方法不做什么
 

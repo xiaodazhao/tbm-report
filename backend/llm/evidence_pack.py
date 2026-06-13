@@ -28,13 +28,28 @@ def build_prompt_evidence_pack(
     warnings: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build the sole evidence pack used for report prompting and trace."""
-    selected_cells = _select_pack_cells(construction_state_cells)
+    excavated_review_cells = _select_excavated_review_cells(construction_state_cells, high_grci_cells)
     forward_attention_cells = _select_forward_attention_cells(construction_state_cells)
+    background_context_cells = _select_background_context_cells(
+        construction_state_cells,
+        excluded_ids={
+            *(cell.cell_id for cell in excavated_review_cells),
+            *(cell.cell_id for cell in forward_attention_cells),
+        },
+    )
+    selected_cells = _merge_cells(
+        excavated_review_cells,
+        forward_attention_cells,
+        background_context_cells,
+    )
     selected_ids = {cell.cell_id for cell in selected_cells}
     for cell in construction_state_cells:
         cell.used_in_evidence_pack = cell.cell_id in selected_ids
 
     key_cells = [_cell_for_pack(cell) for cell in selected_cells]
+    excavated_pack_cells = [_cell_for_pack(cell) for cell in excavated_review_cells]
+    forward_pack_cells = [_cell_for_forward_pack(cell) for cell in forward_attention_cells]
+    background_pack_cells = [_cell_for_pack(cell) for cell in background_context_cells]
     return {
         "schema_version": "prompt_evidence_pack_v1",
         "report_scope": {
@@ -49,16 +64,33 @@ def build_prompt_evidence_pack(
         "geology_evidence": {
             "key_cells": key_cells,
             "selected_cells": key_cells,
+            "excavated_review_cells": excavated_pack_cells,
+            "forward_attention_cells": forward_pack_cells,
+            "background_context_cells": background_pack_cells,
+        },
+        "excavated_review_evidence": {
+            "high_grci_cells": high_grci_cells,
+            "review_cells": excavated_pack_cells,
+            "note": "These cells are excavated-today review cells. GRCI is a review-priority/co-attention index, not a disaster probability or causal proof.",
         },
         "forward_evidence": {
             **(forward_profile if isinstance(forward_profile, dict) else {"profile": forward_profile}),
-            "forward_attention_cells": [
-                _cell_for_forward_pack(cell) for cell in forward_attention_cells
-            ],
+            "forward_attention_cells": forward_pack_cells,
+            "note": "Forward evidence is an attention/indication profile and does not use GRCI.",
+        },
+        "forward_attention_evidence": {
+            "forward_profile": forward_profile if isinstance(forward_profile, dict) else {"profile": forward_profile},
+            "forward_attention_cells": forward_pack_cells,
+            "note": "Forward attention cells are not excavated review cells and must not be described as occurred facts.",
+        },
+        "background_context_evidence": {
+            "background_context_cells": background_pack_cells,
+            "note": "Background cells provide geological context only; they are not today's high GRCI review cells.",
         },
         "coupling_evidence": {
             "high_grci_cells": high_grci_cells,
-            "note": "GRCI is a coupling attention index, not a probability.",
+            "review_priority_cells": high_grci_cells,
+            "note": "GRCI is a geo-response co-attention review-priority index, not a probability, risk forecast, or causal diagnosis.",
         },
         "quality_evidence": quality_evidence or {},
         "source_trace": _collect_source_trace(selected_cells),
@@ -75,8 +107,10 @@ def render_evidence_pack_text(pack: dict[str, Any]) -> str:
     cluster = pack.get("cluster_evidence") or {}
     geology_evidence = pack.get("geology_evidence") or {}
     selected_cells = geology_evidence.get("key_cells") or geology_evidence.get("selected_cells", [])
-    high_grci = (pack.get("coupling_evidence") or {}).get("high_grci_cells", [])
+    excavated_review = pack.get("excavated_review_evidence") or {}
+    high_grci = excavated_review.get("high_grci_cells") or (pack.get("coupling_evidence") or {}).get("high_grci_cells", [])
     forward = pack.get("forward_evidence") or {}
+    background = pack.get("background_context_evidence") or {}
 
     lines = [
         "# Prompt Evidence Pack",
@@ -101,33 +135,49 @@ def render_evidence_pack_text(pack: dict[str, Any]) -> str:
             f"exceed_event_count_total={gas.get('exceed_event_count_total')}"
         ),
         "",
-        "## High GRCI Cells",
+        "## Excavated Review Evidence",
     ]
     if high_grci:
         for cell in high_grci[:8]:
             lines.append(
                 f"- {cell.get('cell_id')} GRS={cell.get('GRS_geo_base')} RAI={cell.get('RAI')} "
-                f"GRCI={cell.get('GRCI')} hazards={cell.get('main_hazards')} "
+                f"GRCI={cell.get('GRCI')} review_level={cell.get('coupling_level')} hazards={cell.get('main_hazards')} "
                 f"evidence={cell.get('supporting_evidence_ids')}"
             )
     else:
         lines.append("- none")
 
-    lines.extend(["", "## Selected Geology/Response Cells"])
-    for cell in selected_cells[:12]:
+    lines.extend(["", "## Forward Attention Evidence"])
+    forward_cells = forward.get("forward_attention_cells") if isinstance(forward, dict) else []
+    for cell in (forward_cells or [])[:8]:
         lines.append(
             f"- {cell.get('cell_id')} center={cell.get('cell_center')} GRS={cell.get('GRS_geo_base')} "
-            f"RAI={cell.get('RAI')} GRCI={cell.get('GRCI')} hazards={cell.get('main_hazards')} "
-            f"forward={cell.get('is_forward_cell')} excavated_today={cell.get('is_excavated_today')}"
+            f"hazards={cell.get('main_hazards')} forward={cell.get('is_forward_cell')} "
+            "GRCI=not_applicable"
         )
 
-    lines.extend(["", "## Forward Evidence"])
+    lines.extend(["", "## Forward Profile"])
     profile = forward.get("profile") if isinstance(forward, dict) else None
     if profile:
         for item in profile[:5]:
             lines.append(f"- {item}")
     else:
         lines.append(str(forward)[:1200])
+
+    lines.extend(["", "## Background Context Cells"])
+    for cell in (background.get("background_context_cells") or [])[:8]:
+        lines.append(
+            f"- {cell.get('cell_id')} center={cell.get('cell_center')} GRS={cell.get('GRS_geo_base')} "
+            f"hazards={cell.get('main_hazards')} background_only=True"
+        )
+
+    lines.extend(["", "## Compatibility Key Cells"])
+    for cell in selected_cells[:12]:
+        lines.append(
+            f"- {cell.get('cell_id')} center={cell.get('cell_center')} GRS={cell.get('GRS_geo_base')} "
+            f"RAI={cell.get('RAI')} GRCI={cell.get('GRCI')} hazards={cell.get('main_hazards')} "
+            f"forward={cell.get('is_forward_cell')} excavated_today={cell.get('is_excavated_today')}"
+        )
 
     lines.extend(["", "## Generation Constraints"])
     for item in pack.get("generation_constraints", []):
@@ -142,7 +192,10 @@ def build_template_report(pack: dict[str, Any]) -> str:
     operation = (pack.get("operation_evidence") or {}).get("operation_mode_summary", {})
     cluster = pack.get("cluster_evidence") or {}
     gas = (pack.get("gas_evidence") or {}).get("exceed_summary", {})
-    high_grci = (pack.get("coupling_evidence") or {}).get("high_grci_cells", [])
+    high_grci = (
+        (pack.get("excavated_review_evidence") or {}).get("high_grci_cells")
+        or (pack.get("coupling_evidence") or {}).get("high_grci_cells", [])
+    )
     forward = pack.get("forward_evidence") or {}
     forward_cells = forward.get("forward_attention_cells", []) if isinstance(forward, dict) else []
     profile = forward.get("profile", []) if isinstance(forward, dict) else []
@@ -156,7 +209,7 @@ def build_template_report(pack: dict[str, Any]) -> str:
             f"本日报基于 {date} 的 PLC 日运行数据、online 可用地质证据、"
             f"cell 级 GRS/RAI/GRCI 和 source_trace 生成。"
         ),
-        f"本日已形成 {len(high_grci)} 个可用的已开挖区段 GRCI 关注 cell；GRCI 仅用于已开挖区段复核。",
+        f"本日已形成 {len(high_grci)} 个可用的已开挖区段 GRCI 复核优先 cell；GRCI 仅用于已开挖区段复核排序。",
         f"前方关注提示来自 forward_profile，共 {len(profile)} 个前方窗口，仅用于提示和复核。",
         "",
         "## 2. 总体施工运行概况（今日施工运行概况）",
@@ -178,17 +231,17 @@ def build_template_report(pack: dict[str, Any]) -> str:
         "该结果只描述当日 PLC 参数状态分组。",
         "",
         "## 5. 当前掌子面描述",
-        "当前掌子面描述只作为空间定位，不把前方证据写成已揭露事实。",
+        "当前掌子面描述只作为空间定位；如无当日可用掌子面素描，不把前方证据写成已揭露事实。",
         "",
         "## 6. 已开挖区段地质与响应异常复核",
     ]
     if high_grci:
         for cell in high_grci[:5]:
             lines.append(
-                f"- {cell.get('cell_id')}：GRCI等级为 {cell.get('coupling_level')}，"
+                f"- {cell.get('cell_id')}：GRCI复核优先级为 {cell.get('coupling_level')}，"
                 f"GRCI值约 {_format_score(cell.get('GRCI'))}；"
                 f"主要地质关注标签为 {_join_items(cell.get('main_hazards'))}。"
-                "该 cell 同时具备 GRS、RAI 和当日 PLC response，GRCI 只表示地质-施工响应耦合关注度。"
+                "该 cell 同时具备 GRS、RAI 和当日 PLC response，GRCI 只表示地质证据与施工响应的共现复核关注度。"
             )
     else:
         lines.append("Evidence Pack 中未形成可用的已开挖区段 high_grci_cells。")
@@ -202,7 +255,7 @@ def build_template_report(pack: dict[str, Any]) -> str:
                 f"涉及气体为 {_join_items(gas.get('exceed_gases'))}。"
             ),
             "",
-            "## 8. 前方风险提示（当前掌子面前方关注提示）",
+            "## 8. 前方关注提示（当前掌子面前方地质关注提示）",
             _forward_text(forward),
             f"forward_attention_cells 数量为 {len(forward_cells)}；这些 cell 使用 GRS_geo_base、main_hazards 和 source_trace，不进入 high_grci_cells。",
             "",
@@ -234,6 +287,64 @@ def _select_pack_cells(cells: list[ConstructionStateCell]) -> list[ConstructionS
             continue
         out.append(cell)
         seen.add(cell.cell_id)
+    return out
+
+
+def _select_excavated_review_cells(
+    cells: list[ConstructionStateCell],
+    high_grci_cells: list[dict[str, Any]],
+) -> list[ConstructionStateCell]:
+    high_ids = [str(cell.get("cell_id")) for cell in high_grci_cells if isinstance(cell, dict)]
+    by_id = {cell.cell_id: cell for cell in cells}
+    out = [by_id[cell_id] for cell_id in high_ids if cell_id in by_id]
+    if out:
+        return out
+    return sorted(
+        [
+            cell for cell in cells
+            if cell.GRCI_available
+            and cell.GRCI is not None
+            and cell.is_excavated_today
+            and not cell.is_forward_cell
+        ],
+        key=lambda cell: cell.GRCI or 0.0,
+        reverse=True,
+    )[:10]
+
+
+def _select_background_context_cells(
+    cells: list[ConstructionStateCell],
+    *,
+    excluded_ids: set[str],
+    limit: int = 8,
+) -> list[ConstructionStateCell]:
+    candidates = [
+        cell for cell in cells
+        if cell.cell_id not in excluded_ids
+        and not cell.is_excavated_today
+        and not cell.is_forward_cell
+        and cell.has_geology_evidence
+    ]
+    return sorted(
+        candidates,
+        key=lambda cell: (
+            cell.GRS_geo_base or 0.0,
+            len(cell.supporting_evidence_ids),
+            cell.cell_center or 0.0,
+        ),
+        reverse=True,
+    )[: max(limit, 0)]
+
+
+def _merge_cells(*groups: list[ConstructionStateCell]) -> list[ConstructionStateCell]:
+    out: list[ConstructionStateCell] = []
+    seen: set[str] = set()
+    for group in groups:
+        for cell in group:
+            if cell.cell_id in seen:
+                continue
+            out.append(cell)
+            seen.add(cell.cell_id)
     return out
 
 

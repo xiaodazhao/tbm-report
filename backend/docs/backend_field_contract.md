@@ -106,6 +106,13 @@ routes.report
 - grounding checker 读取时优先使用 `key_cells`，缺失时 fallback 到 `selected_cells`。
 - 后续如果所有调用方都切换到 `key_cells`，可以删除 `selected_cells`。
 
+### cell 语义分层契约
+
+- `excavated_review_evidence.review_cells`：已掘区段复核 cell，优先来自 `high_grci_cells`，要求 GRCI 可用，不能包含 forward cell。
+- `forward_attention_evidence.forward_attention_cells`：当前掌子面前方关注 cell，只使用 `GRS_geo_base`、`main_hazards`、`source_trace`，不使用 GRCI。
+- `background_context_evidence.background_context_cells`：用于报告地质背景的补充 cell，不应写成当日高 GRCI 复核结论。
+- `geology_evidence.key_cells` 会合并以上三类 cell，作为兼容的统一 key cell 列表；报告和 trace 应优先根据具体语义字段解释结论。
+
 ## 4. Quality / Trace 字段
 
 | 字段 | 含义 |
@@ -117,6 +124,8 @@ routes.report
 | `unsupported_claim_count` | 未找到结构化证据支撑的 claim 数量。 |
 | `trace_coverage` | trace 中可追溯 claim 的覆盖率。 |
 | `report_trace` | claim 与 Evidence Pack / source trace 的匹配结果。 |
+| `support_type` | grounding checker 的原始支撑来源类型，例如 `key_cell`、`forward_segment`、`coupling_context`。 |
+| `trace_support_type` | 面向解释的语义支撑类型，例如 `forecast_support`、`observed_support`、`statistical_support`、`forward_attention_support`、`coupling_review_support`。 |
 
 ## 5. `/api/tbm/report` 返回字段
 

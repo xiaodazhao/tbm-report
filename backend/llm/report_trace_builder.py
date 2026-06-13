@@ -196,6 +196,43 @@ def _filter_claims_for_trace(claims: list[Any], max_claims: int) -> tuple[list[d
     return filtered, excluded_count
 
 
+def _infer_trace_support_type(item: dict[str, Any], traces: list[dict[str, Any]]) -> str:
+    """Infer a semantic trace support type when grounding output is older."""
+    explicit = _safe_text(item.get("trace_support_type"))
+    if explicit:
+        return explicit
+
+    support_type = _safe_text(item.get("support_type"))
+    if support_type in {"operation_context", "cluster_context", "gas_context"}:
+        return "statistical_support"
+    if support_type == "coupling_context":
+        return "coupling_review_support"
+    if support_type == "forward_segment":
+        return "forward_attention_support"
+    if support_type == "recommendation_policy":
+        return "policy_support"
+
+    roles = {
+        _safe_text(trace.get("evidence_role")).lower()
+        for trace in traces
+        if isinstance(trace, dict)
+    }
+    source_types = {
+        _safe_text(trace.get("source_type")).lower()
+        for trace in traces
+        if isinstance(trace, dict)
+    }
+    if "observed" in roles or source_types.intersection({"face_sketch", "sketch"}):
+        return "observed_support"
+    if "prediction" in roles or source_types.intersection({"tsp", "hsp"}):
+        return "forecast_support"
+    if "interpreted" in roles:
+        return "interpreted_support"
+    if support_type == "key_cell":
+        return "cell_evidence_support"
+    return support_type or "none"
+
+
 def build_report_trace(
     report_text: str,
     claims: list[dict] | None = None,
@@ -269,6 +306,8 @@ def build_report_trace(
                     "claim_text": _safe_text(item.get("claim_text")),
                     "claim_type": _safe_text(item.get("claim_type")),
                     "grounded": bool(item.get("grounded")),
+                    "support_type": _safe_text(item.get("support_type")) or None,
+                    "trace_support_type": _infer_trace_support_type(item, traces),
                     "supporting_evidence_ids": _as_list(item.get("supporting_evidence_ids")),
                     "source_trace": traces,
                     "support_note": "; ".join(

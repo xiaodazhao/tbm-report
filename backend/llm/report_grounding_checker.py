@@ -539,6 +539,7 @@ def _build_claim_result(claim: dict[str, Any]) -> dict[str, Any]:
         "claim_text": _safe_text(claim.get("text")),
         "grounded": False,
         "support_type": "none",
+        "trace_support_type": "none",
         "supporting_evidence_ids": [],
         "source_trace": [],
         "messages": [],
@@ -556,6 +557,7 @@ def _mark_grounded(
 ) -> None:
     result["grounded"] = True
     result["support_type"] = support_type
+    result["trace_support_type"] = _trace_support_type(support_type, traces)
     result["severity"] = "ok"
 
     traces = traces or []
@@ -574,6 +576,43 @@ def _mark_grounded(
     if support_type in {"key_cell", "forward_segment"} and not result["source_trace"]:
         result["messages"].append(f"{support_type} 已命中，但 source_trace 为空。")
         result["severity"] = "warning"
+
+
+def _trace_support_type(
+    support_type: str,
+    traces: list[dict[str, Any]] | None = None,
+) -> str:
+    """Return a semantic support label for report trace explanation."""
+    traces = traces or []
+    roles = {
+        _safe_text(item.get("evidence_role")).lower()
+        for item in traces
+        if isinstance(item, dict)
+    }
+    source_types = {
+        _safe_text(item.get("source_type")).lower()
+        for item in traces
+        if isinstance(item, dict)
+    }
+
+    if support_type in {"operation_context", "cluster_context", "gas_context"}:
+        return "statistical_support"
+    if support_type == "coupling_context":
+        return "coupling_review_support"
+    if support_type == "forward_segment":
+        return "forward_attention_support"
+    if support_type == "recommendation_policy":
+        return "policy_support"
+
+    if "observed" in roles or source_types.intersection({"face_sketch", "sketch"}):
+        return "observed_support"
+    if "prediction" in roles or source_types.intersection({"tsp", "hsp"}):
+        return "forecast_support"
+    if "interpreted" in roles:
+        return "interpreted_support"
+    if support_type == "key_cell":
+        return "cell_evidence_support"
+    return support_type or "none"
 
 
 def check_claim_grounding(
@@ -898,6 +937,14 @@ def check_claim_grounding(
 
             if result["grounded"] and not result["messages"]:
                 result["messages"].append("找到可支撑的结构化证据。")
+
+            if result["grounded"]:
+                result["trace_support_type"] = _trace_support_type(
+                    result.get("support_type", "none"),
+                    _as_list(result.get("source_trace")),
+                )
+            else:
+                result["trace_support_type"] = "none"
 
             claim_results.append(result)
 

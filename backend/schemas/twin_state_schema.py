@@ -38,6 +38,22 @@ CONTEXT_PATHS = {
         ("prompt_evidence_pack", PROMPT_EVIDENCE_SECTIONS["geology"], "key_cells"),
         ("prompt_evidence_pack", PROMPT_EVIDENCE_SECTIONS["geology"], "selected_cells"),
     ],
+    "excavated_review_cells": [
+        ("prompt_evidence_pack", "excavated_review_evidence", "review_cells"),
+        ("prompt_evidence_pack", "excavated_review_evidence", "high_grci_cells"),
+        ("prompt_evidence_pack", PROMPT_EVIDENCE_SECTIONS["geology"], "excavated_review_cells"),
+        ("prompt_evidence_pack", PROMPT_EVIDENCE_SECTIONS["coupling"], "review_priority_cells"),
+        ("prompt_evidence_pack", PROMPT_EVIDENCE_SECTIONS["coupling"], "high_grci_cells"),
+    ],
+    "forward_attention_cells": [
+        ("prompt_evidence_pack", "forward_attention_evidence", "forward_attention_cells"),
+        ("prompt_evidence_pack", PROMPT_EVIDENCE_SECTIONS["forward"], "forward_attention_cells"),
+        ("prompt_evidence_pack", PROMPT_EVIDENCE_SECTIONS["geology"], "forward_attention_cells"),
+    ],
+    "background_context_cells": [
+        ("prompt_evidence_pack", "background_context_evidence", "background_context_cells"),
+        ("prompt_evidence_pack", PROMPT_EVIDENCE_SECTIONS["geology"], "background_context_cells"),
+    ],
     "forward_segments": [
         ("twin_state", TWIN_STATE_SECTIONS["forward"], "segments"),
         ("twin_state", TWIN_STATE_SECTIONS["forward"], "forward_segments"),
