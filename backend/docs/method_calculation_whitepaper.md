@@ -4,6 +4,18 @@
 
 本文只描述当前代码真实执行逻辑，不描述理想设计，不补写论文实验，不把尚未实现的算法写成已经实现的能力。
 
+## 文档导航
+
+- [当前后端系统说明书](current_backend_system_manual.md)：总流程、API、真实数据流案例。
+- [后端字段契约](backend_field_contract.md)：API、核心 schema 与 debug 输出字段。
+- [方法定义文档](method_definition.md)：任务定义、方法边界与核心对象解释。
+- [指标定义文档](metrics_definition.md)：GRS、RAI、GRCI、Quality、Trace 指标解释。
+- [系统边界声明](scope_and_limitations.md)：当前系统不做什么。
+- [2023-12-30 案例说明](case_2023-12-30.md)：典型日期说明案例。
+- [附录 A：字段反向索引](#附录-a字段反向索引)：按字段查来源、计算、下游用途。
+- [附录 B：配置常量总表](#附录-b配置常量总表)：按常量查位置、取值和影响。
+- [附录 C：导出字段完整性检查](#附录-c导出字段完整性检查)：检查当前 export 是否足够复盘。
+
 ## 0. 当前方法定位
 
 当前后端不是一个地质灾害概率预测系统，也不是一个 TSP/HSP 原始信号反演系统，更不是一个 TBM 物理仿真数字孪生系统。它当前做的是：
@@ -1991,4 +2003,731 @@ GRCI 不是前方风险；
 没有 RAI 不计算正式 GRCI；
 前方提示不能写成已发生事实；
 TSP/HSP 只能作为超前预报证据，不能被写成现场揭露事实。
+```
+
+## 附录 A：字段反向索引
+
+本附录用于从字段反查来源、计算方法、可空条件、下游用途和报告/Trace 关系。表中的“进入报告/Trace”表示该字段可能直接进入 Evidence Pack、报告模板或 trace 支撑；不是说它一定逐字出现在报告正文中。
+
+### A.1 PLC / cell_response_df 字段
+
+主要产生函数：
+
+```text
+plc/cell_response.py::project_plc_response_to_cells
+plc/response.py::analyze_plc_response
+analysis/dataprocess.py::annotate_operation_mode
+```
+
+| 字段名 | 所属对象/文件 | 产生函数 | 输入来源 | 计算/赋值方法 | 可为空情况 | 下游使用位置 | 是否进入报告/Trace | 方法含义与注意事项 |
+|---|---|---|---|---|---|---|---|---|
+| `cell_id` | `cell_response_df` / `ConstructionStateCell` | `project_plc_response_to_cells` | PLC 里程列 | `cell_{cell_start}_{cell_end}` | 缺少里程时整表为空 | cell 合并、Evidence Pack、debug | 是 | 10m cell 主键 |
+| `cell_start` | 同上 | 同上 | PLC 里程列 | `floor(chainage/cell_length)*cell_length` | 缺少里程时为空表 | 空间判断、GRCI、forward | 是 | cell 起点 |
+| `cell_end` | 同上 | 同上 | `cell_start` | `cell_start + cell_length` | 缺少里程时为空表 | 空间判断、GRCI、forward | 是 | cell 终点 |
+| `cell_center` | 同上 | 同上 | `cell_start`, `cell_end` | `(cell_start + cell_end)/2` | 缺少里程时为空表 | 地质投影、forward、debug | 是 | cell 中心里程 |
+| `sample_count` | `cell_response_df` / `plc_metrics` | `project_plc_response_to_cells` | PLC 行 | cell 内记录数 | 无 PLC 命中时无该 cell response | `plc_metrics` | debug 为主 | 反映 cell 内 PLC 样本量 |
+| `duration_sec` | `cell_response_df` | `project_plc_response_to_cells` | 时间列 | cell 内 row duration 求和 | 无时间时每行按 1s 兜底；无 PLC 命中为空 | `duration_min`, `plc_metrics` | debug 为主 | cell 施工记录持续秒数 |
+| `duration_min` | `plc_metrics` | `build_construction_state_cells` | `duration_sec` | `duration_sec/60` 或直接从 response 记录换算 | 无 PLC response 时为空 | Evidence Pack/debug | 可进入 debug | cell 施工记录持续分钟 |
+| `operation_state` | `cell_response_df` / `ConstructionStateCell` | `project_plc_response_to_cells` | operation flags | work/stop/abnormal/transition 按持续时间主导状态 | 无 PLC response 时为空 | Evidence Pack、报告工况说明 | 可进入报告 | cell 内主导工况 |
+| `work_duration_sec` | `cell_response_df` | `project_plc_response_to_cells` | `is_working` + duration | working 行 duration 求和 | 无 PLC response 时为空 | `plc_metrics` | debug 为主 | 稳定掘进时长 |
+| `work_duration_min` | `plc_metrics` | `build_construction_state_cells` | `work_duration_sec` | 秒转分钟 | 无 PLC response 时为空 | Evidence Pack/debug | debug 为主 | 稳定掘进分钟 |
+| `stop_duration_sec` | `cell_response_df` | `project_plc_response_to_cells` | `is_stopped` + duration | stopped 行 duration 求和 | 无 PLC response 时为空 | `stop_ratio` | debug 为主 | 停机时长 |
+| `stop_duration_min` | `ConstructionStateCell` | `build_construction_state_cells` | `cell_response_df` | 秒转分钟或 response 字段读取 | 无 PLC response 时为空 | Evidence Pack/debug | 可进入报告 | 停机高不一定代表地质异常，可能包含组织停机或计划停机 |
+| `abnormal_duration_sec` | `cell_response_df` | `project_plc_response_to_cells` | `is_abnormal` + duration | abnormal 行 duration 求和 | 无 PLC response 时为空 | `abnormal_ratio` | debug 为主 | 异常扭矩等响应时长 |
+| `abnormal_duration_min` | `plc_metrics` | `build_construction_state_cells` | `abnormal_duration_sec` | 秒转分钟 | 无 PLC response 时为空 | Evidence Pack/debug | debug 为主 | 异常响应分钟 |
+| `speed_mean` | `cell_response_df` / `ConstructionStateCell` | `project_plc_response_to_cells` | 推进速度列 | cell 内均值 | 缺字段或全空时为空 | RAI 分量、debug | 可进入 debug | 推进速度均值 |
+| `speed_std` | `cell_response_df` | 同上 | 推进速度列 | cell 内标准差 | 缺字段或样本不足为空/0 | `speed_volatility_score` | debug 为主 | 速度波动来源 |
+| `thrust_mean` | `ConstructionStateCell` | 同上 | 推力列 | cell 内均值 | 缺字段或全空时为空 | debug/Evidence Pack | 可进入 debug | 推力均值 |
+| `thrust_std` | `cell_response_df` | 同上 | 推力列 | cell 内标准差 | 缺字段或样本不足为空/0 | debug | debug 为主 | 当前不直接进入 RAI 公式 |
+| `torque_mean` | `ConstructionStateCell` | 同上 | 刀盘扭矩列 | cell 内均值 | 缺字段或全空时为空 | debug/Evidence Pack | 可进入 debug | 扭矩均值 |
+| `torque_std` | `cell_response_df` | 同上 | 刀盘扭矩列 | cell 内标准差 | 缺字段或样本不足为空/0 | `torque_volatility_score` | debug 为主 | 扭矩波动来源 |
+| `rpm_mean` | `cell_response_df` | 同上 | 刀盘转速列 | cell 内均值 | 缺字段或全空时为空 | debug | debug 为主 | 转速均值，当前不直接进入 RAI |
+| `rpm_std` | `cell_response_df` | 同上 | 刀盘转速列 | cell 内标准差 | 缺字段或样本不足为空/0 | debug | debug 为主 | 转速波动，当前不直接进入 RAI |
+| `stop_ratio` | `cell_response_df` / `plc_metrics` | `project_plc_response_to_cells` | `stop_duration_sec`, `duration_sec` | `stop_duration_sec/duration_sec` | duration 为 0 或无 PLC response 时为空/0 | RAI | 间接进入报告 | 停机占比；不是异常原因判定 |
+| `abnormal_ratio` | 同上 | 同上 | `abnormal_duration_sec`, `duration_sec` | `abnormal_duration_sec/duration_sec` | duration 为 0 或无 PLC response 时为空/0 | RAI | 间接进入报告 | 异常响应占比 |
+| `speed_drop_score` | `cell_response_df` / `plc_metrics` | `project_plc_response_to_cells` | `speed_mean`, 当日速度分布 | `clip01(1-speed_mean/max(global_speed_q75,1e-6))` | 速度缺失时兜底 | RAI | 间接进入报告 | 使用当日推进速度 75% 分位数作参照 |
+| `torque_volatility_score` | 同上 | 同上 | `torque_std`, `torque_mean` | `clip01(torque_std/max(abs(torque_mean),1.0))` | 扭矩缺失时为 0 或空 | RAI | 间接进入报告 | 扭矩波动启发式分量 |
+| `speed_volatility_score` | 同上 | 同上 | `speed_std`, `speed_mean` | `clip01(speed_std/max(abs(speed_mean),1.0))` | 速度缺失时为 0 或空 | RAI | 间接进入报告 | 速度波动启发式分量 |
+| `abnormal_score` | `cell_response_df` / `ConstructionStateCell` | `project_plc_response_to_cells` | RAI 分量 | `0.40*stop_ratio+0.25*abnormal_ratio+0.20*speed_drop_score+0.10*torque_volatility_score+0.05*speed_volatility_score` | 无 PLC response 时为空 | `RAI`, Evidence Pack | 可进入报告 | 工程启发式异常分 |
+| `RAI` | `cell_response_df` / `ConstructionStateCell` | `project_plc_response_to_cells` | `abnormal_score` | `RAI=abnormal_score` | 无 PLC response 时为空 | GRCI、Evidence Pack、已掘复核章节 | 是 | 施工响应异常度，不是灾害概率 |
+| `response_support_count` | `cell_response_df` | `project_plc_response_to_cells` | PLC 行 | cell 内样本数 | 无 PLC response 时为空 | debug、可信度辅助 | debug 为主 | PLC response 支撑样本数 |
+| `response_metrics` | `cell_response_df` / `plc_metrics` | `project_plc_response_to_cells`, `build_construction_state_cells` | 聚合分量 | dict/JSON 形式保存 RAI 分量 | 无 PLC response 时为空 | debug、导出复盘 | debug 为主 | 当前 CSV 中以 `plc_metrics` 字段承载 |
+
+### A.2 地质 normalized_evidence_df 字段
+
+主要产生函数：
+
+```text
+geology_v2/evidence_normalizer.py::normalize_evidence_df
+geology_v2/evidence_normalizer.py::filter_available_evidence
+geology_v2/evidence_dedup.py::deduplicate_hsp_anomaly_points
+```
+
+| 字段名 | 所属对象/文件 | 产生函数 | 输入来源 | 计算/赋值方法 | 可为空情况 | 下游使用位置 | 是否进入报告/Trace | 方法含义与注意事项 |
+|---|---|---|---|---|---|---|---|---|
+| `evidence_id` | `normalized_evidence_df` | `normalize_evidence_df` | evidence_db | 原始 ID 或标准化生成 | 理论上不应为空 | source_trace、supporting ids | 是 | 证据唯一标识 |
+| `report_id` | 同上 | 同上 | evidence_db | 原始报告 ID | 旧数据可能为空 | dedup、source_trace | 是 | 报告来源标识 |
+| `source_type` | 同上 | 同上 | 原始 source | 原始来源类型 | 可为空 | 标准化前参考 | debug 为主 | 原始来源，不作为主逻辑字段 |
+| `source_type_norm` | 同上 | 同上 | `source_type` | alias 映射为 TSP/HSP/face_sketch 等 | unknown 兜底 | 投影、融合、Trace | 是 | 区分证据来源类型 |
+| `evidence_role` | 同上 | 同上 | `source_type_norm` | SOURCE_ROLE_MAP 映射 | unknown/background 兜底 | online 过滤、Trace 支撑类型 | 是 | prediction/observed/interpreted/background |
+| `spatial_type` | 同上 | 同上 | 原始字段/attrs | point/anomaly_point/segment/overview 等 | unknown 兜底 | 投影距离、sigma | 是 | 证据空间形态 |
+| `report_date` | 同上 | 同上 | evidence_db/attrs | 日期解析 | 旧数据可空 | online 过滤 | debug/Trace | 报告日期 |
+| `issue_date` | 同上 | 同上 | evidence_db/attrs | 日期解析 | 可空 | online 过滤 | debug/Trace | 形成/签发日期 |
+| `available_date` | 同上 | 同上 | evidence_db/attrs | 当前代码若存在则保留 | 可空 | 可用性参考 | debug 为主 | 不是当前主要过滤字段 |
+| `start_num` | 原始 evidence 字段 | 输入保留 | evidence_db | 原始起点里程 | 可空 | 标准化里程 | debug 为主 | 原始数值 |
+| `end_num` | 原始 evidence 字段 | 输入保留 | evidence_db | 原始终点里程 | 可空 | 标准化里程 | debug 为主 | 原始数值 |
+| `face_num` | 原始 evidence 字段 | 输入保留 | evidence_db | 原始掌子面里程 | 可空 | `face_chainage` | debug 为主 | 可用性判断候选 |
+| `start_chainage` | `normalized_evidence_df` | `normalize_evidence_df` | `start_num/end_num/attrs` | 数值化并保证 start <= end | 点证据或缺里程时可空 | 投影、source_trace | 是 | 标准化起点 |
+| `end_chainage` | 同上 | 同上 | 同上 | 数值化并保证 start <= end | 可空 | 投影、source_trace | 是 | 标准化终点 |
+| `center_chainage` | 同上 | 同上 | start/end/face | 区间中点或点里程 | 缺里程时可空 | 投影、过滤 | 是 | 证据中心 |
+| `face_chainage` | 同上 | 同上 | face_num/attrs/report_id/raw_text | 优先原始 face 字段，缺失时从文本桩号兜底 | 可空；forecast_like 缺失会被 online 排除 | online 过滤 | debug/Trace | 防未来信息泄漏关键字段 |
+| `grade` | 同上 | 同上 | attrs_json | support_grade/grade 等归一 | 可空 | GRS grade component | 是 | 围岩等级关注来源 |
+| `lithology` | 同上 | 同上 | attrs_json/raw | 文本或属性解析 | 可空 | source_trace | 可进入 Trace | 岩性描述 |
+| `weathering` | 同上 | 同上 | attrs_json/raw | 文本或属性解析 | 可空 | hazard/trace | 可进入 Trace | 风化描述 |
+| `joint_development` | 同上 | 同上 | attrs_json/raw | 文本或属性解析 | 可空 | hazard_tags | 可进入 Trace | 裂隙发育信息 |
+| `rock_mass_state` | 同上 | 同上 | attrs_json/raw | 文本或属性解析 | 可空 | hazard_tags | 可进入 Trace | 围岩完整性 |
+| `stability` | 同上 | 同上 | attrs_json/raw | 文本或属性解析 | 可空 | hazard_tags | 可进入 Trace | 稳定性描述 |
+| `water_flag` | 同上 | 同上 | attrs_json | 兼容 0/1 flag | 缺失填 0 | hazard_scores | 间接进入报告 | 0 只表示非 positive，不等于明确无水 |
+| `water_state` | 同上 | 同上 | attrs_json | positive/negative/unknown | 可 unknown | 冲突检测 | debug/Trace | 三态水信息 |
+| `collapse_flag` | 同上 | 同上 | attrs_json/HSP anomaly | 兼容 0/1 flag | 缺失填 0 | hazard_scores | 间接进入报告 | 0 不等于明确无掉块 |
+| `collapse_state` | 同上 | 同上 | attrs_json/HSP anomaly | positive/negative/unknown | 可 unknown | 冲突检测 | debug/Trace | 三态掉块信息 |
+| `deformation_flag` | 同上 | 同上 | attrs_json | 兼容 0/1 flag | 缺失填 0 | hazard_scores | 间接进入报告 | 0 不等于明确无变形 |
+| `deformation_state` | 同上 | 同上 | attrs_json | positive/negative/unknown | 可 unknown | 冲突检测 | debug/Trace | 三态变形信息 |
+| `hazard_tags` | 同上 | 同上 | attrs/raw/parser | 标准 hazard tag 列表 | 可为空 | hazard_scores、报告 | 是 | prediction 中表示预报提示，不等于已发生事实 |
+| `attribute_tags` | 同上 | 同上 | attrs/raw/parser | 属性标签列表 | 可为空 | debug/Trace | 可进入 Trace | 辅助描述 |
+| `method_tags` | 同上 | 同上 | attrs/raw/parser | 方法标签列表 | 可为空 | debug/Trace | 可进入 Trace | 证据方法来源 |
+| `unknown_hazard_tags` | 同上 | 同上 | attrs/raw/parser | 未识别 hazard 标签 | 可为空 | debug | debug 为主 | 解析不确定项 |
+| `confidence` | 同上 | 同上 | attrs_json | 原始/解析置信度 | 可空 | evidence_strength | debug 为主 | 来源置信，不是准确率 |
+| `source_reliability` | 同上 | 同上 | config | SOURCE_RELIABILITY 映射 | unknown 兜底 | effective_weight | 间接进入报告 | 来源权重，不是真实概率 |
+| `evidence_strength` | 同上 | 同上 | config + attrs | source/spatial/confidence 综合 | unknown 兜底 | effective_weight | 间接进入报告 | 证据强度权重 |
+| `raw_text` | 同上 | 输入保留 | evidence_db | 原始文本 | 可空 | source_trace excerpt | 是 | 报告追溯文本片段 |
+| `attrs_json` | 同上 | 输入保留/解析 | evidence_db | JSON 属性 | 解析失败为空 dict | 标准化字段来源 | debug 为主 | 原始结构化属性 |
+| `parse_warnings` | 同上 | 标准化/去重 | parser/normalizer | 解析不确定性列表 | 可为空 | debug/质量解释 | 可进入 debug | 记录解析不确定性 |
+
+### A.3 cell_evidence_df 字段
+
+产生函数：
+
+```text
+geology_v2/evidence_projector.py::project_evidence_to_cells
+geology_v2/fusion_engine.py::fuse_geo_states
+```
+
+| 字段名 | 所属对象/文件 | 产生函数 | 输入来源 | 计算/赋值方法 | 可为空情况 | 下游使用位置 | 是否进入报告/Trace | 方法含义与注意事项 |
+|---|---|---|---|---|---|---|---|---|
+| `cell_id` | `cell_evidence_df` | `project_evidence_to_cells` | `cells_df` | 投影命中的 cell | 无投影则无记录 | geo fusion | 间接进入 Trace | cell-evidence 关系键 |
+| `evidence_id` | 同上 | 同上 | normalized evidence | 投影命中的证据 | 无投影则无记录 | geo fusion/source_trace | 是 | 支撑证据 ID |
+| `source_type_norm` | 同上 | 同上 | normalized evidence | 直接带入 | 可 unknown | sigma、fusion | 是 | 来源类型 |
+| `evidence_role` | 当前投影表未必直接导出 | merge 后来自 normalized evidence | normalized evidence | 当前 `cell_evidence_df` 主输出未必包含，fusion merge 后可用 | 可空 | Trace 支撑类型 | 是 | prediction/observed 等角色 |
+| `spatial_type` | `cell_evidence_df` | `project_evidence_to_cells` | normalized evidence | 直接带入 | unknown 兜底 | sigma、distance | 是 | 空间形态 |
+| `distance_m` | `cell_evidence_df` | `project_evidence_to_cells` | cell center 与 evidence 里程 | 点证据取中心距离；区间证据取到区间距离 | 里程缺失时无投影 | spatial_weight | debug/间接 | 空间距离 |
+| `sigma_m` | 当前主输出未保留该字段 | `get_spatial_sigma` 内部计算 | config | 用于 spatial_weight，当前导出未包含独立列 | 当前 export 未包含 | 权重计算内部 | 否 | 建议后续 export 可补充 |
+| `spatial_weight` | `cell_evidence_df` | `project_evidence_to_cells` | `distance_m`, `sigma_m` | `exp(-0.5*(distance_m/sigma_m)^2)` | 无投影则无记录 | effective_weight | 间接 | 空间衰减权重 |
+| `source_reliability` | `cell_evidence_df` | 同上 | normalized evidence | `clip01(source_reliability)` | unknown 兜底 | effective_weight | 间接 | 来源权重 |
+| `evidence_strength` | `cell_evidence_df` | 同上 | normalized evidence | `clip01(evidence_strength)` | unknown 兜底 | effective_weight | 间接 | 证据强度 |
+| `effective_weight` | `cell_evidence_df` | 同上 | 三个分量 | `spatial_weight*clip01(source_reliability)*clip01(evidence_strength)` | 无投影则无记录 | geo fusion | 间接 | 原始 evidence-cell 有效权重 |
+| `effective_weight_capped` | fusion 内部字段 | `fusion_engine::_cap_duplicate_effective_weights` | `effective_weight` | 重复组截断后权重 | 当前原始投影输出不包含；fusion 内部存在 | geo fusion | 间接 | 不是原始投影字段，当前 export 未直接落盘 |
+
+### A.4 geo_states_df 字段
+
+产生函数：
+
+```text
+geology_v2/fusion_engine.py::fuse_geo_states
+```
+
+| 字段名 | 所属对象/文件 | 产生函数 | 输入来源 | 计算/赋值方法 | 可为空情况 | 下游使用位置 | 是否进入报告/Trace | 方法含义与注意事项 |
+|---|---|---|---|---|---|---|---|---|
+| `cell_id` | `geo_states_df` | `fuse_geo_states` | cells_df | 直接带入 | cells 缺失时为空表 | ConstructionStateCell | 是 | 地质 cell 主键 |
+| `cell_start` | 同上 | 同上 | cells_df | 直接带入 | 同上 | 空间判断 | 是 | cell 起点 |
+| `cell_end` | 同上 | 同上 | cells_df | 直接带入 | 同上 | 空间判断 | 是 | cell 终点 |
+| `cell_center` | 同上 | 同上 | cells_df | 直接带入 | 同上 | forward_profile | 是 | cell 中心 |
+| `has_geology_evidence` | 同上 | 同上 | cell_evidence_df | 有有效投影证据为 true | 无投影为 false | GRCI 可用性 | 是 | 是否有地质证据 |
+| `fused_grade` | 同上 | 同上 | evidence grade | 支持度最高且保守取较差等级 | 无证据时空 | Evidence Pack | 是 | 融合围岩等级 |
+| `grade_distribution` | 同上 | 同上 | evidence grade + weight | 按等级汇总支持度/share | 无证据时空 dict | debug/GRS | debug 为主 | 等级支持分布 |
+| `hazard_scores` | 同上 | 同上 | hazard_tags + flags | hazard weight + Noisy-OR 合并 | 无证据时空 dict | GRS、Evidence Pack | 是 | hazard 关注分，不是灾害概率 |
+| `main_hazards` | 同上 | 同上 | `hazard_scores` | 分数 >0.05 的前 5 个 | 无证据时空 | 报告/Trace | 是 | 关注标签，不等于已发生灾害 |
+| `water_score` | 同上 | 同上 | hazard_scores | max(water, water_inrush) | 无证据为 0 | debug | 间接 | 水相关关注 |
+| `collapse_score` | 同上 | 同上 | hazard_scores | max(collapse, block_fall) | 无证据为 0 | debug | 间接 | 掉块/坍塌相关关注 |
+| `deformation_score` | 同上 | 同上 | hazard_scores | deformation 分数 | 无证据为 0 | debug | 间接 | 变形关注 |
+| `source_support` | 同上 | 同上 | evidence source + weight | 按来源汇总支持 | 无证据为空 | debug | debug 为主 | 来源支持结构 |
+| `source_type_count` | 同上 | 同上 | source_type_norm | 去重来源数量 | 无证据为 0 | confidence | debug | 多源数量 |
+| `evidence_count` | 同上 | 同上 | evidence_id | 去重证据数量 | 无证据为 0 | confidence | debug | 支撑证据数 |
+| `confidence_score` | 同上 | 同上 | weight/evidence/source/conflict | `weight_factor*evidence_factor*source_factor*conflict_penalty` | 无证据为 0 | GRS、Evidence Pack | 是 | 融合置信度，不是准确率 |
+| `uncertainty_level` | 同上 | 同上 | confidence/conflict | max(1-confidence, conflict) 分级 | 无证据可 unknown | Evidence Pack | 是 | 不确定性等级 |
+| `conflict_level` | 同上 | 同上 | grade/state conflict | conflict_score 分级 | 无冲突为 none | Evidence Pack | 是 | 多源冲突等级 |
+| `conflict_reasons` | 同上 | 同上 | conflict 检测 | 文本原因列表 | 可空 | debug | debug 为主 | 冲突原因 |
+| `supporting_evidence_ids` | 同上 | 同上 | cell_evidence_df | 去重 evidence_id | 无证据为空 | Evidence Pack/Trace | 是 | 支撑证据 ID |
+| `source_trace` | 同上 | 同上 | normalized evidence | evidence_id/source/role/excerpt | 无证据为空 | Trace | 是 | 报告追溯基础 |
+| `grade_score_component` | 同上 | `_grs_geo_base_components` | `fused_grade` | grade attention score | 无证据为 0 | GRS 复盘 | 当前 export 未直接保留在 ConstructionStateCell | GRS 组件 |
+| `hazard_component` | 同上 | 同上 | hazard_scores | `0.75*max + 0.25*avg` | 无证据为 0 | GRS 复盘 | 当前 export 未直接保留在 ConstructionStateCell | GRS 组件 |
+| `confidence_component` | 同上 | 同上 | confidence_score | `clip01(confidence_score)` | 无证据为 0 | GRS 复盘 | 当前 export 未直接保留在 ConstructionStateCell | GRS 组件 |
+| `GRS_formula_text` | 同上 | 同上 | 固定公式 | 文本常量 | 无证据为空 | debug | 当前 export 未直接保留 | GRS 公式说明 |
+| `GRS_component_method` | 同上 | 同上 | 固定字符串 | `direct_from_fusion_engine` 或 `empty` | 无证据为 empty | debug | 当前 export 未直接保留 | 组件来源 |
+| `GRS_geo_base` | 同上 / `ConstructionStateCell` | 同上 | 三个组件 | `0.45*grade+0.45*hazard+0.10*confidence` | 无证据为 0 或空 | GRCI、forward、Evidence Pack | 是 | 地质证据关注度，不是灾害概率 |
+
+### A.5 ConstructionStateCell 字段
+
+定义与构建：
+
+```text
+schemas/pipeline.py
+coupling/grs_rai_grci.py::build_construction_state_cells
+coupling/grs_rai_grci.py::compute_cell_grci
+```
+
+| 字段名 | 所属对象/文件 | 产生函数 | 输入来源 | 计算/赋值方法 | 可为空情况 | 下游使用位置 | 是否进入报告/Trace | 方法含义与注意事项 |
+|---|---|---|---|---|---|---|---|---|
+| `cell_id` | `ConstructionStateCell` | `build_construction_state_cells` | cells/response/geo | 合并键 | 不应为空 | 全链路 | 是 | 核心对象 ID |
+| `cell_start` | 同上 | 同上 | cells/response/geo | 合并带入 | 不应为空 | 空间状态 | 是 | cell 起点 |
+| `cell_end` | 同上 | 同上 | cells/response/geo | 合并带入 | 不应为空 | 空间状态 | 是 | cell 终点 |
+| `cell_center` | 同上 | 同上 | cells/response/geo | 合并带入 | 不应为空 | forward/profile | 是 | cell 中心 |
+| `has_plc_response` | 同上 | 同上 | cell_response_df | 是否有 response row | false 合法 | GRCI 可用性 | 是 | 控制 GRCI 是否可用 |
+| `has_geology_evidence` | 同上 | 同上 | geo_states_df | 是否有地质证据 | false 合法 | GRCI 可用性 | 是 | 控制地质支撑 |
+| `is_excavated_today` | 同上 | 同上 | day_start/day_end | cell 与当日推进范围是否重叠 | false 合法 | high_grci 筛选 | 是 | 控制已掘复核 |
+| `is_current_face_cell` | 同上 | 同上 | current_chainage | `cell_start <= current < cell_end` | false 合法 | debug/forward 边界 | 是 | 当前掌子面所在 cell |
+| `is_forward_cell` | 同上 | 同上 | current/lookahead | `cell_start >= current_chainage` 且在前方窗口 | false 合法 | forward_attention | 是 | 控制前方关注通道 |
+| `operation_state` | 同上 | 同上 | cell_response_df | 主导工况 | 无 PLC response 为空 | Evidence Pack | 可进入报告 | PLC cell 工况 |
+| `plc_metrics` | 同上 | 同上 | cell_response_df | 聚合指标 dict | 无 PLC response 为空 | debug/RAI 复盘 | debug 为主 | RAI 分量主要在此 |
+| `speed_mean` | 同上 | 同上 | cell_response_df | 均值带入 | 缺字段/无 response 为空 | debug | debug 为主 | 速度均值 |
+| `thrust_mean` | 同上 | 同上 | cell_response_df | 均值带入 | 缺字段/无 response 为空 | debug | debug 为主 | 推力均值 |
+| `torque_mean` | 同上 | 同上 | cell_response_df | 均值带入 | 缺字段/无 response 为空 | debug | debug 为主 | 扭矩均值 |
+| `stop_duration_min` | 同上 | 同上 | cell_response_df | 秒转分钟 | 无 response 为空 | Evidence Pack | 可进入报告 | 停机时长 |
+| `abnormal_score` | 同上 | 同上 | cell_response_df | response abnormal_score | 无 response 为空 | RAI/GRCI | 是 | 施工响应异常分 |
+| `RAI` | 同上 | 同上 | cell_response_df | `RAI=abnormal_score` | 无 response 为空 | GRCI/Evidence Pack | 是 | 施工响应异常度 |
+| `fused_grade` | 同上 | 同上 | geo_states_df | 融合等级 | 无地质证据为空 | Evidence Pack | 是 | 地质等级 |
+| `main_hazards` | 同上 | 同上 | geo_states_df | hazard_scores 排序 | 无地质证据为空 | Report/Trace | 是 | 关注标签 |
+| `hazard_scores` | 同上 | 同上 | geo_states_df | hazard 分数 dict | 无地质证据为空 | GRS 解释 | 是 | 地质关注分量 |
+| `confidence_score` | 同上 | 同上 | geo_states_df | 置信分 | 无证据为 0/空 | Evidence Pack | 是 | 融合置信度 |
+| `uncertainty_level` | 同上 | 同上 | geo_states_df | 不确定性等级 | 可 unknown | Evidence Pack | 是 | 证据不确定性 |
+| `conflict_level` | 同上 | 同上 | geo_states_df | 冲突等级 | 可 none | Evidence Pack | 是 | 多源冲突 |
+| `GRS_geo_base` | 同上 | 同上 | geo_states_df | GRS 带入 | 无证据为 0/空 | GRCI/forward | 是 | 地质证据关注度 |
+| `supporting_evidence_ids` | 同上 | 同上 | geo_states_df | evidence ids | 无证据为空 | Trace | 是 | 支撑证据 |
+| `source_trace` | 同上 | 同上 | normalized evidence | 来源追溯列表 | 无证据为空 | Trace | 是 | 报告可追溯基础 |
+| `GRCI` | 同上 | `compute_cell_grci` | GRS + RAI | 公式计算 | 缺 GRS/RAI/PLC 时 None | high_grci/report | 是 | 已掘复核关注度 |
+| `GRCI_available` | 同上 | 同上 | GRCI 可用条件 | bool | false 合法 | high_grci 筛选 | 是 | false 通常不是错误 |
+| `GRCI_source` | 同上 | 同上 | 计算状态 | `cell_grs_rai_formula_v1` 或 `unavailable` | 不应空 | debug/Trace | 是 | GRCI 来源 |
+| `GRCI_unavailable_reason` | 同上 | 同上 | 可用性判断 | `missing_plc_response` / `missing_geology_evidence` | 可为 null | debug | 是 | 解释不可用原因 |
+| `coupling_level` | 同上 | `classify_grci` | GRCI | high/medium/low/none/unavailable | 不应空 | 报告复核章节 | 是 | 复核优先级，不是风险等级 |
+| `coupling_explanation` | 同上 | `build_construction_state_cells` | GRS/RAI/GRCI/hazards | 文本解释 | 可为空但不建议 | 报告/debug | 是 | 耦合解释或不可用解释 |
+| `trace_refs` | 同上 | 同上 | supporting_evidence_ids | 证据 ID 列表 | 无证据为空 | Trace/debug | 是 | 快速追溯引用 |
+
+### A.6 Evidence Pack 字段
+
+产生函数：
+
+```text
+llm/evidence_pack.py::build_prompt_evidence_pack
+```
+
+| 字段名 | 所属对象/文件 | 产生函数 | 输入来源 | 计算/赋值方法 | 可为空情况 | 下游使用位置 | 是否进入报告/Trace | 方法含义与注意事项 |
+|---|---|---|---|---|---|---|---|---|
+| `report_scope` | Evidence Pack | `build_prompt_evidence_pack` | date/current_chainage | 运行范围摘要 | 不应空 | prompt/report | 是 | 报告范围 |
+| `operation_evidence` | Evidence Pack | 同上 | operation_summary | 直接写入 | PLC 空时可空结构 | 报告工况章节 | 是 | 事实统计 |
+| `cluster_evidence` | Evidence Pack | 同上 | cluster_summary | 直接写入 | 聚类失败时空结构 | 报告聚类章节 | 是 | 辅助施工状态 |
+| `gas_evidence` | Evidence Pack | 同上 | gas_summary | 直接写入 | 无气体字段时空结构 | 报告气体章节 | 是 | 气体监测证据 |
+| `geology_evidence` | Evidence Pack | 同上 | selected cells | 聚合 key/selected/background/forward/review | 可空 | grounding checker | 是 | 地质证据聚合 |
+| `geology_evidence.key_cells` | Evidence Pack | 同上 | review + forward + background | 正式字段 | 无地质证据时空 | Trace | 是 | Grounding 正式入口 |
+| `geology_evidence.selected_cells` | Evidence Pack | 同上 | 同 key_cells | 兼容字段 | 无地质证据时空 | fallback | 是 | 与 key_cells 当前一致 |
+| `excavated_review_evidence` | Evidence Pack | 同上 | high_grci_cells | 已掘复核分层 | 无可用 GRCI 时空 | 报告复核章节 | 是 | 正式方法解释应优先看这里 |
+| `excavated_review_evidence.review_cells` | Evidence Pack | 同上 | high_grci cells -> full cell | 复核 cell 列表 | 可空 | Trace/report | 是 | 已掘复核对象 |
+| `forward_attention_evidence` | Evidence Pack | 同上 | forward_profile + forward cells | 前方关注分层 | 无前方证据时空 | 报告前方章节 | 是 | 不使用 GRCI |
+| `forward_attention_evidence.forward_profile` | Evidence Pack | 同上 | build_forward_profile | 直接写入 | 可空结构 | 报告前方章节 | 是 | 前方窗口 |
+| `forward_attention_evidence.forward_attention_cells` | Evidence Pack | 同上 | `is_forward_cell` cells | GRS 排序选择 | 可空 | Trace/report | 是 | 前方关注 cell |
+| `background_context_evidence` | Evidence Pack | 同上 | 非已掘非前方地质 cells | GRS 排序 top context | 可空 | 背景解释 | 可进入 Trace | 不能写成当日施工异常 |
+| `background_context_evidence.background_context_cells` | Evidence Pack | 同上 | background cells | 上下文 cell 列表 | 可空 | Trace/debug | 是 | 背景上下文 |
+| `coupling_evidence` | Evidence Pack | 同上 | high_grci_cells | 耦合复核证据 | 可空 | 报告复核章节 | 是 | 已掘区段 GRCI 入口 |
+| `coupling_evidence.high_grci_cells` | Evidence Pack | 同上 | high_grci_cells | 筛选后写入 | 可空 | 报告/Trace | 是 | 只含 GRCI_available 且已掘非前方 cell |
+| `quality_evidence` | Evidence Pack | 同上 | quality context | 数据质量/警告 | 可空 | 报告边界 | 是 | 质量边界 |
+| `source_trace` | Evidence Pack | 同上 | selected cells | 跨 cell 汇总 source trace | 可空 | Trace | 是 | 追溯汇总 |
+| `generation_constraints` | Evidence Pack | 同上 | 常量 | 生成约束列表 | 不应空 | prompt/quality | 是 | policy_support 来源 |
+| `warnings` | Evidence Pack | 同上 | pipeline warnings | 直接写入 | 可空 | report/API | 是 | 运行警告 |
+
+### A.7 Quality / Trace 字段
+
+产生函数：
+
+```text
+llm/report_claim_extractor.py
+llm/report_grounding_checker.py
+llm/report_quality_checker.py
+llm/report_trace_builder.py
+```
+
+| 字段名 | 所属对象/文件 | 产生函数 | 输入来源 | 计算/赋值方法 | 可为空情况 | 下游使用位置 | 是否进入报告/Trace | 方法含义与注意事项 |
+|---|---|---|---|---|---|---|---|---|
+| `raw_claim_count` | quality/trace | claim extractor / trace builder | report_text | 原始抽取 claim 数 | 报告空时 0 | quality/trace summary | 是 | 原始候选主张数 |
+| `excluded_non_trace_claim_count` | trace/quality | trace builder | raw claims | 过滤标题、表格等非技术 claim | 可 0 | trace summary | 是 | 非追溯 claim 数 |
+| `claim_trace_count` | trace | trace builder | traced claims | trace 中 claim 总数 | 报告空时 0 | trace summary | 是 | trace claim 数 |
+| `grounded_claim_count` | quality/trace | grounding checker | claim results | grounded=true 计数 | 可 0 | quality/trace | 是 | Evidence Pack 内部支撑数 |
+| `unsupported_claim_count` | quality/trace | grounding checker | claim results | grounded=false 计数 | 可 0 | quality warning | 是 | 不一定代表业务错误，可能是标题/边界句未识别 |
+| `grounding_rate` | quality | grounding checker | grounded/claim | `grounded_claim_count/claim_count` | claim_count=0 时兜底 | quality | 是 | Evidence Pack 内部支撑率，不是事实真实率 |
+| `trace_coverage` | trace | trace builder | grounded/trace count | `grounded_claim_count/claim_trace_count` | claim_trace_count=0 时兜底 | trace summary | 是 | 追溯覆盖率 |
+| `quality_score` | quality | quality checker | violations + grounding | 规则扣分 | 报告空时低分/占位 | API/report debug | 是 | 合规与可追溯评分，不是真实正确率 |
+| `violations` | quality | quality checker | report + policy | 禁用表达/缺章节/误用规则 | 可空 | debug/API | 是 | 规则违规列表 |
+| `warnings` | quality/trace/pipeline | 多处 | 运行和检查结果 | warning 列表 | 可空 | API/report | 是 | 警告不一定失败 |
+| `trace_support_type` | trace claim | grounding checker | support source | statistical/coupling/forward 等 | unsupported 时 none | Trace | 是 | 证据角色 |
+| `support_type` | trace claim | grounding checker | support source | operation_context/key_cell 等 | unsupported 时 none | Trace | 是 | 支撑对象类型 |
+| `source_refs` | 当前 trace 未以该字段统一导出 | trace/source_trace | source_trace | 当前多使用 `source_trace` 和 `supporting_evidence_ids` | 当前字段名不统一 | 后续可优化 | 否/部分 | 当前 export 未见统一 `source_refs` |
+| `matched_evidence_ids` | 当前 trace 未以该字段统一导出 | grounding checker | matched evidence | 当前使用 `supporting_evidence_ids` | 当前字段名不同 | 后续可优化 | 否/部分 | 当前 export 未见统一 `matched_evidence_ids` |
+| `matched_cell_ids` | 当前 trace 未以该字段统一导出 | grounding checker | matched cell | 当前多通过 claim/source_trace 间接表达 | 当前字段名不同 | 后续可优化 | 否/部分 | 当前 export 未见统一 `matched_cell_ids` |
+
+## 附录 B：配置常量总表
+
+本附录列出当前方法中主要人为设定的常量、阈值和权重。它们是工程方法参数，不是物理定律；后续论文实验可围绕其中部分参数做敏感性分析，但当前文档只描述真实代码取值。
+
+### B.1 空间与 cell 配置
+
+| 配置项 | 当前值 | 所在文件/函数 | 用途 | 影响模块 | 改动后可能影响 | 方法解释 |
+|---|---|---|---|---|---|---|
+| `cell_length` | `10.0 m` | `run_daily_report_pipeline`, `build_chainage_cells`, `project_plc_response_to_cells` | 构建 10m cell | PLC response、geo_states、ConstructionStateCell | 改变 cell 数量、GRCI 对齐粒度 | 当前 ConstructionStateCell 空间粒度 |
+| `lookahead_m` | `30.0 m` | `run_daily_report_pipeline`, `build_forward_profile` | 前方关注范围 | forward_profile | 改变前方窗口数量和范围 | 当前前方关注窗口 |
+| `step_m` | `10.0 m` | `build_forward_profile` | 前方 profile 分段 | forward_profile | 改变 0-10/10-20/20-30 分段 | 与 cell_length 对齐 |
+| `advance_direction` | `1` | pipeline/geology filter/forward | 掘进方向 | online filter、forward | 影响未来证据判断和前方窗口方向 | 当前按里程增大方向 |
+| `chainage_tolerance_m` | `1.0 m` | `filter_available_evidence` | online 过滤容差 | 地质可用性 | 影响未来证据排除严格程度 | 避免小里程误差被当作泄漏 |
+| `projection_radius` | `max(3*sigma_m,1.0)` | `project_evidence_to_cells` | evidence 投影半径 | cell_evidence_df | 改变证据影响范围 | 方法参数，不是物理边界 |
+
+### B.2 PLC / RAI 配置
+
+| 配置项 | 当前值 | 所在文件/函数 | 用途 | 影响模块 | 改动后可能影响 | 方法解释 |
+|---|---|---|---|---|---|---|
+| 非零阈值 | `1e-8` | `analysis/dataprocess.py::_judge_condition` | 判断推力/速度/扭矩是否非零 | 工况识别 | 影响 stop/work/transition/abnormal | 工程数值容差 |
+| 时间差有效范围 | `0 < diff_seconds < 3600` | `infer_sample_interval_sec`, `_infer_row_duration_seconds` | 排除异常时间差 | 工况分段、cell duration | 影响持续时间和 ratio | 采样间隔清洗 |
+| KMeans `n_clusters` | `3` | `detect_excavation_state` | 施工状态聚类数 | cluster_summary | 改变聚类标签数量 | 辅助描述，不参与 GRCI |
+| KMeans `random_state` | `0` | `detect_excavation_state` | 聚类可复现 | cluster_summary | 改变可复现性 | 固定随机种子 |
+| KMeans `n_init` | `"auto"` | `detect_excavation_state` | KMeans 初始化 | cluster_summary | 可能影响聚类稳定性 | sklearn 参数 |
+| cluster valid sample threshold | `30` | `build_cluster_context` | 聚类质量判断 | cluster_summary | 改变 `is_stable_enough` | 工程阈值 |
+| cluster min ratio threshold | `0.03` | `build_cluster_context` | 最小簇占比 | cluster_summary | 改变聚类质量 warning | 工程阈值 |
+| RAI stop weight | `0.40` | `project_plc_response_to_cells` | RAI 分量 | RAI/GRCI | 停机占比影响变大/小 | 启发式权重 |
+| RAI abnormal weight | `0.25` | 同上 | RAI 分量 | RAI/GRCI | 异常段影响变大/小 | 启发式权重 |
+| RAI speed drop weight | `0.20` | 同上 | RAI 分量 | RAI/GRCI | 速度下降影响变大/小 | 启发式权重 |
+| RAI torque volatility weight | `0.10` | 同上 | RAI 分量 | RAI/GRCI | 扭矩波动影响变大/小 | 启发式权重 |
+| RAI speed volatility weight | `0.05` | 同上 | RAI 分量 | RAI/GRCI | 速度波动影响变大/小 | 启发式权重 |
+| `global_speed_q75` | 当日速度 75% 分位数 | `project_plc_response_to_cells` | `speed_drop_score` 参照 | RAI | 改变速度下降分 | 当日内部参照 |
+| `clip01` | `[0,1]` 裁剪 | 多处 | 分数边界 | RAI/GRS/GRCI | 防止异常值越界 | 数值稳定 |
+
+RAI 当前完整公式：
+
+```text
+RAI =
+  0.40 * stop_ratio
++ 0.25 * abnormal_ratio
++ 0.20 * speed_drop_score
++ 0.10 * torque_volatility_score
++ 0.05 * speed_volatility_score
+```
+
+这些是工程启发式权重，不是标定后的物理模型。
+
+### B.3 气体阈值配置
+
+| 配置项 | 当前值 | 所在文件/函数 | 用途 | 影响模块 | 改动后可能影响 | 方法解释 |
+|---|---|---|---|---|---|---|
+| `CO2检测` | `0.5 %` | `analysis/gas_analysis.py::THRESHOLDS` | CO2 超阈统计 | gas_summary | 改变 CO2 exceed | 仅对浓度字段解释 |
+| `H2S检测` | `10 ppm` | 同上 | H2S 超阈统计 | gas_summary | 改变 H2S exceed | 同上 |
+| `SO2检测` | `2 ppm` | 同上 | SO2 超阈统计 | gas_summary | 改变 SO2 exceed | 同上 |
+| `NO2检测` | `5 ppm` | 同上 | NO2 超阈统计 | gas_summary | 改变 NO2 exceed | 同上 |
+| `NO检测` | `20 ppm` | 同上 | NO 超阈统计 | gas_summary | 改变 NO exceed | 同上 |
+| `CH4检测` | `0.5 %` | 同上 | CH4 超阈统计 | gas_summary | 改变 CH4 exceed | 同上 |
+
+如果字段被质量诊断判定为 `alarm_flag`，则不应直接套浓度阈值解释。
+
+### B.4 地质 source reliability 配置
+
+| 配置项 | 当前值 | 所在文件/函数 | 用途 | 影响模块 | 改动后可能影响 | 方法解释 |
+|---|---|---|---|---|---|---|
+| `face_sketch` | `1.20` | `geology_v2/config.py::SOURCE_RELIABILITY` | 来源权重 | effective_weight | 提高/降低素描影响 | 配置可超过 1，但投影时 clip |
+| `borehole` | `1.15` | 同上 | 来源权重 | effective_weight | 改变钻孔影响 | 同上 |
+| `TSP` | `0.95` | 同上 | 来源权重 | effective_weight | 改变 TSP 影响 | 不是真实概率 |
+| `HSP` | `0.90` | 同上 | 来源权重 | effective_weight | 改变 HSP 影响 | 不是真实概率 |
+| `report_conclusion` | `1.00` | 同上 | 来源权重 | effective_weight | 改变结论段影响 | 不是真实概率 |
+| `overview` | `0.35` | 同上 | 背景权重 | background/context | 改变背景证据影响 | 背景低权重 |
+| `unknown` | `0.60` | 同上 | 兜底权重 | evidence projection | 改变未知来源影响 | 保守兜底 |
+
+### B.5 evidence_strength 配置
+
+| 配置项 | 当前值 | 所在文件/函数 | 用途 | 影响模块 | 改动后可能影响 | 方法解释 |
+|---|---|---|---|---|---|---|
+| `point` | `1.10` | `SPATIAL_TYPE_STRENGTH` | 点状证据强度 | effective_weight | 改变点证据影响 | 投影时 clip |
+| `anomaly_point` | `1.20` | 同上 | 异常点强度 | effective_weight | 改变异常点影响 | 投影时 clip |
+| `segment` | `1.00` | 同上 | 区间证据强度 | effective_weight | 改变区间证据影响 | 标准强度 |
+| `overview` | `0.35` | 同上 | 概览证据强度 | context | 改变概览影响 | 背景低权重 |
+| `background` | `0.30` | 同上 | 背景证据强度 | context | 改变背景影响 | 背景低权重 |
+| `unknown` | `0.70` | 同上 | 兜底空间强度 | effective_weight | 改变未知空间证据影响 | 保守兜底 |
+| confidence high | `1.15` | `CONFIDENCE_WEIGHT` | 高置信证据 | evidence_strength | 改变高置信权重 | 投影时 clip |
+| confidence medium | `1.00` | 同上 | 中置信证据 | evidence_strength | 标准权重 | 标准 |
+| confidence low | `0.80` | 同上 | 低置信证据 | evidence_strength | 降低影响 | 保守 |
+| confidence unknown | `0.75` | 同上 | 未知置信 | evidence_strength | 降低影响 | 保守 |
+
+### B.6 spatial sigma 配置
+
+| 配置项 | 当前值 | 所在文件/函数 | 用途 | 影响模块 | 改动后可能影响 | 方法解释 |
+|---|---|---|---|---|---|---|
+| `face_sketch + point` | `5` | `get_spatial_sigma` | 空间衰减 | evidence projection | 改变素描点影响范围 | sigma 越大影响越宽 |
+| `borehole + point` | `4` | 同上 | 空间衰减 | evidence projection | 改变钻孔点影响范围 | 点证据较局部 |
+| `HSP + segment` | `12` | 同上 | 空间衰减 | evidence projection | 改变 HSP 区间影响 | 超前预报区间 |
+| `HSP + anomaly_point` | `4` | 同上 | 空间衰减 | evidence projection | 改变异常点影响范围 | 异常点局部 |
+| `TSP + segment` | `15` | 同上 | 空间衰减 | evidence projection | 改变 TSP 区间影响 | TSP 影响范围较宽 |
+| `TSP + report_conclusion` | `12` | 同上 | 空间衰减 | evidence projection | 改变结论段影响 | 结论段 |
+| `overview/background` | `30` | 同上 | 背景衰减 | context | 改变背景覆盖 | 当前强投影不保留 overview/background |
+
+### B.7 grade attention score 配置
+
+| 配置项 | 当前值 | 所在文件/函数 | 用途 | 影响模块 | 改动后可能影响 | 方法解释 |
+|---|---|---|---|---|---|---|
+| `I` / `Ⅰ` / `1` | `0.05` | `GRADE_ATTENTION_SCORE` | GRS grade component | GRS | 改变好围岩关注分 | 不是灾害概率 |
+| `II` / `Ⅱ` / `2` | `0.20` | 同上 | 同上 | GRS | 同上 | 同上 |
+| `III` / `Ⅲ` / `3` | `0.40` | 同上 | 同上 | GRS | 同上 | 同上 |
+| `IV` / `Ⅳ` / `4` | `0.70` | 同上 | 同上 | GRS | 同上 | 关注程度较高 |
+| `V` / `Ⅴ` / `5` | `1.00` | 同上 | 同上 | GRS | 同上 | 关注程度最高 |
+
+### B.8 hazard weight 配置
+
+| hazard | weight | 语义 |
+|---|---:|---|
+| `water` | 0.35 | 出水关注 |
+| `water_inrush` | 0.45 | 出水增强/突水相关关注 |
+| `collapse` | 0.40 | 坍塌相关关注 |
+| `block_fall` | 0.35 | 掉块相关关注 |
+| `deformation` | 0.30 | 变形关注 |
+| `fractured_rock` | 0.30 | 围岩破碎关注 |
+| `extremely_fractured_rock` | 0.40 | 围岩极破碎关注 |
+| `joint_development` | 0.25 | 裂隙发育关注 |
+| `dense_joints` | 0.35 | 裂隙密集关注 |
+| `weak_interlayer` | 0.30 | 软弱夹层关注 |
+| `mud_filling` | 0.30 | 泥质填充关注 |
+| `soft_hard_uneven` | 0.25 | 软硬不均关注 |
+| `reflection_anomaly` | 0.25 | 反射异常关注 |
+| `strong_reflection_anomaly` | 0.35 | 明显反射异常关注 |
+| `poor_stability` | 0.35 | 稳定性较差关注 |
+
+hazard weight 用于 `hazard_scores`。如果 hazard 来自 prediction evidence，它表示预报提示，不等于已发生灾害。
+
+### B.9 GRS 配置
+
+| 配置项 | 当前值 | 所在文件/函数 | 用途 | 影响模块 | 改动后可能影响 | 方法解释 |
+|---|---|---|---|---|---|---|
+| grade weight | `0.45` | `_grs_geo_base_components` | GRS | GRS/GRCI/forward | 改变围岩等级影响 | 地质关注度权重 |
+| hazard weight | `0.45` | 同上 | GRS | GRS/GRCI/forward | 改变 hazard 影响 | 地质关注度权重 |
+| confidence weight | `0.10` | 同上 | GRS | GRS/GRCI/forward | 改变置信度影响 | 地质关注度权重 |
+| hazard max weight | `0.75` | 同上 | hazard_component | GRS | 改变主控 hazard 影响 | 主控关注 |
+| hazard average weight | `0.25` | 同上 | hazard_component | GRS | 改变多 hazard 叠加影响 | 多灾种叠加 |
+
+公式：
+
+```text
+hazard_component = 0.75 * max(hazard_scores) + 0.25 * average(hazard_scores)
+GRS_geo_base = 0.45 * grade_score_component + 0.45 * hazard_component + 0.10 * confidence_component
+```
+
+`GRS_geo_base` 是地质证据关注度，不是地质风险概率。
+
+### B.10 GRCI 配置
+
+| 配置项 | 当前值 | 所在文件/函数 | 用途 | 影响模块 | 改动后可能影响 | 方法解释 |
+|---|---|---|---|---|---|---|
+| GRS weight | `0.55` | `compute_cell_grci` | GRCI | high_grci | 改变地质关注影响 | 复核关注权重 |
+| RAI weight | `0.35` | 同上 | GRCI | high_grci | 改变施工响应影响 | 复核关注权重 |
+| interaction weight | `0.10` | 同上 | GRCI | high_grci | 改变共现增强 | GRS 与 RAI 交互 |
+| high threshold | `>=0.75` | `classify_grci` | coupling_level | report | 改变 high 数量 | 复核优先级 |
+| medium threshold | `>=0.50` | 同上 | coupling_level | report | 改变 medium 数量 | 复核优先级 |
+| low threshold | `>=0.25` | 同上 | coupling_level | report | 改变 low 数量 | 复核优先级 |
+| none threshold | `<0.25` | 同上 | coupling_level | report | 改变 none 数量 | 复核优先级 |
+
+公式：
+
+```text
+GRCI = 0.55 * GRS + 0.35 * RAI + 0.10 * GRS * RAI
+```
+
+`coupling_level` 在文档和报告中应解释为复核优先级，不是风险等级。
+
+### B.11 forward attention 配置
+
+| 配置项 | 当前值 | 所在文件/函数 | 用途 | 影响模块 | 改动后可能影响 | 方法解释 |
+|---|---|---|---|---|---|---|
+| forward score | `max(GRS_geo_base in window)` | `build_forward_profile` | 前方关注分数 | forward_profile | 改变窗口代表值 | 只看地质证据 |
+| high threshold | `>=0.75` | `_attention_level` | attention_level | report | 改变 high 数量 | 前方关注等级 |
+| medium threshold | `>=0.50` | 同上 | attention_level | report | 改变 medium 数量 | 前方关注等级 |
+| low threshold | `>=0.25` | 同上 | attention_level | report | 改变 low 数量 | 前方关注等级 |
+| none threshold | `<0.25` | 同上 | attention_level | report | 改变 none 数量 | 前方关注等级 |
+
+forward attention 只使用 `GRS_geo_base` 和 `source_trace`，不使用 `RAI` / `GRCI`。
+
+### B.12 Quality / Trace 配置
+
+| 配置项 | 当前值 | 所在文件/函数 | 用途 | 影响模块 | 改动后可能影响 | 方法解释 |
+|---|---|---|---|---|---|---|
+| `forbidden_error` | `15` | `report_policy.py`, `report_quality_checker.py` | 禁用表达扣分 | quality_score | 改变违规扣分 | 规则评分 |
+| `warning` | `5` | 同上 | warning 扣分 | quality_score | 改变 warning 扣分 | 规则评分 |
+| `missing_section` | `3` | 同上 | 缺章节扣分 | quality_score | 改变章节完整性扣分 | 规则评分 |
+| `unsupported_claim` | `8` | policy 配置 | unsupported 权重 | quality/grounding | 当前代码不一定逐条按 8 扣分，应以 checker 实际逻辑为准 | 配置项，不等同实际逐条扣分 |
+| `low_grounding_rate` | `10` | quality checker | 低 grounding 扣分 | quality_score | 改变低支撑率惩罚 | 规则评分 |
+| required sections | policy 中定义 | `report_policy.py` | 章节完整性检查 | quality | 改变缺章节判断 | 报告结构约束 |
+| forbidden expressions | policy 中定义 | `report_policy.py` | 禁用表达检查 | quality | 改变误用检测 | 禁止概率化/事实化误写 |
+| GRCI probability misuse | regex/rules | quality + grounding | 防止 GRCI 写成概率 | quality/trace | 改变误用敏感度 | 方法边界 |
+| forward-as-fact rules | regex/rules | quality + grounding | 防止前方提示写成已发生 | quality/trace | 改变误用敏感度 | 方法边界 |
+| gas misuse rules | regex/rules | quality + grounding | 防止报警量/浓度误写 | quality/trace | 改变气体误用检测 | 数据语义边界 |
+
+`quality_score` 是规则评分，不是事实真实性评分。
+
+## 附录 C：导出字段完整性检查
+
+本附录基于当前导出目录检查：
+
+```text
+backend/outputs/pipeline_exports/2023-12-30/
+backend/outputs/pipeline_exports/2023-12-28/
+```
+
+检查结论只描述当前导出，不等同于代码内部是否存在该字段。部分字段在中间 DataFrame 中存在，但当前 export 未单独落盘。
+
+### C.1 文件存在性检查表
+
+| 文件名 | 2023-12-30 是否存在 | 2023-12-28 是否存在 | 内容用途 | 是否足够复盘 |
+|---|---|---|---|---|
+| `report.txt` | 是 | 是 | 模板日报正文 | 足够复盘报告文本 |
+| `prompt.txt` | 是 | 是 | LLM prompt / no-LLM prompt | 足够复盘输入提示 |
+| `evidence_pack.json` | 是 | 是 | 报告证据包 | 足够复盘报告证据分层 |
+| `quality.json` | 是 | 是 | 报告质量检查 | 足够复盘 quality |
+| `trace.json` | 是 | 是 | claim trace | 足够复盘主要 trace |
+| `construction_state_cells.json` | 是 | 是 | 核心 cell 对象 | 足够复盘 GRCI，部分 RAI/GRS 组件需看嵌套或缺失 |
+| `construction_state_cells.csv` | 是 | 是 | 核心 cell 表格 | 足够浏览核心字段，不足以完全展开嵌套 dict |
+| `forward_profile.json` | 是 | 是 | 前方关注 profile | 足够复盘前方关注 |
+| `high_grci_cells.json` | 是 | 是 | high GRCI cell | 足够复盘已掘复核 cell |
+| `warnings.json` | 是 | 是 | pipeline warnings | 足够复盘警告 |
+| `summary.json` | 是 | 是 | 核心摘要指标 | 足够快速概览，不足以论文级完整指标 |
+| `method_metrics.json` | 否 | 否 | 统一方法指标 | 当前未导出 |
+| `cell_response_df.csv` | 否 | 否 | PLC response 原始 cell 表 | 当前未导出 |
+| `geo_states_df.csv` | 否 | 否 | 地质融合 cell 表 | 当前未导出 |
+| `cell_evidence_df.csv` | 否 | 否 | evidence-cell 投影关系 | 当前未导出 |
+
+### C.2 RAI 组件导出检查
+
+| 字段 | construction_state_cells.csv | construction_state_cells.json | evidence_pack.json | 其他文件 | 是否可用于公式复盘 | 结论 |
+|---|---|---|---|---|---|---|
+| `stop_ratio` | 间接在 `plc_metrics` JSON 字符串中 | 是，`plc_metrics.stop_ratio` | 部分 cell 可能保留在 cell payload | 无 `cell_response_df.csv` | 是，但需解析嵌套 | 可复盘 |
+| `abnormal_ratio` | 间接在 `plc_metrics` | 是 | 部分 | 无 | 是，但需解析嵌套 | 可复盘 |
+| `speed_drop_score` | 间接在 `plc_metrics` | 是 | 部分 | 无 | 是，但需解析嵌套 | 可复盘 |
+| `torque_volatility_score` | 间接在 `plc_metrics` | 是 | 部分 | 无 | 是，但需解析嵌套 | 可复盘 |
+| `speed_volatility_score` | 间接在 `plc_metrics` | 是 | 部分 | 无 | 是，但需解析嵌套 | 可复盘 |
+| `abnormal_score` | 是 | 是 | 是 | high_grci_cells 间接 | 是 | 可复盘 |
+| `RAI` | 是 | 是 | 是 | high_grci_cells.json | 是 | 可复盘 |
+
+判断：
+
+```text
+当前 export 足以复盘 RAI，但不够舒服。
+RAI 分量在 construction_state_cells.json 的 plc_metrics 中可查；
+CSV 中是嵌套 JSON 字符串，不如单独 cell_response_df.csv 清晰。
+建议后续小改 export：增加 cell_response_df.csv，或把 RAI components 平铺到 construction_state_cells.csv。
+```
+
+### C.3 GRS 组件导出检查
+
+| 字段 | construction_state_cells.csv | construction_state_cells.json | evidence_pack.json | 其他文件 | 是否可用于公式复盘 | 结论 |
+|---|---|---|---|---|---|---|
+| `grade_score_component` | 否 | 否 | 否 | 当前未导出 `geo_states_df.csv` | 否 | 中间 geo_states_df 内部存在，但当前 export 不足以直接复盘 |
+| `hazard_component` | 否 | 否 | 否 | 当前未导出 `geo_states_df.csv` | 否 | 同上 |
+| `confidence_component` | 否 | 否 | 否 | 当前未导出 `geo_states_df.csv` | 否 | 同上 |
+| `GRS_formula_text` | 否 | 否 | 否 | 当前未导出 `geo_states_df.csv` | 公式可由文档复盘，字段不可查 | 建议导出 |
+| `GRS_component_method` | 否 | 否 | 否 | 当前未导出 `geo_states_df.csv` | 否 | 建议导出 |
+| `GRS_geo_base` | 是 | 是 | 是 | forward/high_grci | 是，结果可查 | 可复盘结果，不能复盘完整组件 |
+| `hazard_scores` | 是 | 是 | 是 | forward_profile 部分 | 部分可复盘 | 可复盘 hazard 结构 |
+| `main_hazards` | 是 | 是 | 是 | forward/high_grci | 是 | 可复盘主要标签 |
+| `confidence_score` | 是 | 是 | 是 | forward_profile | 部分可复盘 | 可查置信分，但缺 GRS 组件字段 |
+
+判断：
+
+```text
+当前 export 可以复盘 GRS_geo_base 的结果和 hazard_scores/main_hazards，
+但不能完整复盘 GRS 三组件公式，因为 grade_score_component、
+hazard_component、confidence_component 没有落到当前导出文件。
+建议后续小改 export：导出 geo_states_df.csv，或将 GRS components 加入 construction_state_cells。
+```
+
+### C.4 GRCI 组件导出检查
+
+| 字段 | construction_state_cells.csv | construction_state_cells.json | evidence_pack.json | high_grci_cells.json | 是否可用于公式复盘 |
+|---|---|---|---|---|---|
+| `GRS_geo_base` | 是 | 是 | 是 | 是 | 是 |
+| `RAI` | 是 | 是 | 是 | 是 | 是 |
+| `GRCI` | 是 | 是 | 是 | 是 | 是 |
+| `GRCI_available` | 是 | 是 | 是 | 是 | 是 |
+| `GRCI_source` | 是 | 是 | 是 | 是 | 是 |
+| `GRCI_unavailable_reason` | 是 | 是 | 是 | 是/可空 | 是 |
+| `coupling_level` | 是 | 是 | 是 | 是 | 是 |
+| `coupling_explanation` | 是 | 是 | 是 | 是 | 是 |
+
+判断：
+
+```text
+当前 export 足以复盘 GRCI。
+```
+
+### C.5 forward_profile 导出检查
+
+| 字段 | forward_profile.json | evidence_pack.json | construction_state_cells.json | 结论 |
+|---|---|---|---|---|
+| `range_label` | 是 | 是 | 不适用 | 可复盘 |
+| `window_start` | 当前字段名为 `start_chainage` | 是 | 不适用 | 字段名与文档示例不同 |
+| `window_end` | 当前字段名为 `end_chainage` | 是 | 不适用 | 字段名与文档示例不同 |
+| `supporting_cell_ids` | 是 | 是 | 可按 cell_id 查 | 可复盘 |
+| `attention_level` | 是 | 是 | 不适用 | 可复盘 |
+| `fused_grade` | 是 | 是 | 是 | 可复盘 |
+| `main_hazards` | 是 | 是 | 是 | 可复盘 |
+| `source_trace` | profile item 中不总是完整；forward_attention_cells 中有 | 是 | 是 | 可复盘，但建议统一 |
+| `forward_attention_cells` | 是 | 是 | 可按 `is_forward_cell` 查 | 可复盘 |
+
+判断：
+
+```text
+当前 export 足以解释前方关注提示。
+需要注意字段名是 start_chainage/end_chainage，不是 window_start/window_end。
+```
+
+### C.6 Evidence Pack 分层导出检查
+
+| 字段 | 是否存在 | 结论 |
+|---|---|---|
+| `excavated_review_evidence` | 是 | 可区分已掘复核 |
+| `excavated_review_evidence.review_cells` | 是 | 可查看复核 cell |
+| `forward_attention_evidence` | 是 | 可区分前方关注 |
+| `forward_attention_evidence.forward_profile` | 是 | 可查看前方窗口 |
+| `forward_attention_evidence.forward_attention_cells` | 是 | 可查看前方 cell |
+| `background_context_evidence` | 是 | 可区分背景上下文 |
+| `background_context_evidence.background_context_cells` | 是 | 可查看背景 cell |
+| `geology_evidence.key_cells` | 是 | Grounding 正式入口 |
+| `geology_evidence.selected_cells` | 是 | 兼容字段 |
+| `coupling_evidence.high_grci_cells` | 是 | 已掘复核 GRCI 入口 |
+
+判断：
+
+```text
+当前 export 足以区分已掘复核、前方关注、背景上下文。
+```
+
+### C.7 Trace support type 导出检查
+
+`trace.json` 当前存在：
+
+```text
+trace_support_type
+support_type
+supporting_evidence_ids
+source_trace
+```
+
+当前未统一导出字段名：
+
+```text
+source_refs
+matched_evidence_ids
+matched_cell_ids
+```
+
+但相同信息可通过 `supporting_evidence_ids`、`source_trace` 和 claim 文本/支撑对象间接获得。
+
+2023-12-30 出现过的 `trace_support_type`：
+
+```text
+statistical_support
+coupling_review_support
+forward_attention_support
+observed_support
+none
+```
+
+2023-12-28 出现过的 `trace_support_type`：
+
+```text
+statistical_support
+coupling_review_support
+forward_attention_support
+forecast_support
+none
+```
+
+未在这两个日期出现，但代码支持或语义保留的类型：
+
+```text
+interpreted_support
+cell_evidence_support
+policy_support
+```
+
+判断：
+
+```text
+当前 Trace 足以说明 claim 的主要证据角色；
+如果后续要做论文实验级批量统计，建议统一增加 matched_evidence_ids、
+matched_cell_ids、source_refs。
+```
+
+### C.8 method_metrics / summary 完整性检查
+
+当前没有统一导出：
+
+```text
+method_metrics.json
+```
+
+当前已有：
+
+```text
+summary.json
+outputs/smoke_summary.json
+```
+
+`summary.json` 当前包含：
+
+```text
+date
+construction_state_cells_row_count
+grci_available_count
+high_grci_cell_count
+forward_cell_count
+key_cells_count
+quality_score
+grounding_rate
+unsupported_claim_count
+warnings
+```
+
+当前 `summary.json` 未统一包含：
+
+```text
+plc_row_count
+daily_chainage_min
+daily_chainage_max
+daily_advance_m
+cell_response_count
+forward_attention_cell_count
+grounded_claim_count
+trace_coverage
+```
+
+其中部分指标在 `smoke_summary.json` 中可见，部分需从导出文件计算。
+
+### C.9 导出改进建议
+
+| 缺失字段/文件 | 影响 | 是否影响当前方法理解 | 是否建议后续小改 export | 优先级 |
+|---|---|---|---|---|
+| `cell_response_df.csv` | RAI 复盘需要解析 `plc_metrics` 嵌套 | 不影响主方法，但影响人工复盘便利性 | 建议 | P1 |
+| `geo_states_df.csv` | GRS 三组件无法直接复盘 | 不影响 GRS 结果理解，但影响公式复盘完整性 | 强烈建议 | P1 |
+| `cell_evidence_df.csv` | 无法完整复盘 evidence-cell 投影权重 | 不影响报告解释，但影响方法审计 | 建议 | P1 |
+| `method_metrics.json` | 缺少统一方法指标文件 | 不影响单次运行，但影响批量实验统计 | 建议 | P1 |
+| RAI components 平铺到 CSV | 当前嵌套在 `plc_metrics` | 不影响 JSON 复盘，影响 Excel 查看 | 建议 | P2 |
+| GRS components 加入 ConstructionStateCell | 当前只在 geo_states_df 内部，export 未保留 | 影响 GRS 公式完整复盘 | 建议 | P1 |
+| `matched_evidence_ids` / `matched_cell_ids` | Trace 批量统计不够直观 | 不影响当前 trace 阅读 | 建议 | P2 |
+
+当前结论：
+
+```text
+RAI：当前 export 可复盘，但建议增加 cell_response_df.csv 或平铺分量。
+GRS：当前 export 可复盘结果，不能完整复盘三组件，建议导出 geo_states_df.csv 或补充 GRS components。
+GRCI：当前 export 足以复盘。
+Forward：当前 export 足以解释前方关注提示。
+Evidence Pack 分层：当前 export 足以区分已掘复核、前方关注、背景上下文。
+Trace：当前 export 足以说明主要支撑类型，但可增加 matched_* 字段提升批量统计能力。
 ```

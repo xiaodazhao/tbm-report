@@ -2,6 +2,15 @@
 
 本文档说明当前 TBM 施工日报后端的真实执行路线。它不是论文概念稿，也不是未来设计稿，而是基于当前代码和已导出的 `2023-12-30` 结果整理出的工程说明书。
 
+## 相关文档
+
+- [方法与计算逻辑白皮书](method_calculation_whitepaper.md)：公式、字段反向索引、配置常量、导出完整性检查。
+- [后端字段契约](backend_field_contract.md)：API、schema 与 debug 输出字段。
+- [方法定义文档](method_definition.md)：任务定义、核心对象与方法边界。
+- [指标定义文档](metrics_definition.md)：GRS、RAI、GRCI、Quality、Trace 指标说明。
+- [系统边界声明](scope_and_limitations.md)：当前系统不做什么。
+- [2023-12-30 案例说明](case_2023-12-30.md)：典型日期案例。
+
 ## 1. 系统一句话说明
 
 当前后端读取每日 PLC 运行数据和多源地质证据，按 10m 里程单元构建 `ConstructionStateCell`，计算 GRS / RAI / GRCI，生成 Evidence Pack、日报文本、Quality 与 Trace 结果，并通过精简后的报告 API 输出。
@@ -650,4 +659,3 @@ DyK1014+545...20231224_hsp_3_collapse_point_0
 - Evidence Pack 中 `key_cells` 与 `selected_cells` 数量一致，均为 13。
 - Grounding checker 能识别全部 key_cells，`grounding_key_cells_seen = 13`。
 - 模板报告质量检查通过，`unsupported_claim_count = 0`。
-
