@@ -9,8 +9,10 @@ from fastapi.testclient import TestClient
 
 from coupling.grs_rai_grci import build_construction_state_cells, compute_cell_grci, high_grci_cells
 from llm.evidence_pack import build_prompt_evidence_pack
+from llm.report_grounding_checker import check_claim_grounding
 from llm.report_trace_builder import build_report_trace
 from llm.report_grounding_checker import _get_key_cells
+from pipeline.evidence_scope import apply_spatial_relevance_filter, build_scope_cells, build_scope_summary
 import pipeline.daily_report_pipeline as daily_pipeline
 import routes.report as report_routes
 from schemas.pipeline import ConstructionStateCell
@@ -169,6 +171,274 @@ def test_build_construction_state_cells_marks_grci_unavailable_without_response(
     assert by_id["cell_10_20"].coupling_level == "unavailable"
     assert all(cell["GRCI_available"] for cell in high_grci_cells(result))
     assert all(not cell["is_forward_cell"] for cell in high_grci_cells(result))
+
+
+def test_spatial_relevance_excludes_distant_time_valid_tsp():
+    scope = build_scope_summary(
+        date="2023-12-30",
+        current_chainage=1014616.0,
+        day_start_chainage=1014601.0,
+        day_end_chainage=1014616.0,
+        cell_length=10.0,
+        lookahead_m=30.0,
+        local_background_back_m=100.0,
+    )
+    evidence = pd.DataFrame(
+        [
+            {
+                "evidence_id": "old-tsp",
+                "source_type_norm": "TSP",
+                "evidence_role": "prediction",
+                "spatial_type": "segment",
+                "start_chainage": 1013080.2,
+                "end_chainage": 1013096.0,
+                "face_chainage": 1013080.2,
+            },
+            {
+                "evidence_id": "local-hsp",
+                "source_type_norm": "HSP",
+                "evidence_role": "prediction",
+                "spatial_type": "segment",
+                "start_chainage": 1014608.0,
+                "end_chainage": 1014641.0,
+            },
+        ]
+    )
+
+    spatial, excluded, counted_scope = apply_spatial_relevance_filter(evidence, scope)
+
+    old = excluded[excluded["evidence_id"] == "old-tsp"].iloc[0]
+    assert bool(old["time_valid"]) is True
+    assert bool(old["spatial_relevant"]) is False
+    assert old["evidence_report_role"] == "excluded_by_distance"
+    assert old["spatial_invalid_reason"] == "outside_report_scope"
+    assert counted_scope["spatial_relevant_evidence_count"] == 1
+    assert counted_scope["excluded_by_distance_evidence_count"] == 1
+    assert spatial["evidence_id"].tolist() == ["local-hsp"]
+
+
+def test_report_scope_cells_are_local_not_global():
+    scope = build_scope_summary(
+        date="2023-12-30",
+        current_chainage=1014616.0,
+        day_start_chainage=1014601.0,
+        day_end_chainage=1014616.0,
+        cell_length=10.0,
+        lookahead_m=30.0,
+        local_background_back_m=100.0,
+    )
+    cells = build_scope_cells(scope)
+    assert len(cells) == 14
+    assert cells["cell_start"].min() == 1014510.0
+    assert cells["cell_end"].max() == 1014650.0
+
+
+def test_components_and_semantic_boundaries_are_exported():
+    cells_df = pd.DataFrame(
+        [
+            {"cell_id": "cell_0_10", "cell_start": 0.0, "cell_end": 10.0, "cell_center": 5.0},
+            {"cell_id": "cell_10_20", "cell_start": 10.0, "cell_end": 20.0, "cell_center": 15.0},
+            {"cell_id": "cell_20_30", "cell_start": 20.0, "cell_end": 30.0, "cell_center": 25.0},
+        ]
+    )
+    response_df = pd.DataFrame(
+        [
+            {
+                "cell_id": "cell_0_10",
+                "cell_start": 0.0,
+                "cell_end": 10.0,
+                "cell_center": 5.0,
+                "RAI": 0.4,
+                "stop_ratio": 0.5,
+                "abnormal_ratio": 0.2,
+                "speed_drop_score": 0.6,
+                "torque_volatility_score": 0.2,
+                "speed_volatility_score": 0.2,
+                "stop_component": 0.2,
+                "abnormal_component": 0.05,
+                "speed_drop_component": 0.12,
+                "torque_component": 0.02,
+                "speed_volatility_component": 0.01,
+                "dominant_component": "stop_component",
+                "RAI_formula_text": "RAI = 0.40 * stop_ratio + 0.25 * abnormal_ratio + 0.20 * speed_drop_score + 0.10 * torque_volatility_score + 0.05 * speed_volatility_score",
+                "stop_reason_available": False,
+                "planned_stop_distinguishable": False,
+                "stop_interpretation_warning": "当前 PLC 字段未区分计划停机与非计划停机，stop_ratio 仅作为施工响应关注信号，不直接作为异常原因。",
+            }
+        ]
+    )
+    geo_df = pd.DataFrame(
+        [
+            {
+                "cell_id": "cell_0_10",
+                "cell_start": 0.0,
+                "cell_end": 10.0,
+                "cell_center": 5.0,
+                "GRS_geo_base": 0.59,
+                "grade_score_component": 0.4,
+                "hazard_component": 0.8,
+                "confidence_component": 0.5,
+                "GRS_formula_text": "GRS = 0.45 * grade_score_component + 0.45 * hazard_component + 0.10 * confidence_component",
+                "GRS_component_method": "fused",
+                "supporting_evidence_ids": ["ev-1"],
+            },
+            {
+                "cell_id": "cell_10_20",
+                "cell_start": 10.0,
+                "cell_end": 20.0,
+                "cell_center": 15.0,
+                "GRS_geo_base": 0.7,
+                "grade_score_component": 0.6,
+                "hazard_component": 0.8,
+                "confidence_component": 0.7,
+                "GRS_component_method": "fused",
+                "supporting_evidence_ids": ["ev-2"],
+            },
+            {
+                "cell_id": "cell_20_30",
+                "cell_start": 20.0,
+                "cell_end": 30.0,
+                "cell_center": 25.0,
+                "GRS_geo_base": 0.0,
+                "GRS_component_method": "empty",
+                "supporting_evidence_ids": [],
+            },
+        ]
+    )
+    normalized = pd.DataFrame(
+        [
+            {"evidence_id": "ev-1", "source_type_norm": "HSP"},
+            {"evidence_id": "ev-2", "source_type_norm": "TSP"},
+        ]
+    )
+
+    result = build_construction_state_cells(
+        cells_df=cells_df,
+        cell_response_df=response_df,
+        geo_states_df=geo_df,
+        cell_evidence_df=pd.DataFrame(),
+        normalized_evidence_df=normalized,
+        current_chainage=10.0,
+        day_start_chainage=0.0,
+        day_end_chainage=10.0,
+        lookahead_m=20.0,
+        scope_summary={
+            "daily_excavated_scope": {"start": 0.0, "end": 10.0},
+            "forward_scope": {"start": 10.0, "end": 20.0},
+            "local_background_scope": {"start": 20.0, "end": 30.0},
+            "report_scope": {"start": 0.0, "end": 30.0},
+        },
+    )
+    by_id = {cell.cell_id: cell for cell in result}
+    daily = by_id["cell_0_10"]
+    forward = by_id["cell_10_20"]
+    background = by_id["cell_20_30"]
+
+    assert round(
+        daily.stop_component
+        + daily.abnormal_component
+        + daily.speed_drop_component
+        + daily.torque_component
+        + daily.speed_volatility_component,
+        6,
+    ) == round(daily.RAI, 6)
+    assert daily.dominant_component == "stop_component"
+    assert daily.stop_reason_available is False
+    assert daily.planned_stop_distinguishable is False
+    assert daily.stop_interpretation_warning
+    assert round(0.45 * daily.grade_score_component + 0.45 * daily.hazard_component + 0.10 * daily.confidence_component, 6) == round(daily.GRS_geo_base, 6)
+    assert daily.GRS_available is True
+    assert round(daily.grs_term + daily.rai_term + daily.interaction_term, 4) == daily.GRCI
+
+    assert forward.cell_role == "forward_attention"
+    assert forward.RAI is None
+    assert forward.GRCI_available is False
+    assert forward.GRCI is None
+
+    assert background.cell_role == "local_background"
+    assert background.GRS_available is False
+    assert background.GRS_unavailable_reason == "missing_spatial_relevant_geology_evidence"
+    assert background.GRCI_available is False
+    assert not high_grci_cells(result) or all(cell["cell_role"] == "daily_review" for cell in high_grci_cells(result))
+
+
+def test_stop_boundary_statement_gets_policy_support():
+    grounding = check_claim_grounding(
+        [
+            {
+                "claim_id": "c1",
+                "claim_type": "recommendation",
+                "text": "当前 PLC 字段未区分计划停机与非计划停机，stop_ratio 仅作为施工响应关注信号，不直接作为异常原因。",
+            }
+        ],
+        prompt_evidence_pack={},
+    )
+    claim = grounding["claim_results"][0]
+    assert claim["grounded"] is True
+    assert claim["trace_support_type"] == "policy_support"
+
+
+def test_method_metrics_contains_required_keys():
+    cells = [
+        ConstructionStateCell(
+            cell_id="cell_0_10",
+            cell_role="daily_review",
+            RAI=0.4,
+            GRS_geo_base=0.6,
+            GRS_available=True,
+            GRCI=0.5,
+            GRCI_available=True,
+        )
+    ]
+    metrics = daily_pipeline._method_metrics(
+        cells,
+        {"date": "2023-12-30", "daily_chainage_min": 1, "daily_chainage_max": 2, "daily_advance_m": 1, "current_chainage": 2},
+        {"spatial_relevant_evidence_df": pd.DataFrame(), "excluded_evidence_df": pd.DataFrame()},
+        quality_summary={"claim_count": 3, "grounded_claim_count": 2, "unsupported_claim_count": 1, "grounding_rate": 0.67, "quality_score": 88},
+        trace_summary={"trace_coverage": 0.5},
+        warnings=["w"],
+        passed=True,
+        priority_cells={"review_cells": [{}], "high_priority_cells": [], "medium_priority_cells": [{}], "low_priority_cells": []},
+        quality={"error_type_counts": {"E1_UNSUPPORTED_CLAIM": 1}, "violations": [{"error_type": "E9_SOURCE_ROLE_CONFUSION"}]},
+        trace={"support_type_distribution": {"none": 2}},
+    )
+    for key in [
+        "date",
+        "daily_chainage_min",
+        "daily_chainage_max",
+        "daily_advance_m",
+        "current_chainage",
+        "time_valid_evidence_count",
+        "spatial_relevant_evidence_count",
+        "excluded_by_distance_evidence_count",
+        "excluded_by_time_evidence_count",
+        "construction_state_cell_count",
+        "daily_review_cell_count",
+        "forward_attention_cell_count",
+        "local_background_cell_count",
+        "RAI_available_count",
+        "GRS_available_count",
+        "GRCI_available_count",
+        "review_cell_count",
+        "high_priority_cell_count",
+        "medium_priority_cell_count",
+        "low_priority_cell_count",
+        "claim_count",
+        "grounded_claim_count",
+        "unsupported_claim_count",
+        "grounding_rate",
+        "trace_coverage",
+        "quality_score",
+        "warnings",
+        "passed",
+        "error_type_counts",
+        "support_type_distribution",
+        "trace_support_none_count",
+        "role_consistency_violation_count",
+    ]:
+        assert key in metrics
+    assert metrics["trace_support_none_count"] == 2
+    assert metrics["role_consistency_violation_count"] == 1
 
 
 def test_report_api_returns_core_fields(monkeypatch):

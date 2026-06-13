@@ -85,6 +85,14 @@ def project_plc_response_to_cells(
             + 0.10 * torque_volatility_score
             + 0.05 * speed_volatility_score
         )
+        rai_components = _rai_components(
+            stop_ratio=stop_ratio,
+            abnormal_ratio=abnormal_ratio,
+            speed_drop_score=speed_drop_score,
+            torque_volatility_score=torque_volatility_score,
+            speed_volatility_score=speed_volatility_score,
+            rai=abnormal_score,
+        )
 
         operation_state = _dominant_operation_state(work_sec, stop_sec, abnormal_sec, duration_sec)
         cell_start = float(group["cell_start"].iloc[0])
@@ -112,8 +120,13 @@ def project_plc_response_to_cells(
                 "speed_drop_score": speed_drop_score,
                 "torque_volatility_score": torque_volatility_score,
                 "speed_volatility_score": speed_volatility_score,
+                **rai_components,
                 "abnormal_score": abnormal_score,
                 "RAI": abnormal_score,
+                "RAI_formula_text": RAI_FORMULA_TEXT,
+                "stop_reason_available": False,
+                "planned_stop_distinguishable": False,
+                "stop_interpretation_warning": STOP_INTERPRETATION_WARNING,
                 "response_support_count": int(len(group)),
                 "response_metrics": {
                     "duration_min": duration_sec / 60.0,
@@ -123,11 +136,51 @@ def project_plc_response_to_cells(
                     "speed_drop_score": speed_drop_score,
                     "torque_volatility_score": torque_volatility_score,
                     "speed_volatility_score": speed_volatility_score,
+                    **rai_components,
+                    "RAI": abnormal_score,
+                    "RAI_formula_text": RAI_FORMULA_TEXT,
+                    "stop_reason_available": False,
+                    "planned_stop_distinguishable": False,
+                    "stop_interpretation_warning": STOP_INTERPRETATION_WARNING,
                 },
             }
         )
 
     return pd.DataFrame(records)
+
+
+RAI_FORMULA_TEXT = (
+    "RAI = 0.40 * stop_ratio + 0.25 * abnormal_ratio "
+    "+ 0.20 * speed_drop_score + 0.10 * torque_volatility_score "
+    "+ 0.05 * speed_volatility_score"
+)
+
+STOP_INTERPRETATION_WARNING = (
+    "当前 PLC 字段未区分计划停机与非计划停机，stop_ratio 仅作为施工响应关注信号，不直接作为异常原因。"
+)
+
+
+def _rai_components(
+    *,
+    stop_ratio: float,
+    abnormal_ratio: float,
+    speed_drop_score: float,
+    torque_volatility_score: float,
+    speed_volatility_score: float,
+    rai: float,
+) -> dict[str, float | str]:
+    components = {
+        "stop_component": 0.40 * stop_ratio,
+        "abnormal_component": 0.25 * abnormal_ratio,
+        "speed_drop_component": 0.20 * speed_drop_score,
+        "torque_component": 0.10 * torque_volatility_score,
+        "speed_volatility_component": 0.05 * speed_volatility_score,
+    }
+    dominant_component = max(components.items(), key=lambda item: item[1])[0]
+    return {
+        **components,
+        "dominant_component": dominant_component,
+    }
 
 
 def _empty_cell_response_df() -> pd.DataFrame:
@@ -220,4 +273,3 @@ def _dominant_operation_state(work_sec: float, stop_sec: float, abnormal_sec: fl
 def _number_key(value: float) -> str:
     number = float(value)
     return str(int(number)) if number.is_integer() else f"{number:.3f}".rstrip("0").rstrip(".")
-

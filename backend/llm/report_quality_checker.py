@@ -6,6 +6,7 @@ from typing import Any
 
 from contracts.data_dictionary import STRONG_HAZARD_TERMS, collect_supported_tags_from_item
 from llm.report_claim_extractor import extract_report_claims
+from llm.report_error_taxonomy import annotate_quality_result, is_method_boundary_text
 from llm.report_grounding_checker import check_claim_grounding
 from llm.report_policy import (
     DEFAULT_FORBIDDEN_TERMS,
@@ -120,6 +121,59 @@ def _is_allowed_forbidden_probability_phrase(
 
 def _is_gas_negated_concentration_context(text: str) -> bool:
     return policy_is_gas_negated_concentration_context(text)
+
+
+def _is_stop_boundary_statement(text: str) -> bool:
+    compact = _safe_text(text)
+    return bool(
+        ("停机" in compact or "stop_ratio" in compact or "计划停机" in compact)
+        and any(
+            phrase in compact
+            for phrase in [
+                "未区分计划停机",
+                "非计划停机",
+                "仅作为施工响应关注信号",
+                "不直接作为异常原因",
+                "不能直接作为异常原因",
+            ]
+        )
+    )
+
+
+def _is_stop_causal_overreach(text: str) -> bool:
+    compact = _safe_text(text)
+    if is_method_boundary_text(compact) or _is_stop_boundary_statement(compact):
+        return False
+    if (
+        ("停机" in compact or "stop_ratio" in compact)
+        and (
+            re.search(r"(停机|stop_ratio).{0,18}(导致|造成|说明|表明|证明|作为|是).{0,18}(异常|故障|原因)", compact)
+            or re.search(r"(异常|故障).{0,18}(原因|由来|来源).{0,18}(停机|stop_ratio)", compact)
+            or "直接作为异常原因" in compact
+        )
+    ):
+        return True
+    if not ("停机" in compact or "stop_ratio" in compact):
+        return False
+    return bool(
+        re.search(r"(停机|stop_ratio).{0,18}(导致|造成|说明|表明|证明).{0,18}(异常|故障|原因)", compact)
+        or re.search(r"(异常|故障).{0,18}(原因|由来|来源).{0,18}(停机|stop_ratio)", compact)
+        or re.search(r"停机.{0,8}(就是|即为|属于).{0,8}异常", compact)
+    )
+
+
+def _is_forward_role_confusion(text: str) -> bool:
+    compact = _safe_text(text)
+    if is_method_boundary_text(compact):
+        return False
+    return bool(("前方" in compact or "forward_attention" in compact) and re.search(r"(已开挖|已掘|已发生|施工异常|响应异常)", compact))
+
+
+def _is_background_role_confusion(text: str) -> bool:
+    compact = _safe_text(text)
+    if is_method_boundary_text(compact):
+        return False
+    return bool(("背景" in compact or "local_background" in compact) and re.search(r"(当日|今日).{0,12}(施工响应|响应异常|GRCI|RAI)", compact))
 
 
 # ============================================================
@@ -245,7 +299,7 @@ def _is_non_technical_claim_text(text: str) -> bool:
         "当前掌子面描述",
         "已开挖区段地质与响应异常复核",
         "气体监测分析",
-        "前方风险提示",
+        "前方关注提示",
         "当前掌子面前方关注提示",
         "结论与建议",
     }:
@@ -256,7 +310,7 @@ def _is_non_technical_claim_text(text: str) -> bool:
         return True
     if compact.startswith("报告不得把 GRCI"):
         return True
-    if "这些 cell 使用 GRS_geo_base" in compact and "不进入 high_grci_cells" in compact:
+    if "这些 cell 使用 GRS_geo_base" in compact and "不进入已开挖区段 GRCI 复核单元" in compact:
         return True
         # 报告元信息 / 声明 / 编制信息，不进入 grounding 分母
     if compact.startswith("报告编制"):
@@ -668,6 +722,58 @@ def check_report_quality(
                     )
 
         # ------------------------------------------------------------
+        # 6.5 Stop-ratio semantics
+        # ------------------------------------------------------------
+        for sentence in sentences:
+            if _is_stop_causal_overreach(sentence):
+                _add_violation(
+                    violations,
+                    type_="stop_semantics",
+                    severity="warning",
+                    phrase="停机=异常原因",
+                    message="报告可能把 stop_ratio 或停机直接写成异常原因，但当前 PLC 字段未区分计划停机与非计划停机。",
+                    suggestion="改为“stop_ratio 仅作为施工响应关注信号，不直接作为异常原因”。",
+                )
+                break
+
+        for sentence in sentences:
+            if _is_forward_role_confusion(sentence):
+                _add_violation(
+                    violations,
+                    type_="role_consistency",
+                    severity="warning",
+                    phrase="forward_attention_as_daily_review",
+                    message="报告可能把 forward_attention cell 写成已开挖事实或已发生施工异常。",
+                    suggestion="改为前方关注提示，不使用已发生或已开挖复核语义。",
+                )
+                violations[-1]["error_type"] = "E4_FORWARD_AS_EXCAVATED_REVIEW"
+                break
+
+        for sentence in sentences:
+            if _is_background_role_confusion(sentence):
+                _add_violation(
+                    violations,
+                    type_="role_consistency",
+                    severity="warning",
+                    phrase="local_background_as_daily_response",
+                    message="报告可能把 local_background cell 写成当日施工响应异常。",
+                    suggestion="local_background 只能作为背景说明，不能支撑当日响应异常判断。",
+                )
+                violations[-1]["error_type"] = "E5_BACKGROUND_AS_DAILY_RESPONSE"
+                break
+
+        if "excluded_by_distance" in text:
+            _add_violation(
+                violations,
+                type_="source_role_confusion",
+                severity="warning",
+                phrase="excluded_by_distance",
+                message="报告引用了 excluded_by_distance evidence 作为正文支撑。",
+                suggestion="excluded_by_distance evidence 只能进入审计排除清单，不能作为日报主证据链支撑。",
+            )
+            violations[-1]["error_type"] = "E9_SOURCE_ROLE_CONFUSION"
+
+        # ------------------------------------------------------------
         # 7. Section completeness
         # ------------------------------------------------------------
         missing_sections = [
@@ -725,10 +831,15 @@ def check_report_quality(
         warning_count = sum(1 for item in violations if item.get("severity") == "warning")
         ok = error_count == 0 and score >= minimum_ok_score
 
-        return {
+        result = {
             "schema_version": SCHEMA_VERSION,
             "ok": ok,
             "score": score,
+            "quality_score": score,
+            "claim_count": int(grounding.get("claim_count") or 0),
+            "grounded_claim_count": int(grounding.get("grounded_claim_count") or 0),
+            "unsupported_claim_count": unsupported_claim_count,
+            "grounding_rate": grounding_rate,
             "violations": violations,
             "warnings": warnings + _as_list(grounding.get("warnings")),
             "stats": {
@@ -759,12 +870,18 @@ def check_report_quality(
             },
             "claim_results": _as_list(grounding.get("claim_results")) if include_claim_results else None,
         }
+        return annotate_quality_result(result)
 
     except Exception as exc:
-        return {
+        result = {
             "schema_version": SCHEMA_VERSION,
             "ok": False,
             "score": 0,
+            "quality_score": 0,
+            "claim_count": 0,
+            "grounded_claim_count": 0,
+            "unsupported_claim_count": 0,
+            "grounding_rate": 0.0,
             "violations": [],
             "warnings": [f"report quality checker failed: {exc}"],
             "stats": {
@@ -791,3 +908,4 @@ def check_report_quality(
             },
             "claim_results": [] if include_claim_results else None,
         }
+        return annotate_quality_result(result)

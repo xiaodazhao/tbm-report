@@ -11,6 +11,7 @@ GENERATION_CONSTRAINTS = [
     "TSP/HSP/掌子面素描是证据来源，不得写成一定真实的结论。",
     "没有 source_trace 或 PLC 指标支持的内容不得作为确定性结论写入日报。",
     "既有超前预报不得被表述为现场揭露事实，除非 Evidence Pack 明确提供现场揭露证据。",
+    "当前 PLC 字段未区分计划停机与非计划停机，stop_ratio 只能写作施工响应关注信号，不得直接写成异常原因。",
 ]
 
 
@@ -24,6 +25,9 @@ def build_prompt_evidence_pack(
     construction_state_cells: list[ConstructionStateCell],
     forward_profile: dict[str, Any],
     high_grci_cells: list[dict[str, Any]],
+    scope_summary: dict[str, Any] | None = None,
+    excluded_evidence_summary: dict[str, Any] | None = None,
+    priority_cells: dict[str, list[dict[str, Any]]] | None = None,
     quality_evidence: dict[str, Any] | None = None,
     warnings: list[str] | None = None,
 ) -> dict[str, Any]:
@@ -50,14 +54,16 @@ def build_prompt_evidence_pack(
     excavated_pack_cells = [_cell_for_pack(cell) for cell in excavated_review_cells]
     forward_pack_cells = [_cell_for_forward_pack(cell) for cell in forward_attention_cells]
     background_pack_cells = [_cell_for_pack(cell) for cell in background_context_cells]
+    scope = dict(scope_summary or {})
+    scope.setdefault("date", date)
+    scope.setdefault("current_chainage", current_chainage)
+    scope.setdefault("cell_length_m", 10)
+    scope.setdefault("cell_count", len(construction_state_cells))
+    priority_cells = priority_cells or {}
     return {
         "schema_version": "prompt_evidence_pack_v1",
-        "report_scope": {
-            "date": date,
-            "current_chainage": current_chainage,
-            "cell_length_m": 10,
-            "cell_count": len(construction_state_cells),
-        },
+        "report_scope": scope,
+        "scope_summary": scope,
         "operation_evidence": operation_summary,
         "cluster_evidence": cluster_summary,
         "gas_evidence": gas_summary,
@@ -67,6 +73,14 @@ def build_prompt_evidence_pack(
             "excavated_review_cells": excavated_pack_cells,
             "forward_attention_cells": forward_pack_cells,
             "background_context_cells": background_pack_cells,
+        },
+        "daily_review_evidence": {
+            "daily_review_cells": excavated_pack_cells,
+            "review_cells": excavated_pack_cells,
+            "high_priority_cells": priority_cells.get("high_priority_cells", []),
+            "medium_priority_cells": priority_cells.get("medium_priority_cells", []),
+            "low_priority_cells": priority_cells.get("low_priority_cells", []),
+            "note": "Daily review cells are inside the report daily excavated scope and may use GRCI when PLC response and geology evidence are both available.",
         },
         "excavated_review_evidence": {
             "high_grci_cells": high_grci_cells,
@@ -87,10 +101,21 @@ def build_prompt_evidence_pack(
             "background_context_cells": background_pack_cells,
             "note": "Background cells provide geological context only; they are not today's high GRCI review cells.",
         },
+        "local_background_evidence": {
+            "local_background_cells": background_pack_cells,
+            "background_context_cells": background_pack_cells,
+            "note": "Local background cells provide geological context only; they are not today's GRCI review cells.",
+        },
+        "excluded_evidence_summary": excluded_evidence_summary or {},
         "coupling_evidence": {
             "high_grci_cells": high_grci_cells,
+            "legacy_high_grci_cells": high_grci_cells,
+            "review_cells": priority_cells.get("review_cells", high_grci_cells),
+            "high_priority_cells": priority_cells.get("high_priority_cells", []),
+            "medium_priority_cells": priority_cells.get("medium_priority_cells", []),
+            "low_priority_cells": priority_cells.get("low_priority_cells", []),
             "review_priority_cells": high_grci_cells,
-            "note": "GRCI is a geo-response co-attention review-priority index, not a probability, risk forecast, or causal diagnosis.",
+            "note": "high_grci_cells is retained as a legacy top-review-cells field. Strict high priority means GRCI >= 0.75.",
         },
         "quality_evidence": quality_evidence or {},
         "source_trace": _collect_source_trace(selected_cells),
@@ -244,7 +269,7 @@ def build_template_report(pack: dict[str, Any]) -> str:
                 "该 cell 同时具备 GRS、RAI 和当日 PLC response，GRCI 只表示地质证据与施工响应的共现复核关注度。"
             )
     else:
-        lines.append("Evidence Pack 中未形成可用的已开挖区段 high_grci_cells。")
+        lines.append("Evidence Pack 中未形成可用的已开挖区段 review_cells。")
 
     lines.extend(
         [
@@ -257,10 +282,10 @@ def build_template_report(pack: dict[str, Any]) -> str:
             "",
             "## 8. 前方关注提示（当前掌子面前方地质关注提示）",
             _forward_text(forward),
-            f"forward_attention_cells 数量为 {len(forward_cells)}；这些 cell 使用 GRS_geo_base、main_hazards 和 source_trace，不进入 high_grci_cells。",
+            f"forward_attention_cells 数量为 {len(forward_cells)}；这些 cell 使用 GRS_geo_base、main_hazards 和 source_trace，不进入已开挖区段 GRCI 复核单元。",
             "",
             "## 9. 结论与建议",
-            "建议围绕 Evidence Pack 中的 high_grci_cells 做已开挖区段复核，围绕 forward_profile 做前方关注提示复核。",
+            "建议围绕 Evidence Pack 中的 review_cells 做已开挖区段复核，围绕 forward_profile 做前方关注提示复核。",
             "报告不得把 GRCI 写成确定性灾害判断，也不得把前方提示或 TSP/HSP 证据写成已发生事实。",
         ]
     )
@@ -302,7 +327,8 @@ def _select_excavated_review_cells(
     return sorted(
         [
             cell for cell in cells
-            if cell.GRCI_available
+            if _is_daily_review_cell(cell)
+            and cell.GRCI_available
             and cell.GRCI is not None
             and cell.is_excavated_today
             and not cell.is_forward_cell
@@ -321,8 +347,7 @@ def _select_background_context_cells(
     candidates = [
         cell for cell in cells
         if cell.cell_id not in excluded_ids
-        and not cell.is_excavated_today
-        and not cell.is_forward_cell
+        and _is_local_background_cell(cell)
         and cell.has_geology_evidence
     ]
     return sorted(
@@ -350,7 +375,7 @@ def _merge_cells(*groups: list[ConstructionStateCell]) -> list[ConstructionState
 
 def _select_forward_attention_cells(cells: list[ConstructionStateCell]) -> list[ConstructionStateCell]:
     ranked = sorted(
-        [cell for cell in cells if cell.is_forward_cell],
+        [cell for cell in cells if _is_forward_attention_cell(cell)],
         key=lambda cell: (
             cell.GRS_geo_base or 0.0,
             len(cell.supporting_evidence_ids),
@@ -359,6 +384,25 @@ def _select_forward_attention_cells(cells: list[ConstructionStateCell]) -> list[
         reverse=True,
     )
     return ranked[:8]
+
+
+def _is_daily_review_cell(cell: ConstructionStateCell) -> bool:
+    return cell.cell_role == "daily_review" or (
+        cell.cell_role == "outside_report_scope"
+        and cell.is_excavated_today
+        and not cell.is_forward_cell
+    )
+
+
+def _is_forward_attention_cell(cell: ConstructionStateCell) -> bool:
+    return cell.cell_role == "forward_attention" or (
+        cell.cell_role == "outside_report_scope"
+        and cell.is_forward_cell
+    )
+
+
+def _is_local_background_cell(cell: ConstructionStateCell) -> bool:
+    return cell.cell_role == "local_background"
 
 
 def _cell_for_pack(cell: ConstructionStateCell) -> dict[str, Any]:
@@ -375,6 +419,21 @@ def _cell_for_pack(cell: ConstructionStateCell) -> dict[str, Any]:
             "stop_duration_min",
             "abnormal_score",
             "RAI",
+            "stop_ratio",
+            "abnormal_ratio",
+            "speed_drop_score",
+            "torque_volatility_score",
+            "speed_volatility_score",
+            "stop_component",
+            "abnormal_component",
+            "speed_drop_component",
+            "torque_component",
+            "speed_volatility_component",
+            "dominant_component",
+            "RAI_formula_text",
+            "stop_reason_available",
+            "planned_stop_distinguishable",
+            "stop_interpretation_warning",
             "fused_grade",
             "main_hazards",
             "hazard_scores",
@@ -382,10 +441,21 @@ def _cell_for_pack(cell: ConstructionStateCell) -> dict[str, Any]:
             "uncertainty_level",
             "conflict_level",
             "GRS_geo_base",
+            "grade_score_component",
+            "hazard_component",
+            "confidence_component",
+            "GRS_formula_text",
+            "GRS_component_method",
+            "GRS_available",
+            "GRS_unavailable_reason",
             "GRCI",
             "GRCI_available",
             "GRCI_source",
             "GRCI_unavailable_reason",
+            "grs_term",
+            "rai_term",
+            "interaction_term",
+            "GRCI_formula_text",
             "coupling_level",
             "coupling_explanation",
             "has_plc_response",
@@ -395,6 +465,7 @@ def _cell_for_pack(cell: ConstructionStateCell) -> dict[str, Any]:
             "is_excavated_today",
             "is_current_face_cell",
             "is_forward_cell",
+            "cell_role",
             "trace_refs",
         }
     )
@@ -414,10 +485,18 @@ def _cell_for_forward_pack(cell: ConstructionStateCell) -> dict[str, Any]:
             "uncertainty_level",
             "conflict_level",
             "GRS_geo_base",
+            "grade_score_component",
+            "hazard_component",
+            "confidence_component",
+            "GRS_formula_text",
+            "GRS_component_method",
+            "GRS_available",
+            "GRS_unavailable_reason",
             "supporting_evidence_ids",
             "source_trace",
             "is_current_face_cell",
             "is_forward_cell",
+            "cell_role",
             "trace_refs",
         }
     )

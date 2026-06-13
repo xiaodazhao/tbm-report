@@ -64,11 +64,20 @@ def _export_one(date: str, *, out_dir: Path, use_llm: bool) -> dict[str, Any]:
             "construction_state_cells_row_count": len(cells),
             "grci_available_count": sum(1 for item in cells if item.get("GRCI_available")),
             "high_grci_cell_count": len(result.high_grci_cells),
+            "review_cell_count": len(result.review_cells),
+            "high_priority_cell_count": len(result.high_priority_cells),
+            "medium_priority_cell_count": len(result.medium_priority_cells),
+            "low_priority_cell_count": len(result.low_priority_cells),
             "forward_cell_count": sum(1 for item in cells if item.get("is_forward_cell")),
+            "daily_review_cell_count": len(result.daily_review_cells),
+            "forward_attention_cell_count": len(result.forward_attention_cells),
+            "local_background_cell_count": len(result.local_background_cells),
             "key_cells_count": len((result.prompt_evidence_pack.get("geology_evidence") or {}).get("key_cells") or []),
             "quality_score": result.quality_summary.get("quality_score"),
             "grounding_rate": result.quality_summary.get("grounding_rate"),
             "unsupported_claim_count": result.quality_summary.get("unsupported_claim_count"),
+            "error_type_counts": result.quality.get("error_type_counts", {}),
+            "support_type_distribution": result.trace.get("support_type_distribution", {}),
             "warnings": result.warnings,
         }
 
@@ -80,11 +89,26 @@ def _export_one(date: str, *, out_dir: Path, use_llm: bool) -> dict[str, Any]:
         _write_json(target / "construction_state_cells.json", cells)
         _write_json(target / "forward_profile.json", result.forward_profile)
         _write_json(target / "high_grci_cells.json", result.high_grci_cells)
+        _write_json(target / "review_cells.json", result.review_cells)
+        _write_json(target / "daily_review_cells.json", result.daily_review_cells)
+        _write_json(target / "forward_attention_cells.json", result.forward_attention_cells)
+        _write_json(target / "local_background_cells.json", result.local_background_cells)
+        _write_json(target / "scope_summary.json", result.scope_summary)
+        _write_json(target / "method_metrics.json", result.method_metrics)
+        _write_json(target / "cell_response_df.json", result.cell_response_records)
+        _write_json(target / "geo_states_df.json", result.geo_state_records)
+        _write_json(target / "cell_evidence_df.json", result.cell_evidence_records)
         _write_json(target / "warnings.json", result.warnings)
         _write_json(target / "summary.json", summary)
 
         csv_rows = [_csv_safe(item) for item in cells]
         pd.DataFrame(csv_rows).to_csv(target / "construction_state_cells.csv", index=False, encoding="utf-8-sig")
+        _write_csv(target / "time_valid_evidence.csv", result.time_valid_evidence)
+        _write_csv(target / "spatial_relevant_evidence.csv", result.spatial_relevant_evidence)
+        _write_csv(target / "excluded_evidence.csv", result.excluded_evidence)
+        _write_csv(target / "cell_response_df.csv", result.cell_response_records)
+        _write_csv(target / "geo_states_df.csv", result.geo_state_records)
+        _write_csv(target / "cell_evidence_df.csv", result.cell_evidence_records)
         return {"date": date, "passed": True, "out_dir": str(target), **summary}
     except Exception as exc:
         error = {
@@ -99,6 +123,13 @@ def _export_one(date: str, *, out_dir: Path, use_llm: bool) -> dict[str, Any]:
 
 def _write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+
+def _write_csv(path: Path, rows: Any) -> None:
+    if not rows:
+        pd.DataFrame().to_csv(path, index=False, encoding="utf-8-sig")
+        return
+    pd.DataFrame([_csv_safe(dict(row)) for row in rows]).to_csv(path, index=False, encoding="utf-8-sig")
 
 
 def _csv_safe(row: dict[str, Any]) -> dict[str, Any]:

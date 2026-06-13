@@ -10,6 +10,7 @@ from llm.report_claim_types import (
     CLAIM_TYPE_FORWARD_SEGMENT,
     CLAIM_TYPE_GAS,
     CLAIM_TYPE_GEOLOGY_CELL,
+    CLAIM_TYPE_METHOD_BOUNDARY,
     CLAIM_TYPE_OPERATION,
     CLAIM_TYPE_RECOMMENDATION,
     CLAIM_TYPE_UNKNOWN,
@@ -20,6 +21,7 @@ from llm.report_claim_types import (
     SPATIAL_SCOPE_OPERATION,
     SPATIAL_SCOPE_UNKNOWN,
 )
+from llm.report_error_taxonomy import is_method_boundary_text
 from llm.report_policy import split_sentences
 
 
@@ -111,6 +113,8 @@ def _detect_claim_type(
     metrics: list[str],
     gases: list[str],
 ) -> str:
+    if is_method_boundary_text(sentence):
+        return CLAIM_TYPE_METHOD_BOUNDARY
     if spatial_scope == SPATIAL_SCOPE_FORWARD or relative_range:
         return CLAIM_TYPE_FORWARD_SEGMENT
     if range_dk and hazards:

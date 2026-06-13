@@ -14,10 +14,12 @@ from llm.report_claim_types import (
     CLAIM_TYPE_FORWARD_SEGMENT,
     CLAIM_TYPE_GAS,
     CLAIM_TYPE_GEOLOGY_CELL,
+    CLAIM_TYPE_METHOD_BOUNDARY,
     CLAIM_TYPE_OPERATION,
     CLAIM_TYPE_RECOMMENDATION,
     normalize_claim_type,
 )
+from llm.report_error_taxonomy import is_method_boundary_text
 from llm.report_policy import (
     GAS_CERTAIN_RE,
     GAS_CONCENTRATION_RE,
@@ -259,6 +261,7 @@ def _extract_source_trace(item: dict[str, Any], max_items: int = 3) -> list[dict
                 "report_id": _safe_text(trace.get("report_id")) or None,
                 "source_type": _safe_text(trace.get("source_type")) or None,
                 "evidence_role": _safe_text(trace.get("evidence_role")) or None,
+                "evidence_report_role": _safe_text(trace.get("evidence_report_role")) or None,
                 "raw_text_excerpt": excerpt or None,
             }
         )
@@ -513,6 +516,23 @@ def _is_general_recommendation_claim(text: str) -> bool:
     )
 
 
+def _is_stop_boundary_statement(text: str) -> bool:
+    text = _safe_text(text)
+    return bool(
+        ("停机" in text or "stop_ratio" in text or "计划停机" in text)
+        and any(
+            phrase in text
+            for phrase in [
+                "未区分计划停机",
+                "非计划停机",
+                "仅作为施工响应关注信号",
+                "不直接作为异常原因",
+                "不能直接作为异常原因",
+            ]
+        )
+    )
+
+
 def _has_direct_face_observation(
     twin_state: dict[str, Any],
     geology_context: dict[str, Any],
@@ -648,7 +668,23 @@ def check_claim_grounding(
             claim_hazards = _dedup([_safe_text(item) for item in _as_list(claim.get("hazards"))])
             matched: dict[str, Any] = {}
 
-            if claim_type == CLAIM_TYPE_GEOLOGY_CELL:
+            if is_method_boundary_text(claim_text):
+                result["claim_type"] = CLAIM_TYPE_METHOD_BOUNDARY
+                _mark_grounded(
+                    result,
+                    support_type="recommendation_policy",
+                    message="方法边界/生成约束说明，按 policy_support 支撑。",
+                )
+
+            elif _is_stop_boundary_statement(claim_text):
+                result["claim_type"] = CLAIM_TYPE_METHOD_BOUNDARY
+                _mark_grounded(
+                    result,
+                    support_type="recommendation_policy",
+                    message="停机解释边界属于生成约束/方法边界说明，按 policy_support 支撑。",
+                )
+
+            elif claim_type == CLAIM_TYPE_GEOLOGY_CELL:
                 for cell in key_cells:
                     if _match_range_dk(claim.get("range_dk"), cell):
                         matched = cell

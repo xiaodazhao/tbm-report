@@ -6,7 +6,18 @@ from typing import Any
 
 import pandas as pd
 
+from pipeline.evidence_scope import role_for_cell
 from schemas.pipeline import ConstructionStateCell
+
+RAI_FORMULA_TEXT = (
+    "RAI = 0.40 * stop_ratio + 0.25 * abnormal_ratio "
+    "+ 0.20 * speed_drop_score + 0.10 * torque_volatility_score "
+    "+ 0.05 * speed_volatility_score"
+)
+GRCI_FORMULA_TEXT = "GRCI = 0.55 * GRS_geo_base + 0.35 * RAI + 0.10 * GRS_geo_base * RAI"
+STOP_INTERPRETATION_WARNING = (
+    "当前 PLC 字段未区分计划停机与非计划停机，stop_ratio 仅作为施工响应关注信号，不直接作为异常原因。"
+)
 
 
 def build_construction_state_cells(
@@ -20,6 +31,7 @@ def build_construction_state_cells(
     day_end_chainage: float | None,
     lookahead_m: float = 30.0,
     advance_direction: int = 1,
+    scope_summary: dict[str, Any] | None = None,
 ) -> list[ConstructionStateCell]:
     """Build the single cell-level state table used by the main report route."""
     base = _base_cells(cells_df, cell_response_df, geo_states_df)
@@ -43,30 +55,54 @@ def build_construction_state_cells(
         cell_end = _num(row.get("cell_end"))
         cell_center = _num(row.get("cell_center"))
 
-        grs = _first_num(geo, ["GRS_geo_base", "GRS", "geo_risk_score", "GRS_base"])
-        rai = _first_num(response, ["RAI", "response_anomaly_index", "abnormal_score"])
         has_plc_response = bool(response)
-        has_geology_evidence = bool(geo) and (grs is not None or bool(geo.get("has_geology_evidence")))
-        grci, grci_source, grci_unavailable_reason = compute_cell_grci(
-            grs,
-            rai,
-            has_plc_response=has_plc_response,
-        )
-        grci_available = grci is not None
-        coupling_level = classify_grci(grci) if grci_available else "unavailable"
+        cell_role = role_for_cell(cell_start, cell_end, scope_summary) if scope_summary else None
+        if cell_role is None or cell_role == "outside_report_scope":
+            is_excavated_today = _cell_overlaps(cell_start, cell_end, day_min, day_max)
+            is_current_face_cell = _is_current_face_cell(cell_start, cell_end, current_chainage)
+            is_forward_cell = _is_strict_forward_cell(cell_start, forward_min, forward_max, current_chainage)
+            if is_excavated_today:
+                cell_role = "daily_review"
+            elif is_forward_cell:
+                cell_role = "forward_attention"
+            else:
+                cell_role = "local_background"
+        else:
+            is_excavated_today = cell_role == "daily_review"
+            is_forward_cell = cell_role == "forward_attention"
+            is_current_face_cell = _is_current_face_cell(cell_start, cell_end, current_chainage)
 
         evidence_ids = _list_value(geo.get("supporting_evidence_ids"))
         if not evidence_ids:
             evidence_ids = evidence_by_cell.get(cell_id, [])
+
+        grs = _first_num(geo, ["GRS_geo_base", "GRS", "geo_risk_score", "GRS_base"])
+        grade_score_component = _num(geo.get("grade_score_component"))
+        hazard_component = _num(geo.get("hazard_component"))
+        confidence_component = _num(geo.get("confidence_component"))
+        grs_formula_text = _text(geo.get("GRS_formula_text")) or (
+            "GRS = 0.45 * grade_score_component + 0.45 * hazard_component + 0.10 * confidence_component"
+        )
+        grs_component_method = _text(geo.get("GRS_component_method")) or "unavailable"
+        raw_rai = _first_num(response, ["RAI", "response_anomaly_index", "abnormal_score"])
+        rai = raw_rai if cell_role == "daily_review" else None
+        has_geology_evidence = bool(evidence_ids) or bool(geo.get("has_geology_evidence"))
+        grs_available = bool(has_geology_evidence and grs is not None and grs_component_method != "empty")
+        grs_unavailable_reason = None if grs_available else "missing_spatial_relevant_geology_evidence"
+        grci, grci_source, grci_unavailable_reason = compute_cell_grci(
+            grs if grs_available else None,
+            rai,
+            has_plc_response=has_plc_response and cell_role == "daily_review",
+        )
+        grci_available = grci is not None
+        coupling_level = classify_grci(grci) if grci_available else "unavailable"
+
         source_trace = _source_trace_for_ids(evidence_ids, evidence_lookup)
         trace_refs = [str(item.get("evidence_id")) for item in source_trace if item.get("evidence_id")]
 
         main_hazards = _list_value(geo.get("main_hazards"))
         hazard_scores = _dict_float_value(geo.get("hazard_scores"))
-        is_excavated_today = _cell_overlaps(cell_start, cell_end, day_min, day_max)
-        is_current_face_cell = _is_current_face_cell(cell_start, cell_end, current_chainage)
-        is_forward_cell = _is_strict_forward_cell(cell_start, forward_min, forward_max, current_chainage)
-
+        grs_term, rai_term, interaction_term = _grci_terms(grs if grs_available else None, rai)
         cell = ConstructionStateCell(
             cell_id=cell_id,
             cell_start=cell_start,
@@ -80,6 +116,23 @@ def build_construction_state_cells(
             stop_duration_min=_num(response.get("stop_duration_min")),
             abnormal_score=_num(response.get("abnormal_score")),
             RAI=rai,
+            stop_ratio=_num(response.get("stop_ratio")),
+            abnormal_ratio=_num(response.get("abnormal_ratio")),
+            speed_drop_score=_num(response.get("speed_drop_score")),
+            torque_volatility_score=_num(response.get("torque_volatility_score")),
+            speed_volatility_score=_num(response.get("speed_volatility_score")),
+            stop_component=_num(response.get("stop_component")),
+            abnormal_component=_num(response.get("abnormal_component")),
+            speed_drop_component=_num(response.get("speed_drop_component")),
+            torque_component=_num(response.get("torque_component")),
+            speed_volatility_component=_num(response.get("speed_volatility_component")),
+            dominant_component=_text(response.get("dominant_component")),
+            RAI_formula_text=_text(response.get("RAI_formula_text")) or (RAI_FORMULA_TEXT if has_plc_response else None),
+            stop_reason_available=bool(response.get("stop_reason_available", False)),
+            planned_stop_distinguishable=bool(response.get("planned_stop_distinguishable", False)),
+            stop_interpretation_warning=_text(response.get("stop_interpretation_warning")) or (
+                STOP_INTERPRETATION_WARNING if has_plc_response else None
+            ),
             geology_evidence_ids=evidence_ids,
             supporting_evidence_ids=evidence_ids,
             source_trace=source_trace,
@@ -90,10 +143,21 @@ def build_construction_state_cells(
             uncertainty_level=_text(geo.get("uncertainty_level")),
             conflict_level=_text(geo.get("conflict_level")),
             GRS_geo_base=grs,
+            grade_score_component=grade_score_component,
+            hazard_component=hazard_component,
+            confidence_component=confidence_component,
+            GRS_formula_text=grs_formula_text if grs_available else None,
+            GRS_component_method=grs_component_method if grs_available else "unavailable",
+            GRS_available=grs_available,
+            GRS_unavailable_reason=grs_unavailable_reason,
             GRCI=grci,
             GRCI_available=grci_available,
             GRCI_source=grci_source,
             GRCI_unavailable_reason=grci_unavailable_reason,
+            grs_term=grs_term,
+            rai_term=rai_term,
+            interaction_term=interaction_term,
+            GRCI_formula_text=GRCI_FORMULA_TEXT if grci_available else None,
             coupling_level=coupling_level,
             coupling_explanation=explain_coupling(
                 grs,
@@ -108,6 +172,7 @@ def build_construction_state_cells(
             is_excavated_today=is_excavated_today,
             is_current_face_cell=is_current_face_cell,
             is_forward_cell=is_forward_cell,
+            cell_role=cell_role,
             used_in_evidence_pack=False,
             trace_refs=trace_refs,
         )
@@ -130,6 +195,14 @@ def compute_cell_grci(
     g = _bounded(grs or 0.0)
     r = _bounded(rai or 0.0)
     return round(_bounded(0.55 * g + 0.35 * r + 0.10 * g * r), 4), "cell_grs_rai_formula_v1", None
+
+
+def _grci_terms(grs: float | None, rai: float | None) -> tuple[float | None, float | None, float | None]:
+    if grs is None or rai is None:
+        return None, None, None
+    g = _bounded(grs)
+    r = _bounded(rai)
+    return 0.55 * g, 0.35 * r, 0.10 * g * r
 
 
 def classify_grci(grci: float | None) -> str:
@@ -166,12 +239,18 @@ def explain_coupling(
 
 
 def high_grci_cells(cells: list[ConstructionStateCell], limit: int = 10) -> list[dict[str, Any]]:
+    """Legacy-compatible alias for top daily review cells by available GRCI."""
+    return review_cells(cells, limit=limit)
+
+
+def review_cells(cells: list[ConstructionStateCell], limit: int = 10) -> list[dict[str, Any]]:
     ranked = sorted(
         [
             cell
             for cell in cells
             if cell.GRCI_available
             and cell.GRCI is not None
+            and _is_daily_review_cell(cell)
             and cell.is_excavated_today
             and not cell.is_forward_cell
         ],
@@ -186,11 +265,37 @@ def high_grci_cells(cells: list[ConstructionStateCell], limit: int = 10) -> list
                 "cell_end",
                 "cell_center",
                 "GRS_geo_base",
+                "grade_score_component",
+                "hazard_component",
+                "confidence_component",
+                "GRS_formula_text",
+                "GRS_component_method",
+                "GRS_available",
+                "GRS_unavailable_reason",
                 "RAI",
+                "stop_ratio",
+                "abnormal_ratio",
+                "speed_drop_score",
+                "torque_volatility_score",
+                "speed_volatility_score",
+                "stop_component",
+                "abnormal_component",
+                "speed_drop_component",
+                "torque_component",
+                "speed_volatility_component",
+                "dominant_component",
+                "RAI_formula_text",
+                "stop_reason_available",
+                "planned_stop_distinguishable",
+                "stop_interpretation_warning",
                 "GRCI",
                 "GRCI_available",
                 "GRCI_source",
                 "GRCI_unavailable_reason",
+                "grs_term",
+                "rai_term",
+                "interaction_term",
+                "GRCI_formula_text",
                 "coupling_level",
                 "main_hazards",
                 "supporting_evidence_ids",
@@ -199,10 +304,35 @@ def high_grci_cells(cells: list[ConstructionStateCell], limit: int = 10) -> list
                 "has_geology_evidence",
                 "is_excavated_today",
                 "is_forward_cell",
+                "cell_role",
             }
         )
         for cell in ranked[: max(limit, 0)]
     ]
+
+
+def priority_cell_groups(cells: list[ConstructionStateCell]) -> dict[str, list[dict[str, Any]]]:
+    reviews = review_cells(cells, limit=len(cells))
+    return {
+        "review_cells": reviews,
+        "high_priority_cells": [cell for cell in reviews if _num(cell.get("GRCI")) is not None and _num(cell.get("GRCI")) >= 0.75],
+        "medium_priority_cells": [
+            cell for cell in reviews
+            if _num(cell.get("GRCI")) is not None and 0.50 <= _num(cell.get("GRCI")) < 0.75
+        ],
+        "low_priority_cells": [
+            cell for cell in reviews
+            if _num(cell.get("GRCI")) is not None and 0.25 <= _num(cell.get("GRCI")) < 0.50
+        ],
+    }
+
+
+def _is_daily_review_cell(cell: ConstructionStateCell) -> bool:
+    return cell.cell_role == "daily_review" or (
+        cell.cell_role == "outside_report_scope"
+        and cell.is_excavated_today
+        and not cell.is_forward_cell
+    )
 
 
 def _base_cells(cells_df: pd.DataFrame, cell_response_df: pd.DataFrame, geo_states_df: pd.DataFrame) -> pd.DataFrame:
@@ -264,6 +394,7 @@ def _source_trace_for_ids(evidence_ids: list[str], evidence_lookup: dict[str, di
                 "report_id": _text(row.get("report_id")),
                 "source_type": _text(row.get("source_type_norm") or row.get("source_type")),
                 "evidence_role": _text(row.get("evidence_role")),
+                "evidence_report_role": _text(row.get("evidence_report_role")),
                 "spatial_type": _text(row.get("spatial_type")),
                 "start_chainage": _num(row.get("start_chainage") or row.get("start_num")),
                 "end_chainage": _num(row.get("end_chainage") or row.get("end_num")),
@@ -287,9 +418,28 @@ def _response_metrics(response: dict[str, Any]) -> dict[str, Any]:
         "abnormal_duration_min",
         "stop_ratio",
         "abnormal_ratio",
+        "speed_drop_score",
+        "torque_volatility_score",
+        "speed_volatility_score",
+        "stop_component",
+        "abnormal_component",
+        "speed_drop_component",
+        "torque_component",
+        "speed_volatility_component",
+        "RAI",
     ]:
         if key in response:
             out[key] = _num(response.get(key))
+    for key in [
+        "dominant_component",
+        "RAI_formula_text",
+        "stop_interpretation_warning",
+    ]:
+        if key in response:
+            out[key] = _text(response.get(key))
+    for key in ["stop_reason_available", "planned_stop_distinguishable"]:
+        if key in response:
+            out[key] = bool(response.get(key))
     return {key: value for key, value in out.items() if value is not None}
 
 

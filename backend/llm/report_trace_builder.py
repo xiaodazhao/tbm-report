@@ -5,6 +5,7 @@ from typing import Any
 
 from llm.report_claim_extractor import extract_report_claims
 from llm.report_claim_types import normalize_claim_type
+from llm.report_error_taxonomy import build_trace_distributions, normalize_support_type
 from llm.report_grounding_checker import check_claim_grounding
 from llm.report_policy import METADATA_PREFIXES, PURE_LABELS
 
@@ -206,7 +207,7 @@ def _infer_trace_support_type(item: dict[str, Any], traces: list[dict[str, Any]]
     if support_type in {"operation_context", "cluster_context", "gas_context"}:
         return "statistical_support"
     if support_type == "coupling_context":
-        return "coupling_review_support"
+        return "daily_review_support"
     if support_type == "forward_segment":
         return "forward_attention_support"
     if support_type == "recommendation_policy":
@@ -229,8 +230,8 @@ def _infer_trace_support_type(item: dict[str, Any], traces: list[dict[str, Any]]
     if "interpreted" in roles:
         return "interpreted_support"
     if support_type == "key_cell":
-        return "cell_evidence_support"
-    return support_type or "none"
+        return "daily_review_support"
+    return normalize_support_type(support_type or "none")
 
 
 def build_report_trace(
@@ -296,6 +297,7 @@ def build_report_trace(
                         "report_id": _safe_text(trace.get("report_id")) or None,
                         "source_type": _safe_text(trace.get("source_type")) or None,
                         "evidence_role": _safe_text(trace.get("evidence_role")) or None,
+                        "evidence_report_role": _safe_text(trace.get("evidence_report_role")) or None,
                         "raw_text_excerpt": excerpt or None,
                     }
                 )
@@ -323,7 +325,7 @@ def build_report_trace(
         unsupported_count = claim_count - grounded_count
         coverage = round(grounded_count / claim_count, 4) if claim_count else 0.0
 
-        return {
+        result = {
             "schema_version": TRACE_SCHEMA_VERSION,
             "trace_available": claim_count > 0,
             "raw_claim_count": len(raw_claim_list),
@@ -335,9 +337,11 @@ def build_report_trace(
             "traced_claims": traced_claims,
             "warnings": _as_list(grounding.get("warnings")),
         }
+        result.update(build_trace_distributions(result))
+        return result
 
     except Exception as exc:
-        return {
+        result = {
             "schema_version": TRACE_SCHEMA_VERSION,
             "trace_available": False,
             "raw_claim_count": 0,
@@ -349,6 +353,8 @@ def build_report_trace(
             "traced_claims": [],
             "warnings": [f"report trace builder failed: {exc}"],
         }
+        result.update(build_trace_distributions(result))
+        return result
 
 
 def summarize_report_trace(trace: dict | None) -> dict:
@@ -363,5 +369,10 @@ def summarize_report_trace(trace: dict | None) -> dict:
         "grounded_claim_count": int(trace.get("grounded_claim_count") or 0),
         "unsupported_claim_count": int(trace.get("unsupported_claim_count") or 0),
         "trace_coverage": float(trace.get("trace_coverage") or 0.0),
+        "support_type_distribution": trace.get("support_type_distribution") or {},
+        "claim_type_distribution": trace.get("claim_type_distribution") or {},
+        "source_role_distribution": trace.get("source_role_distribution") or {},
+        "source_type_distribution": trace.get("source_type_distribution") or {},
+        "unsupported_by_claim_type": trace.get("unsupported_by_claim_type") or {},
         "warnings": _as_list(trace.get("warnings")),
     }
