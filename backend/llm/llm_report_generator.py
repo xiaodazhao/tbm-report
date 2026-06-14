@@ -4,6 +4,7 @@ from typing import Any
 
 from llm.evidence_pack import build_template_report
 from llm.llm_provider import LLMProvider, resolve_llm_provider_config
+from llm.llm_report_planner import generate_report_plan
 from llm.llm_revision import revise_llm_report
 from llm.prompts.report_generation_prompt import build_generation_prompt
 from llm.prompts.report_revision_prompt import build_revision_prompt
@@ -14,10 +15,14 @@ from llm.report_trace_builder import build_report_trace, summarize_report_trace
 GENERATION_MODE_TEMPLATE = "template"
 GENERATION_MODE_LLM = "evidence_pack_llm"
 GENERATION_MODE_LLM_WITH_REVISION = "evidence_pack_llm_with_revision"
+GENERATION_MODE_PLANNER_LLM = "evidence_pack_planner_llm"
+GENERATION_MODE_PLANNER_LLM_WITH_REVISION = "evidence_pack_planner_llm_with_revision"
 SUPPORTED_GENERATION_MODES = {
     GENERATION_MODE_TEMPLATE,
     GENERATION_MODE_LLM,
     GENERATION_MODE_LLM_WITH_REVISION,
+    GENERATION_MODE_PLANNER_LLM,
+    GENERATION_MODE_PLANNER_LLM_WITH_REVISION,
 }
 
 
@@ -31,15 +36,23 @@ def generate_llm_report(
     model: str | None = None,
     mock_llm: bool = False,
     enable_revision: bool | None = None,
+    enable_planner: bool | None = None,
+    planner_provider_name: str | None = None,
+    planner_model: str | None = None,
     max_revision_rounds: int = 1,
     fallback_report: str | None = None,
 ) -> dict[str, Any]:
     """Generate an Evidence-Pack-constrained LLM report and optional revision."""
     mode = normalize_generation_mode(generation_mode)
     revision_enabled = (
-        mode == GENERATION_MODE_LLM_WITH_REVISION
+        mode in {GENERATION_MODE_LLM_WITH_REVISION, GENERATION_MODE_PLANNER_LLM_WITH_REVISION}
         if enable_revision is None
         else bool(enable_revision)
+    )
+    planner_enabled = (
+        mode in {GENERATION_MODE_PLANNER_LLM, GENERATION_MODE_PLANNER_LLM_WITH_REVISION}
+        if enable_planner is None
+        else bool(enable_planner)
     )
     if max_revision_rounds <= 0:
         revision_enabled = False
@@ -49,22 +62,40 @@ def generate_llm_report(
         quality, trace = _evaluate(report, prompt_evidence_pack, twin_state)
         return _template_result(date, report, quality, trace)
 
+    planner_result: dict[str, Any] = {}
+    report_plan = None
+    plan_validation = None
+    if planner_enabled:
+        planner_result = generate_report_plan(
+            date=date,
+            prompt_evidence_pack=prompt_evidence_pack,
+            provider_name=planner_provider_name or provider_name,
+            model=planner_model or model,
+            mock_llm=mock_llm,
+        )
+        report_plan = planner_result.get("report_plan")
+        plan_validation = planner_result.get("plan_validation")
+
     provider = LLMProvider(
         resolve_llm_provider_config(
             provider="mock" if mock_llm else provider_name,
             model=model,
         )
     )
-    prompt = build_generation_prompt(prompt_evidence_pack)
+    prompt = build_generation_prompt(
+        prompt_evidence_pack,
+        report_plan=report_plan,
+        plan_validation=plan_validation,
+    )
     provider_result = provider.generate(prompt, purpose="report_generation")
     if provider.provider == "mock" and fallback_report:
         provider_result["text"] = fallback_report
         provider_result["raw_response"] = fallback_report
 
     error_message = provider_result.get("error_message")
-    warnings = list(provider_result.get("warnings") or [])
+    warnings = list(planner_result.get("warnings") or []) + list(provider_result.get("warnings") or [])
     if provider_result.get("ok"):
-        draft = str(provider_result.get("text") or "").strip()
+        draft = clean_llm_report_text(str(provider_result.get("text") or ""))
     else:
         draft = fallback_report or build_template_report(prompt_evidence_pack)
         warnings.append("LLM generation failed; fallback report was used for draft evaluation.")
@@ -89,7 +120,7 @@ def generate_llm_report(
             revision_request = {"provider": "mock", "purpose": "report_revision"}
             revision_response = fallback_report
             revision_executed = True
-            final_report = fallback_report
+            final_report = clean_llm_report_text(fallback_report)
             quality_after, trace_after = _evaluate(final_report, prompt_evidence_pack, twin_state)
         else:
             revision = revise_llm_report(
@@ -105,7 +136,7 @@ def generate_llm_report(
             revision_executed = bool(revision.get("ok"))
             warnings.extend(revision.get("warnings") or [])
             if revision.get("ok") and revision.get("revised_report"):
-                final_report = str(revision.get("revised_report")).strip()
+                final_report = clean_llm_report_text(str(revision.get("revised_report") or ""))
                 quality_after, trace_after = _evaluate(final_report, prompt_evidence_pack, twin_state)
             else:
                 error_message = error_message or revision.get("error_message")
@@ -122,6 +153,7 @@ def generate_llm_report(
         quality_after=quality_after,
         trace_after=trace_after,
         error_message=error_message,
+        planner_result=planner_result,
     )
     return {
         "date": date,
@@ -144,6 +176,11 @@ def generate_llm_report(
         "trace_after_revision": trace_after,
         "error_type_counts": quality_after.get("error_type_counts", {}),
         "support_type_distribution": trace_after.get("support_type_distribution", {}),
+        "llm_report_plan_prompt": planner_result.get("planning_prompt", ""),
+        "llm_report_plan_request": planner_result.get("planning_request", {}),
+        "llm_report_plan_raw_response": planner_result.get("planning_raw_response", ""),
+        "llm_report_plan": planner_result.get("report_plan", {}),
+        "llm_report_plan_validation": planner_result.get("plan_validation", {}),
         "summary": summary,
         "error_message": error_message,
         "warnings": warnings,
@@ -156,6 +193,36 @@ def normalize_generation_mode(value: str | None) -> str:
     if mode not in SUPPORTED_GENERATION_MODES:
         raise ValueError(f"unsupported generation_mode: {value}")
     return mode
+
+
+def clean_llm_report_text(text: str) -> str:
+    """Remove conversational wrappers and markdown separators from LLM output."""
+    cleaned = str(text or "").strip()
+    prefixes = [
+        "好的，遵照您的指示",
+        "好的，以下是",
+        "以下是",
+        "遵照您的要求",
+        "遵照您的指示",
+    ]
+    changed = True
+    while changed:
+        changed = False
+        for prefix in prefixes:
+            if cleaned.startswith(prefix):
+                cleaned = cleaned[len(prefix):].lstrip(" ：:\n\r\t，,。")
+                changed = True
+    report_markers = ["# TBM 施工日报", "TBM 施工日报", "1. 综合结论摘要"]
+    marker_positions = [cleaned.find(marker) for marker in report_markers if cleaned.find(marker) >= 0]
+    if marker_positions:
+        cleaned = cleaned[min(marker_positions):]
+    lines = []
+    for line in cleaned.splitlines():
+        stripped = line.strip()
+        if stripped in {"***", "---"}:
+            continue
+        lines.append(line.rstrip())
+    return "\n".join(lines).strip()
 
 
 def _evaluate(
@@ -194,9 +261,11 @@ def _summary(
     quality_after: dict[str, Any],
     trace_after: dict[str, Any],
     error_message: str | None,
+    planner_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     draft_summary = _quality_trace_values(quality_before, trace_before)
     final_summary = _quality_trace_values(quality_after, trace_after)
+    planner_result = planner_result or {}
     return {
         "date": date,
         "generation_mode": generation_mode,
@@ -214,6 +283,11 @@ def _summary(
         "final_error_type_counts": quality_after.get("error_type_counts", {}),
         "draft_support_type_distribution": trace_before.get("support_type_distribution", {}),
         "final_support_type_distribution": trace_after.get("support_type_distribution", {}),
+        "planner_enabled": bool(planner_result.get("planner_enabled")),
+        "planner_provider": planner_result.get("planner_provider"),
+        "plan_generated": bool(planner_result.get("plan_generated")),
+        "plan_validation_passed": bool(planner_result.get("plan_validation_passed")),
+        "plan_fallback_used": bool(planner_result.get("plan_fallback_used")),
         "error_message": error_message,
         "passed": not error_message,
     }

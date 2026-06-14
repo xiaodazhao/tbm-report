@@ -38,6 +38,9 @@ def register_report_routes(app: FastAPI) -> None:
             llm_model=request.llm_model,
             mock_llm=request.mock_llm,
             enable_revision=request.enable_revision,
+            enable_planner=request.enable_planner,
+            planner_provider=request.planner_provider,
+            planner_model=request.planner_model,
         )
         return {
             "date": result.date,
@@ -61,6 +64,9 @@ def register_report_routes(app: FastAPI) -> None:
             llm_model=request.llm_model,
             mock_llm=request.mock_llm,
             enable_revision=request.enable_revision,
+            enable_planner=request.enable_planner,
+            planner_provider=request.planner_provider,
+            planner_model=request.planner_model,
         )
         return {
             "date": result.date,

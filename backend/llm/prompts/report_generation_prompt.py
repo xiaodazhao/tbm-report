@@ -39,7 +39,11 @@ METHOD_BOUNDARY_STATEMENTS = [
 ]
 
 
-def build_generation_prompt(prompt_evidence_pack: dict[str, Any]) -> str:
+def build_generation_prompt(
+    prompt_evidence_pack: dict[str, Any],
+    report_plan: dict[str, Any] | None = None,
+    plan_validation: dict[str, Any] | None = None,
+) -> str:
     """Build a strict Evidence-Pack-only report generation prompt."""
     scope = prompt_evidence_pack.get("report_scope") or {}
     excluded = prompt_evidence_pack.get("excluded_evidence_summary") or {}
@@ -51,6 +55,9 @@ def build_generation_prompt(prompt_evidence_pack: dict[str, Any]) -> str:
     prompt_payload = {
         "date": scope.get("date"),
         "current_chainage": scope.get("current_chainage"),
+        "daily_plc_range": scope.get("daily_plc_range") or scope.get("daily_chainage_raw"),
+        "daily_chainage_raw": scope.get("daily_chainage_raw") or scope.get("daily_plc_range"),
+        "daily_advance_m": (scope.get("daily_plc_range") or {}).get("daily_advance_m", scope.get("daily_advance_m")),
         "daily_excavated_scope": scope.get("daily_excavated_scope"),
         "forward_scope": scope.get("forward_scope"),
         "local_background_scope": scope.get("local_background_scope"),
@@ -60,8 +67,7 @@ def build_generation_prompt(prompt_evidence_pack: dict[str, Any]) -> str:
         "excluded_evidence_summary_counts_only": safe_excluded_summary,
     }
     evidence_text = render_evidence_pack_text(prompt_evidence_pack)
-    return "\n".join(
-        [
+    parts = [
             "你是 TBM 施工日报撰写助手。",
             "任务：只能依据下方 Prompt Evidence Pack 生成 TBM 施工日报。",
             "",
@@ -76,6 +82,18 @@ def build_generation_prompt(prompt_evidence_pack: dict[str, Any]) -> str:
             "8. 不允许引用 excluded evidence 作为正文结论支撑。",
             "9. 证据不足时必须写“未形成判断”或“建议结合现场记录复核”。",
             "10. 统一使用章节名“当前掌子面前方关注提示”，不要使用风险类标题。",
+            "11. 不得将 daily_excavated_scope 写成实际推进范围。",
+            "12. 不得根据 daily_excavated_scope 自行计算推进量。",
+            "13. 实际推进量只能使用 daily_plc_range.daily_advance_m。",
+            "14. 实际推进起止只能使用 daily_plc_range.start_chainage 和 daily_plc_range.end_chainage。",
+            "15. daily_excavated_scope 只能写作“10m cell 对齐后的已掘复核范围”。",
+            "16. 推荐表达：PLC 实测推进范围为 daily_plc_range.start_chainage 至 daily_plc_range.end_chainage，日推进约 daily_plc_range.daily_advance_m m；系统按 10m cell 将已掘复核范围对齐为 daily_excavated_scope.start 至 daily_excavated_scope.end。",
+            "",
+            "推进范围语义边界：",
+            "- daily_plc_range / daily_chainage_raw 表示 PLC 实测当日推进范围。",
+            "- daily_advance_m 表示 PLC 实测日推进量。",
+            "- daily_excavated_scope 表示 10m cell 对齐后的已掘复核范围，只用于状态建模和区段复核，不等同于实际推进范围。",
+            "- 不得用 daily_excavated_scope.start/end 的差值计算日推进量。",
             "",
             "方法边界必须遵守：",
             *[f"- {item}" for item in METHOD_BOUNDARY_STATEMENTS],
@@ -91,6 +109,21 @@ def build_generation_prompt(prompt_evidence_pack: dict[str, Any]) -> str:
             "",
             evidence_text,
             "",
-            "请输出完整中文报告正文，不要输出 JSON。",
-        ]
-    )
+    ]
+    if report_plan:
+        parts.extend(
+            [
+                "LLM Report Plan（必须遵循）：",
+                "1. 按照 report_plan.sections 的章节用途、allowed_cell_roles、allowed_metrics 和 forbidden_metrics 撰写。",
+                "2. 如果 report_plan 与 Evidence Pack 或硬性约束冲突，以 Evidence Pack 和硬性约束为准。",
+                "3. 前方关注章节不得使用 RAI/GRCI；已掘复核章节才可使用 GRCI。",
+                "4. local_background 只能作为背景上下文，不能写成当日施工异常。",
+                "Plan validation:",
+                json.dumps(plan_validation or {}, ensure_ascii=False, indent=2, default=str),
+                "Report plan:",
+                json.dumps(report_plan, ensure_ascii=False, indent=2, default=str),
+                "",
+            ]
+        )
+    parts.append("请输出完整中文报告正文，不要输出 JSON。")
+    return "\n".join(parts)

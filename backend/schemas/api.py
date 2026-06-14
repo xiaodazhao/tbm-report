@@ -9,11 +9,20 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 class DailyReportRequest(BaseModel):
     date: str  # YYYY-MM-DD
     use_llm: bool = False
-    generation_mode: Literal["template", "evidence_pack_llm", "evidence_pack_llm_with_revision"] | None = None
+    generation_mode: Literal[
+        "template",
+        "evidence_pack_llm",
+        "evidence_pack_llm_with_revision",
+        "evidence_pack_planner_llm",
+        "evidence_pack_planner_llm_with_revision",
+    ] | None = None
     llm_provider: str | None = None
     llm_model: str | None = None
     mock_llm: bool = False
     enable_revision: bool | None = None
+    enable_planner: bool | None = None
+    planner_provider: str | None = None
+    planner_model: str | None = None
 
     @field_validator("date")
     @classmethod

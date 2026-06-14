@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from llm.evidence_pack import build_prompt_evidence_pack
 from llm.llm_provider import LLMProvider, resolve_llm_provider_config
-from llm.llm_report_generator import generate_llm_report
+from llm.llm_report_generator import clean_llm_report_text, generate_llm_report
 from llm.prompts.report_generation_prompt import build_generation_prompt
 from llm.prompts.report_revision_prompt import build_revision_prompt
+from llm.report_quality_checker import check_report_quality
 from schemas.pipeline import ConstructionStateCell
 
 
@@ -20,6 +21,10 @@ def test_generation_prompt_is_evidence_pack_constrained():
     assert "前方风险提示" not in prompt
     assert "old-tsp-1013" not in prompt
     assert "excluded_by_distance_evidence_count" in prompt
+    assert "daily_plc_range" in prompt
+    assert "daily_advance_m" in prompt
+    assert "不得根据 daily_excavated_scope 自行计算推进量" in prompt
+    assert "不得用 daily_excavated_scope.start/end 的差值计算日推进量" in prompt
 
 
 def test_mock_llm_generation_runs_quality_and_trace():
@@ -84,6 +89,34 @@ def test_revision_prompt_contains_feedback_and_boundaries():
     assert "前方风险提示" not in prompt
 
 
+def test_aligned_scope_as_actual_advance_is_flagged():
+    report = "本日施工里程由 1014600.0 推进至 1014620.0，共计掘进 20 米。"
+    quality = check_report_quality(report, prompt_evidence_pack=_pack(), include_claim_results=True)
+
+    assert quality["error_type_counts"]["E14_ALIGNED_SCOPE_AS_ACTUAL_ADVANCE"] >= 1
+
+
+def test_raw_plc_range_with_aligned_review_scope_is_allowed():
+    report = (
+        "PLC 实测推进范围为 1014601.0 至 1014616.0，日推进约 15.0 m；"
+        "系统按 10m cell 将已掘复核范围对齐为 1014600.0 至 1014620.0。"
+    )
+    quality = check_report_quality(report, prompt_evidence_pack=_pack(), include_claim_results=True)
+
+    assert quality["error_type_counts"]["E14_ALIGNED_SCOPE_AS_ACTUAL_ADVANCE"] == 0
+
+
+def test_llm_report_postprocess_removes_preamble_and_separators():
+    cleaned = clean_llm_report_text(
+        "好的，遵照您的指示，以下是报告：\n---\n# TBM 施工日报\n正文\n***\n"
+    )
+
+    assert cleaned.startswith("# TBM 施工日报")
+    assert "好的" not in cleaned
+    assert "---" not in cleaned
+    assert "***" not in cleaned
+
+
 def _pack():
     daily = ConstructionStateCell(
         cell_id="cell_100_110",
@@ -144,10 +177,13 @@ def _pack():
         ],
         scope_summary={
             "date": "2023-12-30",
-            "current_chainage": 110,
-            "daily_excavated_scope": {"start": 100, "end": 110},
-            "forward_scope": {"start": 110, "end": 140},
-            "local_background_scope": {"start": 0, "end": 100},
+            "current_chainage": 1014616.0,
+            "daily_chainage_min": 1014601.0,
+            "daily_chainage_max": 1014616.0,
+            "daily_advance_m": 15.0,
+            "daily_excavated_scope": {"start": 1014600.0, "end": 1014620.0},
+            "forward_scope": {"start": 1014620.0, "end": 1014650.0},
+            "local_background_scope": {"start": 1014510.0, "end": 1014600.0},
         },
         excluded_evidence_summary={
             "excluded_evidence_count": 1,

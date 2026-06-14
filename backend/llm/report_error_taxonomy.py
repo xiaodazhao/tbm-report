@@ -18,6 +18,7 @@ ERROR_TYPES = [
     "E11_HEADING_FALSE_POSITIVE",
     "E12_METHOD_BOUNDARY_STATEMENT",
     "E13_STOP_REASON_OVERINTERPRETATION",
+    "E14_ALIGNED_SCOPE_AS_ACTUAL_ADVANCE",
 ]
 
 SUPPORT_TYPES = [
@@ -64,6 +65,8 @@ def classify_violation(violation: dict[str, Any]) -> str:
         return "E7_UNSUPPORTED_RECOMMENDATION"
     if type_ == "stop_semantics" or "停机=异常原因" in combined or "stop_ratio" in combined and "异常原因" in combined:
         return "E13_STOP_REASON_OVERINTERPRETATION"
+    if type_ == "aligned_scope_as_actual_advance":
+        return "E14_ALIGNED_SCOPE_AS_ACTUAL_ADVANCE"
     if type_ in {"current_face_misuse", "spatial_semantics"}:
         return "E9_SOURCE_ROLE_CONFUSION"
     if type_ == "forbidden_phrase":

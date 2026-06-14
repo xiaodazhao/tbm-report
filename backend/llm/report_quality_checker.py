@@ -67,6 +67,68 @@ def _safe_float(value: Any, default: float | None = None) -> float | None:
         return default
 
 
+def _num_variants(value: float | None) -> set[str]:
+    if value is None:
+        return set()
+    out = {f"{value:.1f}", f"{value:g}"}
+    if abs(value - round(value)) < 1e-6:
+        out.add(str(int(round(value))))
+    return out
+
+
+def _contains_number(text: str, value: float | None) -> bool:
+    if value is None:
+        return False
+    return any(item and item in text for item in _num_variants(value))
+
+
+def _daily_scope_values(prompt_evidence_pack: dict[str, Any]) -> dict[str, float | None]:
+    scope = _as_dict(prompt_evidence_pack.get("report_scope") or prompt_evidence_pack.get("scope_summary"))
+    raw = _as_dict(scope.get("daily_plc_range") or scope.get("daily_chainage_raw"))
+    aligned = _as_dict(scope.get("daily_excavated_scope"))
+    raw_start = _safe_float(raw.get("start_chainage"), _safe_float(scope.get("daily_chainage_min")))
+    raw_end = _safe_float(raw.get("end_chainage"), _safe_float(scope.get("daily_chainage_max")))
+    raw_advance = _safe_float(raw.get("daily_advance_m"), _safe_float(scope.get("daily_advance_m")))
+    aligned_start = _safe_float(aligned.get("start"))
+    aligned_end = _safe_float(aligned.get("end"))
+    aligned_advance = None
+    if aligned_start is not None and aligned_end is not None:
+        aligned_advance = abs(aligned_end - aligned_start)
+    return {
+        "raw_start": raw_start,
+        "raw_end": raw_end,
+        "raw_advance": raw_advance,
+        "aligned_start": aligned_start,
+        "aligned_end": aligned_end,
+        "aligned_advance": aligned_advance,
+    }
+
+
+def _is_aligned_scope_as_actual_advance(sentence: str, prompt_evidence_pack: dict[str, Any]) -> bool:
+    text = _normalize_space(sentence)
+    values = _daily_scope_values(prompt_evidence_pack)
+    aligned_start = values["aligned_start"]
+    aligned_end = values["aligned_end"]
+    aligned_advance = values["aligned_advance"]
+    raw_advance = values["raw_advance"]
+    if aligned_start is None or aligned_end is None or aligned_advance is None:
+        return False
+    if raw_advance is not None and abs(float(aligned_advance) - float(raw_advance)) < 1e-6:
+        return False
+    if any(word in text for word in ["对齐", "复核范围", "10m cell", "10 m cell", "不等同", "不是实际"]):
+        return False
+
+    has_aligned_range = _contains_number(text, aligned_start) and _contains_number(text, aligned_end)
+    has_advance_context = any(word in text for word in ["推进", "掘进", "施工里程", "实际推进", "日推进"])
+    if has_aligned_range and has_advance_context:
+        return True
+
+    has_aligned_advance = _contains_number(text, aligned_advance)
+    has_distance_unit = any(unit in text for unit in ["米", "m", "M"])
+    has_distance_context = any(word in text for word in ["共计掘进", "掘进", "推进", "日推进", "advance"])
+    return bool(has_aligned_advance and has_distance_unit and has_distance_context)
+
+
 def _load_policy() -> dict[str, Any]:
     return load_report_policy(
         Path(__file__).resolve().parents[1] / "configs" / "quality_checker_policy.json"
@@ -563,6 +625,21 @@ def check_report_quality(
         violations: list[dict[str, Any]] = []
         warnings: list[str] = []
         sentences = _split_sentences(text)
+
+        # ------------------------------------------------------------
+        # 0. Numeric scope semantics
+        # ------------------------------------------------------------
+        for sentence in sentences:
+            if _is_aligned_scope_as_actual_advance(sentence, prompt_evidence_pack):
+                _add_violation(
+                    violations,
+                    type_="aligned_scope_as_actual_advance",
+                    severity="error",
+                    phrase="daily_excavated_scope as actual advance",
+                    message="报告将 10m cell 对齐后的已掘复核范围误写为实际 PLC 推进范围或实际推进量。",
+                    suggestion="实际推进起止和推进量只能使用 daily_plc_range；daily_excavated_scope 只能表述为 10m cell 对齐后的已掘复核范围。",
+                )
+                break
 
         # ------------------------------------------------------------
         # 1. Forbidden terms

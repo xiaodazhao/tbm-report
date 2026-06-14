@@ -23,11 +23,24 @@ def main() -> None:
     parser.add_argument("--dates", help="Comma-separated dates.")
     parser.add_argument("--no-llm", action="store_true", help="Keep LLM disabled. This is the default.")
     parser.add_argument("--use-llm", action="store_true", help="Allow LLM call; fallback remains enabled.")
-    parser.add_argument("--generation-mode", choices=["template", "evidence_pack_llm", "evidence_pack_llm_with_revision"], help="Optional generation mode.")
+    parser.add_argument(
+        "--generation-mode",
+        choices=[
+            "template",
+            "evidence_pack_llm",
+            "evidence_pack_llm_with_revision",
+            "evidence_pack_planner_llm",
+            "evidence_pack_planner_llm_with_revision",
+        ],
+        help="Optional generation mode.",
+    )
     parser.add_argument("--llm-provider", help="LLM provider, e.g. mock or openai_or_compatible.")
     parser.add_argument("--llm-model", help="LLM model name.")
     parser.add_argument("--mock-llm", action="store_true", help="Use deterministic mock LLM.")
     parser.add_argument("--enable-revision", action="store_true", help="Enable LLM revision when generation mode supports it.")
+    parser.add_argument("--enable-planner", action="store_true", help="Enable LLM report planner when generation mode supports it.")
+    parser.add_argument("--planner-provider", help="Planner LLM provider, defaults to --llm-provider.")
+    parser.add_argument("--planner-model", help="Planner LLM model, defaults to --llm-model.")
     parser.add_argument("--out-dir", default="outputs/pipeline_exports", help="Output directory.")
     args = parser.parse_args()
 
@@ -50,6 +63,9 @@ def main() -> None:
                 llm_model=args.llm_model,
                 mock_llm=args.mock_llm,
                 enable_revision=args.enable_revision if args.enable_revision else None,
+                enable_planner=args.enable_planner if args.enable_planner else None,
+                planner_provider=args.planner_provider,
+                planner_model=args.planner_model,
             )
         )
 
@@ -79,6 +95,9 @@ def _export_one(
     llm_model: str | None = None,
     mock_llm: bool = False,
     enable_revision: bool | None = None,
+    enable_planner: bool | None = None,
+    planner_provider: str | None = None,
+    planner_model: str | None = None,
 ) -> dict[str, Any]:
     target = out_dir / date
     target.mkdir(parents=True, exist_ok=True)
@@ -91,6 +110,9 @@ def _export_one(
             llm_model=llm_model,
             mock_llm=mock_llm,
             enable_revision=enable_revision,
+            enable_planner=enable_planner,
+            planner_provider=planner_provider,
+            planner_model=planner_model,
         )
         cells = [cell.model_dump() for cell in result.construction_state_cells]
         summary = {
@@ -171,7 +193,16 @@ def _write_llm_outputs(target: Path, llm_generation: dict[str, Any]) -> None:
         "model": llm_generation.get("model"),
         "passed": llm_generation.get("passed"),
         "error_message": llm_generation.get("error_message"),
+        "planner_enabled": (llm_generation.get("summary") or {}).get("planner_enabled"),
+        "planner_provider": (llm_generation.get("summary") or {}).get("planner_provider"),
+        "plan_validation_passed": (llm_generation.get("summary") or {}).get("plan_validation_passed"),
+        "plan_fallback_used": (llm_generation.get("summary") or {}).get("plan_fallback_used"),
     })
+    (target / "llm_report_plan_prompt.txt").write_text(llm_generation.get("llm_report_plan_prompt", "") or "", encoding="utf-8")
+    _write_json(target / "llm_report_plan_request.json", llm_generation.get("llm_report_plan_request", {}))
+    (target / "llm_report_plan_raw_response.txt").write_text(llm_generation.get("llm_report_plan_raw_response", "") or "", encoding="utf-8")
+    _write_json(target / "llm_report_plan.json", llm_generation.get("llm_report_plan", {}))
+    _write_json(target / "llm_report_plan_validation.json", llm_generation.get("llm_report_plan_validation", {}))
     (target / "llm_prompt.txt").write_text(llm_generation.get("prompt", "") or "", encoding="utf-8")
     _write_json(target / "llm_request.json", llm_generation.get("request", {}))
     (target / "llm_raw_response.txt").write_text(llm_generation.get("raw_response", "") or "", encoding="utf-8")

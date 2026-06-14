@@ -59,6 +59,19 @@ def build_prompt_evidence_pack(
     scope.setdefault("current_chainage", current_chainage)
     scope.setdefault("cell_length_m", 10)
     scope.setdefault("cell_count", len(construction_state_cells))
+    daily_plc_range = {
+        "start_chainage": scope.get("daily_chainage_min"),
+        "end_chainage": scope.get("daily_chainage_max"),
+        "daily_advance_m": scope.get("daily_advance_m"),
+        "meaning": "PLC measured daily advance range; use this for actual daily advance statements.",
+    }
+    scope["daily_plc_range"] = daily_plc_range
+    scope["daily_chainage_raw"] = daily_plc_range
+    if isinstance(scope.get("daily_excavated_scope"), dict):
+        scope["daily_excavated_scope"] = {
+            **scope["daily_excavated_scope"],
+            "meaning": "10m-cell aligned excavated review scope; not the actual PLC advance distance.",
+        }
     priority_cells = priority_cells or {}
     return {
         "schema_version": "prompt_evidence_pack_v1",
