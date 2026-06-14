@@ -47,19 +47,19 @@ routes.report
 
 ```mermaid
 flowchart TD
-    A[PLC 日运行 CSV] --> B[PLC 质量检查 / 工况识别 / 气体统计 / 响应聚合]
-    C[正式 evidence_db.csv] --> D[地质证据标准化]
-    D --> E[时间可用性过滤]
-    E --> F[日报空间范围筛选]
-    B --> G[10m cell response]
-    F --> H[geology_state cell]
+    A[PLC daily CSV] --> B[PLC processing]
+    C[official evidence_db] --> D[Geology normalize]
+    D --> E[Time valid filter]
+    E --> F[Report scope filter]
+    B --> G[cell response]
+    F --> H[geology state]
     G --> I[ConstructionStateCell]
     H --> I
-    I --> J[RAI / GRS / GRCI]
+    I --> J[RAI GRS GRCI]
     J --> K[Evidence Pack]
-    K --> L[Template 或 LLM 生成]
-    L --> M[Quality / Grounding / Trace]
-    M --> N[API 返回与导出文件]
+    K --> L[Template or LLM]
+    L --> M[Quality Grounding Trace]
+    M --> N[API and exports]
 ```
 
 ## 证据分层结构图
@@ -71,10 +71,10 @@ flowchart LR
     A --> D[local_background]
     A --> E[excluded_by_distance]
 
-    B --> F[可计算 GRCI 的已掘复核 cell]
-    C --> G[只使用 GRS / source_trace 的前方关注]
-    D --> H[局部背景上下文]
-    E --> I[不进入日报主证据链]
+    B --> F[review cells with GRCI]
+    C --> G[forward cells use GRS only]
+    D --> H[local background context]
+    E --> I[excluded from main report]
 ```
 
 ## LLM 生成结构图
@@ -87,11 +87,11 @@ flowchart TD
     D --> E[LLM Draft]
     E --> F[Post-process]
     F --> G[Quality / Trace]
-    G --> H{是否启用修订}
-    H -- 否 --> I[Final Report]
-    H -- 是 --> J[Revision Prompt]
+    G --> H{Revision enabled}
+    H -- No --> I[Final Report]
+    H -- Yes --> J[Revision Prompt]
     J --> K[Revised Report]
-    K --> L[Quality / Trace 再检查]
+    K --> L[Final Quality Trace]
     L --> I
 ```
 

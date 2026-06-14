@@ -33,31 +33,31 @@ FastAPI routes.report
 
 ```mermaid
 flowchart TD
-    A[指定 date] --> B[load_daily_inputs]
-    B --> C[PLC 日运行数据]
-    B --> D[正式 evidence_db.csv]
+    A[input date] --> B[load_daily_inputs]
+    B --> C[PLC daily data]
+    B --> D[official evidence_db]
 
-    C --> E[PLC 质量检查 / 工况识别]
-    E --> F[气体统计 / 施工响应聚合]
+    C --> E[PLC quality and operation]
+    E --> F[Gas and response aggregation]
     F --> G[cell_response_df]
 
     D --> H[normalize_evidence_df]
     H --> I[filter_available_evidence]
-    I --> J[日报空间范围筛选]
+    I --> J[Report scope filter]
     J --> K[project_evidence_to_cells]
     K --> L[geo_states_df]
 
     G --> M[ConstructionStateCell]
     L --> M
-    M --> N[RAI / GRS / GRCI 语义收敛]
+    M --> N[RAI GRS GRCI]
     N --> O[Forward Profile]
     N --> P[Twin State]
     N --> Q[Prompt Evidence Pack]
 
     Q --> R[Report Generation]
-    R --> S[Quality / Grounding / Trace]
+    R --> S[Quality Grounding Trace]
     S --> T[DailyReportResult]
-    T --> U[API / Export Scripts]
+    T --> U[API and export scripts]
 ```
 
 ## 3. 证据范围分层
@@ -71,14 +71,14 @@ flowchart LR
     A --> D[local_background]
     A --> E[excluded_by_distance]
 
-    B --> F[已掘区段复核]
-    F --> G[允许计算 GRCI]
+    B --> F[excavated review]
+    F --> G[GRCI allowed]
 
-    C --> H[当前掌子面前方关注]
-    H --> I[只使用 GRS / hazards / source_trace]
+    C --> H[forward attention]
+    H --> I[GRS hazards source_trace only]
 
-    D --> J[局部背景上下文]
-    E --> K[不进入日报主证据链]
+    D --> J[local background]
+    E --> K[excluded from main report]
 ```
 
 语义边界：
@@ -93,23 +93,23 @@ flowchart LR
 ```mermaid
 flowchart TD
     A[Prompt Evidence Pack] --> B{generation_mode}
-    B -->|template| C[模板报告]
-    B -->|evidence_pack_llm| D[Evidence Pack 约束 prompt]
-    B -->|evidence_pack_llm_with_revision| E[初稿 + Quality/Trace 反馈修订]
+    B -->|template| C[Template report]
+    B -->|evidence_pack_llm| D[Evidence Pack prompt]
+    B -->|evidence_pack_llm_with_revision| E[Draft plus revision loop]
     B -->|evidence_pack_planner_llm| F[Report Planner]
 
     F --> G[Plan Validation]
     G --> H[Generator]
     D --> H
     E --> H
-    H --> I[LLM 输出后处理]
-    I --> J[Quality / Trace]
-    J --> K{是否 revision}
-    K -->|是| L[Revision Prompt]
-    L --> M[Final Quality / Trace]
-    K -->|否| M
+    H --> I[LLM post process]
+    I --> J[Quality Trace]
+    J --> K{Revision}
+    K -->|Yes| L[Revision Prompt]
+    L --> M[Final Quality Trace]
+    K -->|No| M
     C --> M
-    M --> N[report_text / quality / trace / audit files]
+    M --> N[report quality trace audit]
 ```
 
 LLM 只能消费 Evidence Pack 和经过验证的 planner 结果。LLM 不读取原始 PLC，不读取完整 evidence_db，不计算 RAI、GRS、GRCI，也不决定 forward cell。
@@ -118,11 +118,11 @@ LLM 只能消费 Evidence Pack 和经过验证的 planner 结果。LLM 不读取
 
 ```mermaid
 flowchart TD
-    A[PLC 文件目录] --> B[audit_plc_dates.py]
+    A[PLC directory] --> B[audit_plc_dates.py]
     C[evidence_db.csv] --> D[audit_evidence_db.py]
     B --> E[classify_experiment_dates.py]
     D --> E
-    E --> F[可运行日期清单]
+    E --> F[usable date list]
     F --> G[run_batch_pipeline.py]
     F --> H[run_batch_llm_generation.py]
 ```
@@ -138,10 +138,10 @@ flowchart TD
     C --> D[candidate evidence]
     D --> E[candidate_evidence_db]
 
-    E -. 不写入 .-> F[official evidence_db.csv]
-    E -. 不进入 .-> G[time_valid / spatial_relevant]
-    E -. 不参与 .-> H[RAI / GRS / GRCI]
-    E -. 不进入 .-> I[Evidence Pack]
+    E -. no write .-> F[official evidence_db]
+    E -. no entry .-> G[time_valid spatial_relevant]
+    E -. no use .-> H[RAI GRS GRCI]
+    E -. no entry .-> I[Evidence Pack]
 ```
 
 P3 定位为 sidecar candidate evidence module：
