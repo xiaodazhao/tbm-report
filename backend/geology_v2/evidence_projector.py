@@ -44,9 +44,14 @@ CELL_EVIDENCE_COLUMNS = [
     "source_type_norm",
     "spatial_type",
     "distance_m",
+    "evidence_overlap_length",
+    "evidence_overlap_ratio",
     "spatial_weight",
     "source_reliability",
     "evidence_strength",
+    "evidence_confidence",
+    "evidence_confidence_method",
+    "manual_review_status",
     "effective_weight",
 ]
 
@@ -111,6 +116,19 @@ def _distance_to_point(
         return None
 
     return float(abs(float(cell_center) - float(center_chainage)))
+
+
+def _overlap_length(
+    cell_start: Optional[float],
+    cell_end: Optional[float],
+    evidence_start: Optional[float],
+    evidence_end: Optional[float],
+) -> Optional[float]:
+    if cell_start is None or cell_end is None or evidence_start is None or evidence_end is None:
+        return None
+    c0, c1 = min(cell_start, cell_end), max(cell_start, cell_end)
+    e0, e1 = min(evidence_start, evidence_end), max(evidence_start, evidence_end)
+    return float(max(0.0, min(c1, e1) - max(c0, e0)))
 
 
 def _evidence_distance(cell_center: float, evidence_row: pd.Series) -> Optional[float]:
@@ -278,6 +296,8 @@ def project_evidence_to_cells(
             cell_center = _safe_float(cell.get("cell_center"))
             if cell_center is None:
                 continue
+            cell_start = _safe_float(cell.get("cell_start"))
+            cell_end = _safe_float(cell.get("cell_end"))
 
             distance_m = _evidence_distance(
                 cell_center=cell_center,
@@ -303,6 +323,18 @@ def project_evidence_to_cells(
             if effective_weight <= 1e-12:
                 continue
 
+            ev_start = _safe_float(evidence.get("start_chainage"))
+            ev_end = _safe_float(evidence.get("end_chainage"))
+            if ev_start is None or ev_end is None:
+                point = _safe_float(evidence.get("center_chainage"))
+                ev_start = point
+                ev_end = point
+            overlap_length = _overlap_length(cell_start, cell_end, ev_start, ev_end)
+            cell_length = abs(float(cell_end) - float(cell_start)) if cell_start is not None and cell_end is not None else None
+            overlap_ratio = None
+            if overlap_length is not None and cell_length and cell_length > 0:
+                overlap_ratio = max(0.0, min(float(overlap_length) / float(cell_length), 1.0))
+
             records.append(
                 {
                     "cell_id": str(cell.get("cell_id")),
@@ -310,9 +342,18 @@ def project_evidence_to_cells(
                     "source_type_norm": source_type_norm,
                     "spatial_type": spatial_type,
                     "distance_m": float(distance_m),
+                    "evidence_overlap_length": float(overlap_length or 0.0),
+                    "evidence_overlap_ratio": float(overlap_ratio or 0.0),
                     "spatial_weight": float(spatial_weight),
                     "source_reliability": float(source_reliability),
                     "evidence_strength": float(evidence_strength),
+                    "evidence_confidence": _safe_float(evidence.get("evidence_confidence") or evidence.get("confidence")),
+                    "evidence_confidence_method": (
+                        str(evidence.get("evidence_confidence_method") or "source_field").strip()
+                        if _safe_float(evidence.get("evidence_confidence") or evidence.get("confidence")) is not None
+                        else "unavailable"
+                    ),
+                    "manual_review_status": evidence.get("manual_review_status"),
                     "effective_weight": float(effective_weight),
                 }
             )
@@ -330,6 +371,8 @@ def project_evidence_to_cells(
 
     numeric_cols = [
         "distance_m",
+        "evidence_overlap_length",
+        "evidence_overlap_ratio",
         "spatial_weight",
         "source_reliability",
         "evidence_strength",

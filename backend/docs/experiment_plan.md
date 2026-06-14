@@ -1,6 +1,6 @@
 # 后续实验计划
 
-本文记录当前后端研究原型之后的实验设计，不表示这些实验已经完成。
+本文记录当前后端研究原型进入实验阶段后的推荐实验设计。当前方法主线已经冻结，后续实验不再默认新增方法模块，而是围绕稳定性、敏感性、生成模式和典型案例复盘展开。
 
 ## 1. 已有工程基础
 
@@ -13,7 +13,14 @@
 - 91 天 batch pipeline 成功；
 - 91 天 batch mock LLM 成功；
 - P3 mock extraction 成功；
-- 当前 pytest = 62 passed。
+- 当前 pytest 持续通过。
+
+当前指标口径：
+
+- RAI / GRS / GRCI 是启发式关注指标，不是灾害预测模型；
+- 当前没有灾害发生标签、异常原因标签或现场复核标签，因此不做监督学习式权重校准；
+- GRCI 只用于 `daily_review`，不用于 `forward_attention`；
+- `daily_plc_range` / `daily_advance_m` 是 PLC 实测范围和推进量，`daily_excavated_scope` 是 cell 对齐复核范围。
 
 ## 2. generation mode 对比
 
@@ -34,20 +41,27 @@
 - report section completeness
 - revision 前后差异
 
-## 3. 消融实验
+## 3. GRCI 权重敏感性
 
-可设计消融：
+推荐脚本：
 
-1. 去掉 Evidence Pack 分层；
-2. 去掉 planner；
-3. 去掉 revision；
-4. 去掉 Quality / Trace 反馈；
-5. 去掉 GRCI，仅使用 GRS/RAI；
-6. 不区分 daily_review / forward_attention / local_background。
+```powershell
+python scripts/analyze_grci_weight_sensitivity.py --input-dir outputs/pipeline_exports --out-dir outputs/analysis/grci_weights
+```
 
-目标是说明各模块对报告可追溯性、语义正确性和错误减少的贡献。
+目标是分析不同启发式权重下 high attention cell 排序是否稳定。该实验不是灾害预测验证，也不使用监督标签。
 
-## 4. revision 效果分析
+## 4. cell 尺度敏感性
+
+推荐脚本：
+
+```powershell
+python scripts/analyze_cell_size_sensitivity.py --dates 2023-12-30,2023-12-28 --cell-sizes 5,10 --out-dir outputs/analysis/cell_size
+```
+
+目标是比较 5m/10m 下 cell 数量、GRCI available 数、Quality / Trace 和 Evidence Pack selection 的变化。10m 是最大推荐日报复核尺度，不默认使用 20m。
+
+## 5. generation mode 对比与 revision 效果
 
 比较 revision 前后：
 
@@ -57,7 +71,7 @@
 - 前方提示误写为事实是否减少；
 - 文本结构是否保持完整。
 
-## 5. P3 地质文本抽取准确率
+## 6. P3 地质文本抽取准确率
 
 P3 需要人工 gold standard：
 
@@ -65,7 +79,7 @@ P3 需要人工 gold standard：
 - 与 P3 candidate evidence 对比；
 - 统计 chainage accuracy、hazard tag precision/recall、role accuracy、validation failure rate。
 
-## 6. 人工评价
+## 7. 人工评价
 
 可邀请 TBM 施工或地质专家评价：
 
@@ -75,7 +89,7 @@ P3 需要人工 gold standard：
 - 前方关注提示是否过度表达；
 - 建议是否保守且有依据。
 
-## 7. 典型案例导出
+## 8. 典型案例导出
 
 建议选择：
 
@@ -86,12 +100,13 @@ P3 需要人工 gold standard：
 
 每个案例导出 Evidence Pack、Trace、报告和关键 cells。
 
-## 8. 待补事项
+## 9. 待补事项
 
 ```text
 真实 DeepSeek 抽样验证
-planner 模式批量统计
-ablation
+generation mode 批量统计
+5m/10m cell 尺度敏感性
+GRCI 权重敏感性
 P3 gold standard
 human evaluation
 case studies

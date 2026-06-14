@@ -41,6 +41,7 @@ def register_report_routes(app: FastAPI) -> None:
             enable_planner=request.enable_planner,
             planner_provider=request.planner_provider,
             planner_model=request.planner_model,
+            cell_size_m=request.cell_size_m,
         )
         return {
             "date": result.date,
@@ -67,6 +68,7 @@ def register_report_routes(app: FastAPI) -> None:
             enable_planner=request.enable_planner,
             planner_provider=request.planner_provider,
             planner_model=request.planner_model,
+            cell_size_m=request.cell_size_m,
         )
         return {
             "date": result.date,

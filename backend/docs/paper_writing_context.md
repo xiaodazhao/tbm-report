@@ -4,7 +4,7 @@
 
 ## 1. 项目一句话定义
 
-本文面向 TBM 连续掘进过程中的施工日报自动生成问题，提出一种时空证据门控的施工状态孪生与证据约束大语言模型生成框架。该框架将 PLC 施工参数、TSP/HSP 超前地质预报和掌子面素描等多源数据组织为可追溯的里程单元证据，并通过 ConstructionStateCell、RAI、GRS、GRCI 和 Prompt Evidence Pack 约束大语言模型完成日报规划、生成、核验与修订。
+本文面向 TBM 连续掘进过程中的施工日报自动生成问题，提出一种面向 TBM 施工日报的多源证据约束生成与可追溯校核方法。该方法将 PLC 施工参数、TSP/HSP 超前地质预报和掌子面素描等多源数据组织为可追溯的 ConstructionStateCell，并通过 RAI、GRS、GRCI 启发式关注指标、Prompt Evidence Pack 和 Quality / Trace 约束日报生成与核验。
 
 ## 2. 研究对象与数据来源
 
@@ -31,7 +31,7 @@ average_daily_advance_m = 13.8571
 
 ## 3. 本文不是做什么
 
-本文不是简单调用大语言模型直接写施工日报；不是让 LLM 直接读取全部原始数据并自行判断地质风险；不是让 LLM 计算 RAI、GRS 或 GRCI；不是把 GRCI 解释为灾害概率；不是将前方超前预报写成现场已揭露事实；P3 地质文本结构化模块也不是替代正式 evidence_db 的解析器。
+本文不是简单调用大语言模型直接写施工日报；不是让 LLM 直接读取全部原始 PLC CSV 或完整 evidence_db 并自行判断地质风险；不是让 LLM 计算 RAI、GRS 或 GRCI；不是把 GRCI 解释为灾害概率；不是将前方超前预报写成现场已揭露事实；P3 地质文本结构化模块也不是替代正式 evidence_db 的解析器。
 
 ## 4. 核心方法链路
 
@@ -39,7 +39,7 @@ average_daily_advance_m = 13.8571
 PLC / 地质证据
 -> 时空证据门控
 -> ConstructionStateCell
--> RAI / GRS / GRCI
+-> RAI / GRS / GRCI 启发式关注指标
 -> Prompt Evidence Pack
 -> LLM Report Planner
 -> Evidence-constrained Generator
@@ -58,7 +58,7 @@ ConstructionStateCell 是 10m 里程单元下的施工状态表达对象。它�
 
 ### 4.3 RAI / GRS / GRCI
 
-RAI 表示 PLC 施工响应异常关注度。GRS 表示地质证据关注度。GRCI 表示已掘 cell 的地质-施工响应耦合关注度。GRCI 不是灾害概率，也不是前方风险。只有同时存在 GRS、RAI 和 PLC response 的 daily review cell 才计算正式 GRCI。
+RAI 表示 PLC 施工响应启发式关注度。GRS 表示地质证据启发式关注度。GRCI 表示已掘 cell 的地质-施工响应耦合启发式关注度。GRCI 不是灾害概率，也不是前方风险。只有同时存在 GRS、RAI 和 PLC response 的 daily review cell 才计算正式 GRCI。当前没有灾害发生标签、异常原因标签或现场复核标签，因此不做监督学习式权重校准。
 
 ### 4.4 Prompt Evidence Pack
 
@@ -82,6 +82,8 @@ P3 从 raw_text/source_text/original_text_span 旁路抽取 candidate evidence�
 - `daily_excavated_scope`：10m cell 对齐后的已掘复核范围，不是实际推进范围。
 - `daily_review`：已掘区段复核 cell，可使用 GRCI。
 - `forward_attention`：当前掌子面前方关注提示，只使用 GRS/source_trace，不使用 GRCI。
+- `forward_distance_band`：当前采用 0-10m、10-20m、20-30m 三个前方距离分层。
+- `selection_score` / `selection_rank` / `selection_reason`：Evidence Pack 中 key cells 的选择分、排序和选择原因。
 - `local_background`：局部背景 cell，只作上下文。
 - `E14_ALIGNED_SCOPE_AS_ACTUAL_ADVANCE`：检查是否把 cell 对齐范围误写成实际推进范围。
 
@@ -90,7 +92,7 @@ P3 从 raw_text/source_text/original_text_span 旁路抽取 candidate evidence�
 1. 面向 TBM 日报生成构建时空证据门控机制；
 2. 提出 ConstructionStateCell 作为里程空间下的施工状态表达单元；
 3. 将已掘复核、前方关注和局部背景分层为不同证据角色；
-4. 设计 RAI / GRS / GRCI 表达施工响应、地质信号和耦合关注；
+4. 设计 RAI / GRS / GRCI 启发式关注指标表达施工响应、地质证据和耦合复核；
 5. 构建 Prompt Evidence Pack 约束 LLM 生成过程；
 6. 引入 Report Planner，实现章节级证据角色和指标使用控制；
 7. 构建 Quality / Trace / Error Taxonomy，实现生成结果可追溯核验；
@@ -108,20 +110,21 @@ P3 从 raw_text/source_text/original_text_span 旁路抽取 candidate evidence�
 91 天 batch pipeline 成功
 91 天 batch mock LLM 成功
 P3 mock extraction 成功
-当前 pytest = 62 passed
+当前 pytest 持续通过
 ```
 
-## 8. 待完成实验
+## 8. 后续论文实验
 
-后续还需完成：
+当前方法主线已经冻结，后续论文实验建议围绕稳定性、敏感性、生成模式和案例复盘展开：
 
-1. generation mode comparison；
-2. ablation study；
-3. revision effect analysis；
-4. 真实 DeepSeek 抽样验证；
-5. P3 gold standard；
-6. human evaluation；
-7. case study export。
+1. 91 天批量运行稳定性；
+2. 5m/10m cell 尺度敏感性；
+3. GRCI 权重敏感性；
+4. generation mode 对比；
+5. 典型日期案例复盘；
+6. 可选人工评价。
+
+这些实验评价的是方法稳定性、证据约束能力、报告 grounding 和可追溯性，不是灾害预测准确率。
 
 ## 9. 论文建议结构
 
@@ -148,7 +151,7 @@ P3 mock extraction 成功
 
 ## 10. 写作口径
 
-中文论文中的主角是“时空证据门控、施工状态孪生和证据约束生成”。LLM 是证据约束下的工程语义生成模块，不是唯一贡献。91 天数据是单工程连续过程验证，不要夸大成多工程泛化。GRCI 不能写成概率，forward_attention 不能写成已发生灾害，daily_excavated_scope 不能写成实际推进。
+中文论文中的主角是“多源证据约束生成、ConstructionStateCell 施工状态单元和可追溯校核”。LLM 是 Evidence Pack 约束下的工程语义生成模块，不是唯一贡献，也不是地质风险判断器。91 天数据是单工程连续过程验证，不要夸大成多工程泛化。GRCI 不能写成灾害概率，forward_attention 不能写成已发生灾害，daily_excavated_scope 不能写成实际推进。
 
 P3 只能写成旁路候选模块，不应写成正式主链路的一部分。
 

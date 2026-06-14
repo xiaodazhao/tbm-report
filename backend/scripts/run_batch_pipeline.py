@@ -25,6 +25,7 @@ def main() -> None:
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--max-dates", type=int)
     parser.add_argument("--no-llm", action="store_true", help="Use template/no-LLM mode. This is the default.")
+    parser.add_argument("--cell-size", type=float, default=10.0, help="Cell size in meters; default remains 10.")
     args = parser.parse_args()
 
     dates = _select_dates(args)
@@ -34,6 +35,7 @@ def main() -> None:
         out_dir=out_dir,
         use_llm=False,
         continue_on_error=args.continue_on_error,
+        cell_size_m=args.cell_size,
     )
     write_csv(out_dir / "batch_summary.csv", payload["summary_rows"])
     write_json(out_dir / "batch_summary.json", payload["summary"])
@@ -47,12 +49,18 @@ def run_batch_pipeline(
     out_dir: Path,
     use_llm: bool = False,
     continue_on_error: bool = True,
+    cell_size_m: float = 10.0,
 ) -> dict[str, Any]:
     summary_rows: list[dict[str, Any]] = []
     error_rows: list[dict[str, Any]] = []
     for date in dates:
         try:
-            result = run_daily_report_pipeline(date, use_llm=use_llm, generation_mode="template" if not use_llm else None)
+            result = run_daily_report_pipeline(
+                date,
+                use_llm=use_llm,
+                generation_mode="template" if not use_llm else None,
+                cell_size_m=cell_size_m,
+            )
             target = out_dir / date
             target.mkdir(parents=True, exist_ok=True)
             write_json(target / "scope_summary.json", result.scope_summary)
@@ -88,6 +96,7 @@ def _summary_row(date: str, result: Any, *, passed: bool, error_message: str | N
         "passed": passed,
         "error_message": error_message,
         "construction_state_cells": len(result.construction_state_cells),
+        "cell_size_m": result.scope_summary.get("cell_length_m"),
         "daily_review_cell_count": len(result.daily_review_cells),
         "forward_attention_cell_count": len(result.forward_attention_cells),
         "local_background_cell_count": len(result.local_background_cells),

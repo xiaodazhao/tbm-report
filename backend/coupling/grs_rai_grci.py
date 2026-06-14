@@ -42,6 +42,7 @@ def build_construction_state_cells(
     geo_by_cell = _index_by_cell(geo_states_df)
     evidence_lookup = _build_evidence_lookup(normalized_evidence_df)
     evidence_by_cell = _group_cell_evidence(cell_evidence_df)
+    evidence_summary_by_cell = _summarize_cell_evidence(cell_evidence_df)
 
     day_min, day_max = _range_bounds(day_start_chainage, day_end_chainage)
     forward_min, forward_max = _forward_bounds(current_chainage, lookahead_m, advance_direction)
@@ -75,6 +76,7 @@ def build_construction_state_cells(
         evidence_ids = _list_value(geo.get("supporting_evidence_ids"))
         if not evidence_ids:
             evidence_ids = evidence_by_cell.get(cell_id, [])
+        evidence_summary = evidence_summary_by_cell.get(cell_id, {})
 
         grs = _first_num(geo, ["GRS_geo_base", "GRS", "geo_risk_score", "GRS_base"])
         grade_score_component = _num(geo.get("grade_score_component"))
@@ -99,6 +101,9 @@ def build_construction_state_cells(
 
         source_trace = _source_trace_for_ids(evidence_ids, evidence_lookup)
         trace_refs = [str(item.get("evidence_id")) for item in source_trace if item.get("evidence_id")]
+        trace_completeness = _trace_completeness(source_trace, evidence_ids)
+        distance_to_face = _distance_to_face(cell_center, current_chainage, advance_direction)
+        forward_band, forward_weight = _forward_distance_band(distance_to_face) if cell_role == "forward_attention" else (None, None)
 
         main_hazards = _list_value(geo.get("main_hazards"))
         hazard_scores = _dict_float_value(geo.get("hazard_scores"))
@@ -136,6 +141,21 @@ def build_construction_state_cells(
             geology_evidence_ids=evidence_ids,
             supporting_evidence_ids=evidence_ids,
             source_trace=source_trace,
+            evidence_overlap_length=_num(evidence_summary.get("total_overlap_length")),
+            evidence_overlap_ratio=_num(evidence_summary.get("max_overlap_ratio")),
+            max_overlap_ratio=_num(evidence_summary.get("max_overlap_ratio")),
+            mean_overlap_ratio=_num(evidence_summary.get("mean_overlap_ratio")),
+            total_overlap_length=_num(evidence_summary.get("total_overlap_length")),
+            evidence_count=int(evidence_summary.get("evidence_count") or len(evidence_ids)),
+            evidence_ids=evidence_ids,
+            source_type_distribution=evidence_summary.get("source_type_distribution") or {},
+            evidence_confidence=_num(evidence_summary.get("evidence_confidence")),
+            evidence_confidence_method=_text(evidence_summary.get("evidence_confidence_method")) or "unavailable",
+            trace_completeness=trace_completeness,
+            trace_completeness_method="heuristic_by_trace_fields" if trace_completeness is not None else "unavailable",
+            manual_review_status=_text(evidence_summary.get("manual_review_status")),
+            source_reliability=_num(evidence_summary.get("source_reliability")),
+            source_reliability_method=_text(evidence_summary.get("source_reliability_method")) or "unavailable",
             fused_grade=_text(geo.get("fused_grade")),
             main_hazards=main_hazards,
             hazard_scores=hazard_scores,
@@ -172,6 +192,9 @@ def build_construction_state_cells(
             is_excavated_today=is_excavated_today,
             is_current_face_cell=is_current_face_cell,
             is_forward_cell=is_forward_cell,
+            distance_to_face_m=distance_to_face,
+            forward_distance_band=forward_band,
+            forward_distance_weight=forward_weight,
             cell_role=cell_role,
             used_in_evidence_pack=False,
             trace_refs=trace_refs,
@@ -299,11 +322,30 @@ def review_cells(cells: list[ConstructionStateCell], limit: int = 10) -> list[di
                 "coupling_level",
                 "main_hazards",
                 "supporting_evidence_ids",
+                "evidence_overlap_length",
+                "evidence_overlap_ratio",
+                "max_overlap_ratio",
+                "mean_overlap_ratio",
+                "total_overlap_length",
+                "evidence_count",
+                "evidence_ids",
+                "source_type_distribution",
+                "evidence_confidence",
+                "evidence_confidence_method",
+                "trace_completeness",
+                "trace_completeness_method",
+                "manual_review_status",
+                "source_reliability",
+                "source_reliability_method",
                 "coupling_explanation",
                 "has_plc_response",
                 "has_geology_evidence",
                 "is_excavated_today",
+                "is_current_face_cell",
                 "is_forward_cell",
+                "distance_to_face_m",
+                "forward_distance_band",
+                "forward_distance_weight",
                 "cell_role",
             }
         )
@@ -371,6 +413,33 @@ def _group_cell_evidence(cell_evidence_df: pd.DataFrame) -> dict[str, list[str]]
     return out
 
 
+def _summarize_cell_evidence(cell_evidence_df: pd.DataFrame) -> dict[str, dict[str, Any]]:
+    if not isinstance(cell_evidence_df, pd.DataFrame) or cell_evidence_df.empty or "cell_id" not in cell_evidence_df.columns:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for cell_id, group in cell_evidence_df.groupby("cell_id"):
+        evidence_ids = [str(value) for value in group.get("evidence_id", pd.Series(dtype=str)).dropna().tolist()]
+        source_types = [str(value) for value in group.get("source_type_norm", pd.Series(dtype=str)).dropna().tolist()]
+        overlap_lengths = pd.to_numeric(group.get("evidence_overlap_length"), errors="coerce") if "evidence_overlap_length" in group.columns else pd.Series(dtype=float)
+        overlap_ratios = pd.to_numeric(group.get("evidence_overlap_ratio"), errors="coerce") if "evidence_overlap_ratio" in group.columns else pd.Series(dtype=float)
+        reliabilities = pd.to_numeric(group.get("source_reliability"), errors="coerce") if "source_reliability" in group.columns else pd.Series(dtype=float)
+        confidences = pd.to_numeric(group.get("evidence_confidence"), errors="coerce") if "evidence_confidence" in group.columns else pd.Series(dtype=float)
+        out[str(cell_id)] = {
+            "evidence_ids": list(dict.fromkeys(evidence_ids)),
+            "evidence_count": len(set(evidence_ids)),
+            "source_type_distribution": {key: source_types.count(key) for key in sorted(set(source_types))},
+            "total_overlap_length": _series_sum(overlap_lengths),
+            "max_overlap_ratio": _series_max(overlap_ratios),
+            "mean_overlap_ratio": _series_mean(overlap_ratios),
+            "source_reliability": _series_mean(reliabilities),
+            "source_reliability_method": "mean_projected_source_reliability" if not reliabilities.dropna().empty else "unavailable",
+            "evidence_confidence": _series_mean(confidences),
+            "evidence_confidence_method": "mean_projected_evidence_confidence" if not confidences.dropna().empty else "unavailable",
+            "manual_review_status": _first_text(group, ["manual_review_status"]),
+        }
+    return out
+
+
 def _build_evidence_lookup(normalized_evidence_df: pd.DataFrame) -> dict[str, dict[str, Any]]:
     if not isinstance(normalized_evidence_df, pd.DataFrame) or normalized_evidence_df.empty:
         return {}
@@ -398,10 +467,59 @@ def _source_trace_for_ids(evidence_ids: list[str], evidence_lookup: dict[str, di
                 "spatial_type": _text(row.get("spatial_type")),
                 "start_chainage": _num(row.get("start_chainage") or row.get("start_num")),
                 "end_chainage": _num(row.get("end_chainage") or row.get("end_num")),
+                "evidence_confidence": _num(row.get("evidence_confidence") or row.get("confidence")),
+                "evidence_confidence_method": _text(row.get("evidence_confidence_method")) or ("source_field" if _num(row.get("confidence")) is not None else "unavailable"),
+                "manual_review_status": _text(row.get("manual_review_status")),
+                "source_reliability": _num(row.get("source_reliability")),
+                "source_reliability_method": _text(row.get("source_reliability_method")) or ("source_field" if _num(row.get("source_reliability")) is not None else "unavailable"),
                 "raw_text_excerpt": _excerpt(row.get("raw_text") or row.get("text") or row.get("description")),
             }
         )
     return traces
+
+
+def _trace_completeness(source_trace: list[dict[str, Any]], evidence_ids: list[str]) -> float | None:
+    if not evidence_ids:
+        return None
+    if not source_trace:
+        return 0.0
+    scores = []
+    for trace in source_trace:
+        has_id = bool(trace.get("evidence_id"))
+        has_source = bool(trace.get("source_type"))
+        has_chainage = trace.get("start_chainage") is not None or trace.get("end_chainage") is not None
+        has_trace_text = bool(trace.get("raw_text_excerpt") or trace.get("report_id"))
+        if has_id and has_source and has_chainage and has_trace_text:
+            scores.append(1.0)
+        elif has_id and has_chainage:
+            scores.append(0.7)
+        elif has_trace_text or has_source:
+            scores.append(0.4)
+        else:
+            scores.append(0.0)
+    return sum(scores) / len(scores) if scores else 0.0
+
+
+def _distance_to_face(cell_center: float | None, current_chainage: float | None, direction: int) -> float | None:
+    center = _num(cell_center)
+    current = _num(current_chainage)
+    if center is None or current is None:
+        return None
+    sign = 1 if float(direction or 1) >= 0 else -1
+    return float((center - current) * sign)
+
+
+def _forward_distance_band(distance_to_face_m: float | None) -> tuple[str, float | None]:
+    distance = _num(distance_to_face_m)
+    if distance is None:
+        return "unknown", None
+    if 0.0 <= distance <= 10.0:
+        return "near_forward", 1.0
+    if 10.0 < distance <= 20.0:
+        return "short_forward", 0.7
+    if 20.0 < distance <= 30.0:
+        return "extended_forward", 0.4
+    return "outside_forward_window", None
 
 
 def _response_metrics(response: dict[str, Any]) -> dict[str, Any]:
@@ -537,6 +655,43 @@ def _first_num(row: dict[str, Any], keys: list[str]) -> float | None:
         number = _num(row.get(key))
         if number is not None:
             return _bounded(number)
+    return None
+
+
+def _series_mean(series: pd.Series) -> float | None:
+    if series is None:
+        return None
+    cleaned = pd.to_numeric(series, errors="coerce").dropna()
+    if cleaned.empty:
+        return None
+    return float(cleaned.mean())
+
+
+def _series_max(series: pd.Series) -> float | None:
+    if series is None:
+        return None
+    cleaned = pd.to_numeric(series, errors="coerce").dropna()
+    if cleaned.empty:
+        return None
+    return float(cleaned.max())
+
+
+def _series_sum(series: pd.Series) -> float | None:
+    if series is None:
+        return None
+    cleaned = pd.to_numeric(series, errors="coerce").dropna()
+    if cleaned.empty:
+        return None
+    return float(cleaned.sum())
+
+
+def _first_text(frame: pd.DataFrame, keys: list[str]) -> str | None:
+    for key in keys:
+        if key in frame.columns:
+            for value in frame[key].dropna().tolist():
+                text = _text(value)
+                if text:
+                    return text
     return None
 
 

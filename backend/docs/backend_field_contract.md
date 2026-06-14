@@ -24,6 +24,7 @@ P3 sidecar 输出、批量审计输出和正式日报输出各有边界；`_arch
 | `daily_excavated_scope` | 10m cell 对齐后的已掘复核范围 | 不是实际推进范围 |
 | `forward_scope` | 当前掌子面前方关注窗口 | 只用于前方关注提示 |
 | `local_background_scope` | 已掘范围后方局部背景窗口 | 只作背景上下文 |
+| `cell_size_m` | 当前运行使用的 cell 尺度，默认 10m | 10m 是最大推荐日报复核尺度；5m/10m 用于尺度敏感性分析 |
 
 典型表达：
 
@@ -54,16 +55,46 @@ PLC 实测推进范围为 1014601.0 至 1014616.0，日推进约 15.0 m；
 | `main_hazards` | 主要地质关注类型 |
 | `source_trace` | 支撑该 cell 的证据追溯信息 |
 | `coupling_explanation` | 面向报告的耦合解释 |
+| `evidence_overlap_length` | 代表性证据-cell 重叠长度 |
+| `evidence_overlap_ratio` | 代表性证据-cell 重叠比例 |
+| `max_overlap_ratio` / `mean_overlap_ratio` | 当前 cell 证据重叠比例摘要 |
+| `total_overlap_length` | 当前 cell 证据重叠长度合计 |
+| `evidence_count` / `evidence_ids` | 当前 cell 投影证据数量与 ID |
+| `source_type_distribution` | 当前 cell 中证据来源类型分布 |
+| `evidence_confidence` | 证据置信度摘要；来源缺失时为 null |
+| `evidence_confidence_method` | 证据置信度来源说明 |
+| `trace_completeness` | 追溯信息完整度 |
+| `trace_completeness_method` | 追溯完整度计算方法 |
+| `manual_review_status` | 人工复核状态 |
+| `source_reliability` | 来源可靠性摘要；来源缺失时为 null |
+| `source_reliability_method` | 来源可靠性来源说明 |
+| `distance_to_face_m` | cell center 到当前掌子面的距离 |
+| `forward_distance_band` | 前方距离分带 |
+| `forward_distance_weight` | 前方 cell 选择分中的距离权重 |
 
-## 3. RAI / GRS / GRCI
+上述 overlap、trace completeness、source reliability、selection 相关字段主要服务解释性导出、Evidence Pack selection 和论文实验分析；它们不改变 RAI / GRS / GRCI 的默认公式和语义边界。
+
+forward 距离分层当前采用：
+
+| 分层 | 语义 |
+|---|---|
+| `near_0_10m` | 当前掌子面前方 0-10m |
+| `mid_10_20m` | 当前掌子面前方 10-20m |
+| `far_20_30m` | 当前掌子面前方 20-30m |
+| `beyond_30m` | 超出 30m 关注窗口 |
+| `not_forward` | 非前方关注 cell |
+
+## 3. RAI / GRS / GRCI 启发式关注指标
 
 | 指标 | 语义 | 不应误解为 |
 |---|---|---|
-| `RAI` | PLC 施工响应异常关注度 | 事故原因或停机原因 |
-| `GRS_geo_base` | 地质证据关注度 | 地质灾害概率 |
-| `GRCI` | 已掘 cell 的地质-施工响应耦合关注度 | 灾害概率、前方风险 |
+| `RAI` | PLC 施工响应启发式关注度 | 事故原因或停机原因 |
+| `GRS_geo_base` | 地质证据启发式关注度 | 地质灾害概率 |
+| `GRCI` | 已掘 cell 的地质-施工响应耦合启发式关注度 | 灾害概率、前方风险 |
 
 GRCI 只在 daily review cell 中计算。forward attention 和 local background cell 必须视为 `GRCI_available=false`。
+
+当前没有灾害发生标签、异常原因标签或现场复核标签，因此这些指标不进行监督学习式权重校准。
 
 ## 4. Evidence Pack
 
@@ -85,6 +116,20 @@ GRCI 只在 daily review cell 中计算。forward attention 和 local background
 
 `geology_evidence.key_cells` 是正式字段；`geology_evidence.selected_cells` 是短期兼容字段，当前与 `key_cells` 内容一致。
 
+Evidence Pack 中 cell 可包含以下选择字段：
+
+| 字段 | 含义 |
+|---|---|
+| `selection_score` | 当前角色下的选择分 |
+| `selection_rank` | 当前角色下的排序 |
+| `selection_reason` | 被选入 Evidence Pack 的原因 |
+| `selection_method` | 选择分方法版本 |
+| `selected_by_score` | 是否按选择分进入 Evidence Pack |
+
+`daily_review` 的选择分可以使用 GRCI；`forward_attention` 的选择分不得使用 GRCI。
+
+selection 字段只决定 Evidence Pack 中关键 cell 的排序和说明，不改变原始 cell 的 RAI / GRS / GRCI 数值。
+
 ## 5. Quality / Trace 字段
 
 | 字段 | 含义 |
@@ -96,6 +141,16 @@ GRCI 只在 daily review cell 中计算。forward attention 和 local background
 | `error_type_counts` | 各类错误数量 |
 | `support_type_distribution` | 证据支撑类型分布 |
 | `E14_ALIGNED_SCOPE_AS_ACTUAL_ADVANCE` | 将 10m 对齐复核范围误写为实际推进范围或实际推进量 |
+
+## 5.1 method_metrics 新增字段
+
+| 字段 | 含义 |
+|---|---|
+| `cell_size_m` | 当前运行使用的 cell 尺寸 |
+| `mean_trace_completeness` | cell 追溯完整度均值 |
+| `min_trace_completeness` | cell 追溯完整度最小值 |
+| `low_trace_completeness_count` | 追溯完整度偏低的 cell 数量 |
+| `evidence_without_trace_count` | 有证据但追溯信息缺失的 cell 数量 |
 
 ## 6. LLM Planner 字段
 

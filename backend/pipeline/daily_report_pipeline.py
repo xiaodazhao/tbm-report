@@ -40,12 +40,17 @@ def run_daily_report_pipeline(
     planner_model: str | None = None,
     max_revision_rounds: int = 1,
     cell_length: float = 10.0,
+    cell_size_m: float | None = None,
     lookahead_m: float = 30.0,
     advance_direction: int = 1,
     local_background_back_m: float = 100.0,
 ) -> DailyReportResult:
     """Run the only retained daily TBM report pipeline."""
     warnings: list[str] = []
+    if cell_size_m is not None:
+        cell_length = float(cell_size_m)
+    if float(cell_length or 10.0) > 10.0:
+        warnings.append("cell_size_m larger than recommended maximum for daily report review")
     active_generation_mode = normalize_generation_mode(
         generation_mode or ("evidence_pack_llm" if use_llm else "template")
     )
@@ -497,6 +502,7 @@ def _method_metrics(
         "daily_review_cell_count": sum(1 for cell in cells if cell.cell_role == "daily_review"),
         "forward_attention_cell_count": sum(1 for cell in cells if cell.cell_role == "forward_attention"),
         "local_background_cell_count": sum(1 for cell in cells if cell.cell_role == "local_background"),
+        "cell_size_m": scope_summary.get("cell_length_m"),
         "RAI_available_count": sum(1 for cell in cells if cell.RAI is not None),
         "GRS_available_count": sum(1 for cell in cells if cell.GRS_available),
         "GRCI_available_count": sum(1 for cell in cells if cell.GRCI_available),
@@ -510,6 +516,10 @@ def _method_metrics(
         "grounding_rate": quality_summary.get("grounding_rate"),
         "trace_coverage": trace_summary.get("trace_coverage"),
         "quality_score": quality_summary.get("quality_score"),
+        "mean_trace_completeness": _mean([cell.trace_completeness for cell in cells if cell.trace_completeness is not None]),
+        "min_trace_completeness": _min([cell.trace_completeness for cell in cells if cell.trace_completeness is not None]),
+        "low_trace_completeness_count": sum(1 for cell in cells if cell.trace_completeness is not None and cell.trace_completeness < 0.7),
+        "evidence_without_trace_count": sum(1 for cell in cells if cell.evidence_count and not cell.source_trace),
         "error_type_counts": quality.get("error_type_counts", {}),
         "support_type_distribution": trace.get("support_type_distribution", {}),
         "trace_support_none_count": (trace.get("support_type_distribution", {}) or {}).get("none", 0),
@@ -622,9 +632,28 @@ def _with_forward_attention_cells(forward_profile: dict[str, Any], construction_
                 "GRS_available",
                 "GRS_unavailable_reason",
                 "supporting_evidence_ids",
+                "evidence_overlap_length",
+                "evidence_overlap_ratio",
+                "max_overlap_ratio",
+                "mean_overlap_ratio",
+                "total_overlap_length",
+                "evidence_count",
+                "evidence_ids",
+                "source_type_distribution",
+                "evidence_confidence",
+                "evidence_confidence_method",
+                "trace_completeness",
+                "trace_completeness_method",
+                "manual_review_status",
+                "source_reliability",
+                "source_reliability_method",
                 "source_trace",
                 "is_current_face_cell",
                 "is_forward_cell",
+                "distance_to_face_m",
+                "forward_distance_band",
+                "forward_distance_weight",
+                "cell_role",
                 "trace_refs",
             }
         )
@@ -646,3 +675,15 @@ def _num(value: Any) -> float | None:
     if pd.isna(number):
         return None
     return number
+
+
+def _mean(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return float(sum(values) / len(values))
+
+
+def _min(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return float(min(values))

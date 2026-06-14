@@ -23,6 +23,7 @@ class DailyReportRequest(BaseModel):
     enable_planner: bool | None = None
     planner_provider: str | None = None
     planner_model: str | None = None
+    cell_size_m: float | None = Field(default=None, gt=0)
 
     @field_validator("date")
     @classmethod

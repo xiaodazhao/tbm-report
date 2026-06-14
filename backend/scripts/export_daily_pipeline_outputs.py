@@ -41,6 +41,7 @@ def main() -> None:
     parser.add_argument("--enable-planner", action="store_true", help="Enable LLM report planner when generation mode supports it.")
     parser.add_argument("--planner-provider", help="Planner LLM provider, defaults to --llm-provider.")
     parser.add_argument("--planner-model", help="Planner LLM model, defaults to --llm-model.")
+    parser.add_argument("--cell-size", type=float, default=10.0, help="Cell size in meters; default remains 10.")
     parser.add_argument("--out-dir", default="outputs/pipeline_exports", help="Output directory.")
     args = parser.parse_args()
 
@@ -66,6 +67,7 @@ def main() -> None:
                 enable_planner=args.enable_planner if args.enable_planner else None,
                 planner_provider=args.planner_provider,
                 planner_model=args.planner_model,
+                cell_size_m=args.cell_size,
             )
         )
 
@@ -98,6 +100,7 @@ def _export_one(
     enable_planner: bool | None = None,
     planner_provider: str | None = None,
     planner_model: str | None = None,
+    cell_size_m: float = 10.0,
 ) -> dict[str, Any]:
     target = out_dir / date
     target.mkdir(parents=True, exist_ok=True)
@@ -113,10 +116,12 @@ def _export_one(
             enable_planner=enable_planner,
             planner_provider=planner_provider,
             planner_model=planner_model,
+            cell_size_m=cell_size_m,
         )
         cells = [cell.model_dump() for cell in result.construction_state_cells]
         summary = {
             "date": result.date,
+            "cell_size_m": result.scope_summary.get("cell_length_m"),
             "construction_state_cells_row_count": len(cells),
             "grci_available_count": sum(1 for item in cells if item.get("GRCI_available")),
             "high_grci_cell_count": len(result.high_grci_cells),

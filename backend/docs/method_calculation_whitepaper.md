@@ -25,11 +25,14 @@
 -> 用 Quality / Trace 检查报告 claim 是否有证据支撑
 ```
 
+当前方法主线已经冻结，后续工作进入实验与复盘阶段。RAI、GRS、GRCI 均为启发式关注指标，用于工程日报中的关注排序、复核提示和可追溯解释；它们不是灾害预测模型，也不输出灾害发生概率。
+
 当前系统不做：
 
 - 不重新解释 TSP/HSP 原始探测信号；
 - 不做 TBM 物理仿真数字孪生；
 - 不做地质灾害概率预测；
+- 不做监督学习式权重校准，因为当前数据没有灾害发生标签、异常原因标签或现场复核标签；
 - 不让 LLM 计算 RAI、GRS、GRCI；
 - 不让 P3 旁路候选证据自动进入正式日报主链路。
 
@@ -107,9 +110,9 @@ PLC 实测推进范围 != 10m cell 对齐后的复核范围
 
 下游 Evidence Pack、Twin State、Trace、debug API 和导出文件都优先使用该对象，而不是从零散 dict 中重复取字段。
 
-## 5. RAI 施工响应异常度
+## 5. RAI 施工响应启发式关注指标
 
-`RAI` 表示 PLC 施工响应关注度，是工程近似异常指标，不是灾害概率。
+`RAI` 表示 PLC 施工响应关注度，是基于停机占比、异常工况占比、速度下降和参数波动构造的启发式关注指标。它不是灾害概率，也不是异常停机原因识别器。
 
 当前 components：
 
@@ -146,9 +149,9 @@ RAI = stop_component
 
 因此报告不能把“停机比例高”直接写成“异常停机原因明确”。
 
-## 6. GRS 地质证据关注度
+## 6. GRS 地质证据启发式关注指标
 
-`GRS_geo_base` 表示地质证据融合后的关注度，不是灾害概率。
+`GRS_geo_base` 表示地质证据融合后的启发式关注度，不是灾害概率。它用于表达“该 cell 的可用地质证据是否值得日报关注”，不表示地质灾害必然发生。
 
 当前公式：
 
@@ -184,9 +187,9 @@ GRS_geo_base = 0.45 * grade_score_component
 - `GRS_geo_base=0` 不能自动解释为“低关注”，必须同时看 `GRS_available`；
 - 有证据但关注低，和没有证据，是两种不同语义。
 
-## 7. GRCI 地质-施工响应耦合关注度
+## 7. GRCI 地质-施工响应耦合启发式关注指标
 
-`GRCI` 表示地质证据关注与施工响应关注的耦合复核指标。它不是灾害概率，不是前方风险，也不能用于 forward cell。
+`GRCI` 表示地质证据关注与施工响应关注的耦合复核指标。它是已掘区段复核用的启发式关注指标，不是灾害概率，不是前方风险，也不能用于 forward cell。
 
 只有满足以下条件才计算正式 GRCI：
 
@@ -225,6 +228,47 @@ GRCI = grs_term + rai_term + interaction_term
 - forward_attention 与 local_background cell 不计算 GRCI；
 - high GRCI 只来自已掘区段。
 
+## 7.1 方法增强后的解释性字段
+
+当前稳定版在不改变 RAI / GRS / GRCI 公式的前提下，增加了若干解释性字段：
+
+| 字段组 | 字段 | 用途 |
+|---|---|---|
+| cell 尺度 | `cell_size_m` | 标记本次运行使用的 cell 尺度，默认 10m |
+| 证据重叠 | `evidence_overlap_length`、`evidence_overlap_ratio`、`max_overlap_ratio`、`mean_overlap_ratio` | 解释地质证据与 cell 的空间交叠关系 |
+| 证据摘要 | `evidence_count`、`source_type_distribution` | 解释 cell 支撑证据数量和来源类型 |
+| 前方距离 | `distance_to_face_m`、`forward_distance_band`、`forward_distance_weight` | 解释 forward_attention cell 距当前掌子面的位置 |
+| 置信与可靠性 | `evidence_confidence`、`evidence_confidence_method`、`source_reliability`、`source_reliability_method` | 在来源有字段时保留置信和可靠性信息；没有来源字段时不伪造 |
+| 追溯完整度 | `trace_completeness`、`trace_completeness_method` | 评估 source trace 是否足以支撑报告复盘 |
+| Evidence Pack selection | `selection_score`、`selection_rank`、`selection_reason`、`selection_method`、`selected_by_score` | 解释 key cell 为什么进入 Evidence Pack |
+
+这些字段服务于解释性导出、Evidence Pack selection 和论文实验分析，不改变 RAI、GRS、GRCI 的默认语义边界。
+
+## 7.2 forward distance band
+
+`forward_attention` 的距离分层为：
+
+```text
+0-10m   -> near_0_10m
+10-20m  -> mid_10_20m
+20-30m  -> far_20_30m
+```
+
+该距离只用于前方关注提示和 Evidence Pack selection。前方 cell 不计算正式 GRCI，报告只能写“当前掌子面前方关注提示”，不能写成已发生事实。
+
+## 7.3 cell_size_m 与尺度敏感性
+
+默认 cell 尺度为 10m。10m 是当前日报复核的最大推荐尺度。5m/10m 用于 cell 尺度敏感性分析，默认不使用 20m。若显式使用大于 10m 的尺度，系统会给出 warning。
+
+需要特别区分：
+
+```text
+daily_plc_range / daily_advance_m = PLC 实测推进范围和推进量
+daily_excavated_scope = cell 对齐后的已掘复核范围
+```
+
+`daily_excavated_scope` 会随 cell 尺度变化，不能写成实际推进范围。
+
 ## 8. Evidence Pack
 
 Evidence Pack 是报告生成的唯一结构化证据输入。它至少包含：
@@ -252,6 +296,20 @@ Evidence Pack 是报告生成的唯一结构化证据输入。它至少包含：
 - 短期兼容字段：`geology_evidence.selected_cells`
 - 两者内容保持一致；
 - grounding checker 优先读取 `key_cells`，其次 fallback 到 `selected_cells`。
+
+Evidence Pack selection 字段：
+
+- `selection_score`：当前证据角色下的选择分；
+- `selection_rank`：同一角色内的排序；
+- `selection_reason`：进入 Evidence Pack 的原因；
+- `selection_method`：选择分方法版本；
+- `selected_by_score`：是否按选择分进入 Evidence Pack。
+
+不同角色的选择分语义不同：
+
+- `daily_review` 可以使用 GRCI、RAI、GRS 和 trace completeness；
+- `forward_attention` 只能使用 GRS、forward distance、evidence confidence 和 trace completeness，不使用 GRCI；
+- `local_background` 只作为局部背景上下文，不作为当日复核结论。
 
 ## 9. 报告生成
 
@@ -328,13 +386,25 @@ P3 不写入正式 `evidence_db.csv`，不进入 time_valid / spatial_relevant�
 `method_metrics.json` 用于后续实验统计，包含：
 
 - date 与里程范围；
+- `cell_size_m`；
 - time_valid / spatial_relevant / excluded evidence 数量；
 - construction_state_cell_count；
 - daily_review / forward_attention / local_background 数量；
 - RAI / GRS / GRCI available 数量；
+- trace completeness 统计；
 - high / medium / low priority cell 数量；
 - claim / grounding / quality / trace 指标；
 - warnings 与 passed 状态。
+
+当前可复盘的实验脚本包括：
+
+- `analyze_batch_metrics.py`：批量质量、trace、cell role 和 GRCI 可用性统计；
+- `analyze_generation_modes.py`：不同生成模式的质量、trace 和错误类型对比；
+- `analyze_grci_weight_sensitivity.py`：GRCI 启发式权重敏感性分析；
+- `analyze_cell_size_sensitivity.py`：5m/10m cell 尺度敏感性分析；
+- `export_allowed_claims.py`：旁路导出 allowed claims，不接入默认生成流程。
+
+其中权重敏感性分析是稳定性检验，不是灾害预测验证；当前没有灾害发生标签、异常原因标签或现场复核标签，因此不做监督学习式权重校准或预测准确率评价。
 
 ## 13. 典型日期复盘方式
 

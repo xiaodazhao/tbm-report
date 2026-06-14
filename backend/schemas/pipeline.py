@@ -40,6 +40,21 @@ class ConstructionStateCell(BaseModel):
     geology_evidence_ids: list[str] = Field(default_factory=list)
     supporting_evidence_ids: list[str] = Field(default_factory=list)
     source_trace: list[dict[str, Any]] = Field(default_factory=list)
+    evidence_overlap_length: float | None = None
+    evidence_overlap_ratio: float | None = None
+    max_overlap_ratio: float | None = None
+    mean_overlap_ratio: float | None = None
+    total_overlap_length: float | None = None
+    evidence_count: int = 0
+    evidence_ids: list[str] = Field(default_factory=list)
+    source_type_distribution: dict[str, int] = Field(default_factory=dict)
+    evidence_confidence: float | None = None
+    evidence_confidence_method: str = "unavailable"
+    trace_completeness: float | None = None
+    trace_completeness_method: str = "unavailable"
+    manual_review_status: str | None = None
+    source_reliability: float | None = None
+    source_reliability_method: str = "unavailable"
     fused_grade: str | None = None
     main_hazards: list[str] = Field(default_factory=list)
     hazard_scores: dict[str, float] = Field(default_factory=dict)
@@ -71,6 +86,9 @@ class ConstructionStateCell(BaseModel):
     is_excavated_today: bool = False
     is_current_face_cell: bool = False
     is_forward_cell: bool = False
+    distance_to_face_m: float | None = None
+    forward_distance_band: str | None = None
+    forward_distance_weight: float | None = None
     cell_role: str = "outside_report_scope"
     used_in_evidence_pack: bool = False
     trace_refs: list[str] = Field(default_factory=list)

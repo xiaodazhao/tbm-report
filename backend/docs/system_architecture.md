@@ -8,7 +8,11 @@
 - [方法与计算逻辑白皮书](method_calculation_whitepaper.md)
 - [LLM 生成模式](llm_generation_modes.md)
 - [批量审计与多日期运行](batch_pipeline.md)
+- [方法增强说明](method_enhancement.md)
+- [实验与复盘脚本说明](experiment_scripts.md)
 - [旁路式地质文本结构化](geology_text_extraction.md)
+
+当前方法主线已经冻结，后续工作进入实验与复盘阶段。旁路分析脚本、P3 candidate evidence 和 allowed claims 导出均不改变本文所述默认主流程。
 
 ## 1. 当前唯一日报主链路
 

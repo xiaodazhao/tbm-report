@@ -30,17 +30,20 @@ def build_prompt_evidence_pack(
     priority_cells: dict[str, list[dict[str, Any]]] | None = None,
     quality_evidence: dict[str, Any] | None = None,
     warnings: list[str] | None = None,
+    top_k_review_cells: int = 10,
+    top_k_forward_cells: int = 8,
+    top_k_background_cells: int = 8,
 ) -> dict[str, Any]:
     """Build the sole evidence pack used for report prompting and trace."""
-    excavated_review_cells = _select_excavated_review_cells(construction_state_cells, high_grci_cells)
-    forward_attention_cells = _select_forward_attention_cells(construction_state_cells)
+    excavated_review_cells = _select_excavated_review_cells(construction_state_cells, high_grci_cells)[:top_k_review_cells]
+    forward_attention_cells = _select_forward_attention_cells(construction_state_cells)[:top_k_forward_cells]
     background_context_cells = _select_background_context_cells(
         construction_state_cells,
         excluded_ids={
             *(cell.cell_id for cell in excavated_review_cells),
             *(cell.cell_id for cell in forward_attention_cells),
         },
-    )
+    )[:top_k_background_cells]
     selected_cells = _merge_cells(
         excavated_review_cells,
         forward_attention_cells,
@@ -50,10 +53,10 @@ def build_prompt_evidence_pack(
     for cell in construction_state_cells:
         cell.used_in_evidence_pack = cell.cell_id in selected_ids
 
-    key_cells = [_cell_for_pack(cell) for cell in selected_cells]
-    excavated_pack_cells = [_cell_for_pack(cell) for cell in excavated_review_cells]
-    forward_pack_cells = [_cell_for_forward_pack(cell) for cell in forward_attention_cells]
-    background_pack_cells = [_cell_for_pack(cell) for cell in background_context_cells]
+    excavated_pack_cells = _pack_cells_with_selection(excavated_review_cells, "daily_review")
+    forward_pack_cells = _pack_cells_with_selection(forward_attention_cells, "forward_attention")
+    background_pack_cells = _pack_cells_with_selection(background_context_cells, "local_background")
+    key_cells = _merge_pack_cells(excavated_pack_cells, forward_pack_cells, background_pack_cells)
     scope = dict(scope_summary or {})
     scope.setdefault("date", date)
     scope.setdefault("current_chainage", current_chainage)
@@ -133,6 +136,16 @@ def build_prompt_evidence_pack(
         "quality_evidence": quality_evidence or {},
         "source_trace": _collect_source_trace(selected_cells),
         "generation_constraints": GENERATION_CONSTRAINTS,
+        "selection_config": {
+            "top_k_review_cells": top_k_review_cells,
+            "top_k_forward_cells": top_k_forward_cells,
+            "top_k_background_cells": top_k_background_cells,
+            "selection_methods": {
+                "daily_review": "0.40*GRCI + 0.25*RAI + 0.25*GRS + 0.10*trace_completeness with available terms renormalized",
+                "forward_attention": "0.45*GRS + 0.25*forward_distance_weight + 0.20*evidence_confidence + 0.10*trace_completeness with available terms renormalized; GRCI is not used",
+                "local_background": "0.50*GRS + 0.25*evidence_confidence + 0.25*trace_completeness with available terms renormalized",
+            },
+        },
         "warnings": warnings or [],
     }
 
@@ -399,6 +412,72 @@ def _select_forward_attention_cells(cells: list[ConstructionStateCell]) -> list[
     return ranked[:8]
 
 
+def _pack_cells_with_selection(cells: list[ConstructionStateCell], role: str) -> list[dict[str, Any]]:
+    scored = []
+    for cell in cells:
+        score, method, reason = _selection_score(cell, role)
+        payload = _cell_for_forward_pack(cell) if role == "forward_attention" else _cell_for_pack(cell)
+        payload.update(
+            {
+                "selection_score": score,
+                "selection_method": method,
+                "selection_reason": reason,
+                "selected_by_score": True,
+            }
+        )
+        scored.append(payload)
+    scored.sort(key=lambda item: item.get("selection_score") or 0.0, reverse=True)
+    for index, item in enumerate(scored, start=1):
+        item["selection_rank"] = index
+    return scored
+
+
+def _merge_pack_cells(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen = set()
+    for group in groups:
+        for cell in group:
+            cell_id = cell.get("cell_id")
+            if cell_id in seen:
+                continue
+            out.append(cell)
+            seen.add(cell_id)
+    return out
+
+
+def _selection_score(cell: ConstructionStateCell, role: str) -> tuple[float | None, str, str]:
+    if role == "daily_review":
+        terms = [
+            ("GRCI", 0.40, cell.GRCI if cell.GRCI_available else None),
+            ("RAI", 0.25, cell.RAI),
+            ("GRS", 0.25, cell.GRS_geo_base if cell.GRS_available else None),
+            ("trace_completeness", 0.10, cell.trace_completeness),
+        ]
+        method = "daily_review_selection_score_v1"
+    elif role == "forward_attention":
+        terms = [
+            ("GRS", 0.45, cell.GRS_geo_base if cell.GRS_available else None),
+            ("forward_distance_weight", 0.25, cell.forward_distance_weight),
+            ("evidence_confidence", 0.20, cell.evidence_confidence),
+            ("trace_completeness", 0.10, cell.trace_completeness),
+        ]
+        method = "forward_attention_selection_score_v1_no_grci"
+    else:
+        terms = [
+            ("GRS", 0.50, cell.GRS_geo_base if cell.GRS_available else None),
+            ("evidence_confidence", 0.25, cell.evidence_confidence),
+            ("trace_completeness", 0.25, cell.trace_completeness),
+        ]
+        method = "local_background_selection_score_v1"
+    available = [(name, weight, _bounded(value)) for name, weight, value in terms if value is not None]
+    if not available:
+        return None, method, "no_available_selection_terms"
+    total_weight = sum(weight for _, weight, _ in available) or 1.0
+    score = sum((weight / total_weight) * value for _, weight, value in available)
+    reason = ", ".join(f"{name}={value:.3f}" for name, _, value in available)
+    return round(float(score), 4), method, reason
+
+
 def _is_daily_review_cell(cell: ConstructionStateCell) -> bool:
     return cell.cell_role == "daily_review" or (
         cell.cell_role == "outside_report_scope"
@@ -474,10 +553,28 @@ def _cell_for_pack(cell: ConstructionStateCell) -> dict[str, Any]:
             "has_plc_response",
             "has_geology_evidence",
             "supporting_evidence_ids",
+            "evidence_overlap_length",
+            "evidence_overlap_ratio",
+            "max_overlap_ratio",
+            "mean_overlap_ratio",
+            "total_overlap_length",
+            "evidence_count",
+            "evidence_ids",
+            "source_type_distribution",
+            "evidence_confidence",
+            "evidence_confidence_method",
+            "trace_completeness",
+            "trace_completeness_method",
+            "manual_review_status",
+            "source_reliability",
+            "source_reliability_method",
             "source_trace",
             "is_excavated_today",
             "is_current_face_cell",
             "is_forward_cell",
+            "distance_to_face_m",
+            "forward_distance_band",
+            "forward_distance_weight",
             "cell_role",
             "trace_refs",
         }
@@ -506,9 +603,27 @@ def _cell_for_forward_pack(cell: ConstructionStateCell) -> dict[str, Any]:
             "GRS_available",
             "GRS_unavailable_reason",
             "supporting_evidence_ids",
+            "evidence_overlap_length",
+            "evidence_overlap_ratio",
+            "max_overlap_ratio",
+            "mean_overlap_ratio",
+            "total_overlap_length",
+            "evidence_count",
+            "evidence_ids",
+            "source_type_distribution",
+            "evidence_confidence",
+            "evidence_confidence_method",
+            "trace_completeness",
+            "trace_completeness_method",
+            "manual_review_status",
+            "source_reliability",
+            "source_reliability_method",
             "source_trace",
             "is_current_face_cell",
             "is_forward_cell",
+            "distance_to_face_m",
+            "forward_distance_band",
+            "forward_distance_weight",
             "cell_role",
             "trace_refs",
         }
@@ -542,6 +657,10 @@ def _num(value: Any) -> float:
         return float(value)
     except Exception:
         return 0.0
+
+
+def _bounded(value: Any) -> float:
+    return max(0.0, min(1.0, _num(value)))
 
 
 def _format_score(value: Any) -> str:
