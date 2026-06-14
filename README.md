@@ -1,122 +1,154 @@
-# TBM 施工日报生成工作台
+# TBM 施工日报生成研究原型
 
-本仓库当前整理为一个以后端单主线 pipeline 为核心、配套干净前端工作台的 TBM 施工日报研究原型。
+本项目是一个面向 TBM 连续掘进过程的施工日报生成研究原型。当前主线不是“直接让大语言模型写日报”，而是先把 PLC 运行数据、多源地质证据和报告约束组织成可追溯的结构化证据，再由模板或受约束 LLM 生成、核验和修订日报。
 
-当前有效主线：
+## 当前主线
 
 ```text
 backend/routes/report.py
 -> backend/pipeline/daily_report_pipeline.py::run_daily_report_pipeline
 -> ConstructionStateCell
 -> Prompt Evidence Pack
--> Report
+-> template / LLM / planner LLM
 -> Quality / Trace
+-> Report
 ```
 
-旧前端、旧论文实验脚本、旧顶层文档和旧后端模块均已归档，不参与当前主流程。
-
-## 当前主目录
-
-```text
-tbm-report/
-├── backend/      当前有效后端研究原型
-├── frontend/     当前有效前端日报生成工作台
-├── _archive/     历史材料归档，不参与当前主流程
-├── README.md     当前说明
-├── .gitignore
-└── pytest.ini
-```
-
-## 后端主线
-
-当前后端从 PLC 日运行数据和多源地质证据出发，完成：
-
-1. 读取日运行 PLC CSV 与地质证据库；
-2. 分析 PLC 工况、聚类施工状态、气体监测和施工响应；
-3. 通过 `geology_v2` 完成地质证据标准化、online 过滤、cell 投影和融合；
-4. 构建 10m `ConstructionStateCell`；
-5. 计算 `GRS_geo_base / RAI / GRCI`；
-6. 构建当前掌子面前方 `forward_profile`；
-7. 构建 Prompt Evidence Pack；
-8. 生成 no-LLM 模板报告或 LLM fallback 报告；
-9. 执行 Quality / Trace 核验；
-10. 通过 API 或导出脚本输出结果。
-
-详细说明：
-
-- [后端 README](backend/README.md)
+核心说明文档：
+- [系统架构](backend/docs/system_architecture.md)
 - [字段契约](backend/docs/backend_field_contract.md)
-- [方法定义](backend/docs/method_definition.md)
-- [指标定义](backend/docs/metrics_definition.md)
-- [范围与限制](backend/docs/scope_and_limitations.md)
-- [目录归档计划](backend/docs/archive_plan.md)
+- [LLM 生成模式](backend/docs/llm_generation_modes.md)
+- [批量审计与运行](backend/docs/batch_pipeline.md)
+- [P3 地质文本结构化旁路模块](backend/docs/geology_text_extraction.md)
+- [后续实验计划](backend/docs/experiment_plan.md)
+- [论文写作用完整上下文包](backend/docs/paper_writing_context.md)
+- [论文写作用精简上下文包](backend/docs/llm_context_brief.md)
 
-## 前端工作台
+## 项目目标
 
-当前前端是从头重做的 Vue 3 工作台，位于：
+项目目标是构建一条可复现、可解释、可追溯的 TBM 施工日报生成链路：
+
+1. 从日运行 PLC 数据和正式 `evidence_db` 读取输入；
+2. 通过时间合法性和空间相关性筛选地质证据；
+3. 构建 10m 里程单元 `ConstructionStateCell`；
+4. 计算 RAI、GRS、GRCI 等工程关注指标；
+5. 构建 Prompt Evidence Pack 约束报告生成；
+6. 使用 template、LLM、planner LLM 和 revision 等模式生成报告；
+7. 通过 Quality / Trace / Error Taxonomy 检查报告是否有证据支撑；
+8. 支持 91 天数据审计、日期分类、批量 pipeline 和批量 mock LLM 运行；
+9. 额外提供 P3 sidecar 地质文本结构化候选模块，但不接入正式主链路。
+
+## generation_mode
+
+当前支持：
 
 ```text
-frontend/
+template
+evidence_pack_llm
+evidence_pack_llm_with_revision
+evidence_pack_planner_llm
+evidence_pack_planner_llm_with_revision
 ```
 
-前端只调用当前后端四个 API：
+开发和测试默认使用 `template` 或 `mock`。真实 DeepSeek / OpenAI-compatible 调用必须显式允许外发，例如脚本参数 `--allow-external-llm` 或对应环境变量。不要在未确认数据脱敏和外发许可前把 Evidence Pack 发给外部模型。
+
+## 批量审计与批量运行
+
+当前已完成：
 
 ```text
-GET  /api/tbm/health
-GET  /api/tbm/dates
-POST /api/tbm/report
-POST /api/tbm/report/debug
+PLC total_dates = 91
+PLC usable_dates = 91
+Evidence total_evidence_count = 484
+TSP_count = 139
+HSP_count = 176
+sketch_count = 169
+A 类日期 = 83
+B 类日期 = 8
+batch pipeline passed = 91 / 91
+batch mock LLM passed = 91 / 91
+average_daily_advance_m = 13.8571
 ```
 
-页面：
+详见 [批量审计与运行](backend/docs/batch_pipeline.md)。
 
-- `/report`：日报生成页；
-- `/cells`：高关注区段页；
-- `/forward`：前方关注提示页；
-- `/debug`：调试与追溯页。
+## P3 sidecar geology extraction
 
-启动前端：
+P3 是独立旁路模块：
+
+```text
+raw_text / source_text / original_text_span
+-> LLM geology extraction
+-> candidate evidence
+-> schema validation
+-> candidate_evidence_db
+```
+
+P3 只生成候选 evidence：
+
+```text
+candidate_only = true
+requires_manual_review = true
+not_used_by_main_pipeline = true
+```
+
+它不会写入正式 `evidence_db`，不会被当前日报主 pipeline 自动读取，不参与 `time_valid / spatial_relevant`，不参与 `RAI / GRS / GRCI`，也不进入 Evidence Pack。
+
+## 常用命令
+
+进入后端：
 
 ```powershell
-cd frontend
-npm install
-npm run dev
+cd backend
 ```
 
-构建前端：
+测试：
 
 ```powershell
-cd frontend
-npm run build
+python -m pytest tests -q
 ```
 
-## 核心语义
+三日期 no-LLM smoke：
 
-- `ConstructionStateCell` 是当前系统的核心对象。
-- `GRS_geo_base` 表示地质证据关注度。
-- `RAI` 表示 PLC 施工响应异常度。
-- `GRCI` 表示已掘 cell 的地质-施工响应耦合关注度。
-- `GRCI` 不是灾害概率。
-- `GRCI` 不是前方风险。
-- 没有 PLC response 或没有 RAI 的 cell 不计算正式 GRCI。
-- forward cell 使用 `forward_profile / GRS_geo_base / source_trace`，不进入 `high_grci_cells`。
-
-## 当前 API
-
-当前只维护以下核心接口：
-
-```text
-GET  /api/tbm/health
-GET  /api/tbm/dates
-POST /api/tbm/report
-POST /api/tbm/report/debug
+```powershell
+python scripts/smoke_test_daily_pipeline.py --dates 2023-12-30,2023-12-28,2023-09-15 --no-llm --out outputs/smoke_summary.json
 ```
 
-旧接口、Agent 接口、旧 `routes/tbm.py` 均已归档，不参与当前主流程。
+LLM planner mock：
 
-## 配置后端
+```powershell
+python scripts/run_llm_report_generation.py --dates 2023-12-30 --generation-mode evidence_pack_planner_llm_with_revision --mock-llm --enable-planner --enable-revision --out-dir outputs/llm_exports
+```
 
-复制后端环境变量模板：
+数据审计：
+
+```powershell
+python scripts/audit_plc_dates.py --out-dir outputs/audit
+python scripts/audit_evidence_db.py --out-dir outputs/audit
+python scripts/classify_experiment_dates.py --plc-audit outputs/audit/plc_date_audit.csv --evidence-audit outputs/audit/evidence_db_audit.csv --out-dir outputs/audit
+```
+
+批量 pipeline：
+
+```powershell
+python scripts/run_batch_pipeline.py --date-file outputs/audit/date_classification.csv --class-filter A,B --no-llm --out-dir outputs/batch_pipeline --continue-on-error
+```
+
+批量 mock LLM：
+
+```powershell
+python scripts/run_batch_llm_generation.py --date-file outputs/audit/date_classification.csv --class-filter A,B --generation-mode evidence_pack_llm_with_revision --mock-llm --enable-revision --out-dir outputs/batch_llm --continue-on-error
+```
+
+P3 mock extraction：
+
+```powershell
+python scripts/run_geology_text_extraction.py --input-file outputs/geology_extraction/sample_geology_text.txt --source-type HSP --mock-llm --out-dir outputs/geology_extraction
+```
+
+## 后端配置
+
+复制模板：
 
 ```powershell
 copy backend\.env.example backend\.env
@@ -126,100 +158,44 @@ copy backend\.env.example backend\.env
 
 ```env
 DATA_ROOT=G:/我的云端硬盘/TBM9
+DATA_DIR=G:/我的云端硬盘/TBM9/TBM9_2023
+EVIDENCE_DB_PATH=G:/我的云端硬盘/TBM9/DB/evidence_db.csv
 USE_LLM=false
 ```
 
-如果数据目录是只读环境，可设置：
+如果数据目录只读，可设置：
 
 ```env
 ENSURE_DIRS_ON_IMPORT=false
 ```
 
-## 运行后端
+## API
+
+当前前端和外部调用只应使用：
+
+```text
+GET  /api/tbm/health
+GET  /api/tbm/dates
+POST /api/tbm/report
+POST /api/tbm/report/debug
+```
+
+启动后端：
 
 ```powershell
 cd backend
 uvicorn app:app --reload --port 8000
 ```
 
-访问：
+## 关键语义边界
 
-```text
-http://127.0.0.1:8000/docs
-```
-
-## 后端回归测试
-
-```powershell
-cd backend
-python -m pytest tests -q
-```
-
-## 多日期 no-LLM smoke test
-
-```powershell
-cd backend
-python scripts/smoke_test_daily_pipeline.py --dates 2023-12-30,2023-12-28,2023-09-15 --no-llm --out outputs/smoke_summary.json
-```
-
-该脚本会输出：
-
-- 当日里程范围；
-- cell response 数量；
-- `ConstructionStateCell` 数量；
-- `GRCI_available` 数量；
-- high GRCI cell 数量；
-- forward cell 数量；
-- Evidence Pack `key_cells` 数量；
-- Quality / Trace 指标；
-- warnings。
-
-## 导出完整中间结果
-
-```powershell
-cd backend
-python scripts/export_daily_pipeline_outputs.py --dates 2023-12-30,2023-12-28 --no-llm --out-dir outputs/pipeline_exports
-```
-
-每个日期会导出：
-
-- `report.txt`
-- `prompt.txt`
-- `evidence_pack.json`
-- `quality.json`
-- `trace.json`
-- `construction_state_cells.json`
-- `construction_state_cells.csv`
-- `forward_profile.json`
-- `high_grci_cells.json`
-- `warnings.json`
-- `summary.json`
+- `daily_plc_range` 是 PLC 实测推进范围。
+- `daily_excavated_scope` 是 10m cell 对齐后的已掘复核范围，不是实际推进范围。
+- `forward_attention` 是当前掌子面前方关注提示，不是已发生事实。
+- `GRCI` 是地质-施工响应耦合关注度，不是灾害概率，也不是前方风险。
+- 无 RAI 或无 PLC response 的 cell 不计算正式 GRCI。
+- P3 是候选证据旁路模块，不进入正式 evidence_db 和日报主链路。
 
 ## 归档内容
 
-根目录 `_archive/` 保存历史材料：
-
-- `_archive/old_frontend/`：旧前端工程，仍依赖旧接口和 Agent，不参与当前主线；
-- `_archive/root_old_docs/`：旧论文草稿、旧技术路线和旧说明文档；
-- `_archive/root_old_experiments/`：旧论文实验脚本；
-- `_archive/local_ignored_snapshots/`：本地代码快照，不建议提交到 GitHub。
-
-后端内部 `_archive/` 保存旧后端模块：
-
-- `backend/_archive/legacy_previous/`：旧 Agent、旧 routes、旧 services、旧 geology、旧 segment GRCI、旧 prompt builder 等。
-
-当前主流程禁止从任何 `_archive/` 目录 import 代码。
-
-## 当前边界
-
-当前仓库不做：
-
-- Agent 问答；
-- 旧接口兼容；
-- 真实外部 LLM 接入；
-- TSP/HSP 原始探测信号重新解释；
-- TBM 物理仿真数字孪生；
-- 地质灾害概率预测；
-- 正式论文实验批量评价。
-
-这些能力如需参考历史版本，请查看 `_archive/`。
+历史前端、旧接口、旧 Agent、旧 segment GRCI、旧实验草稿和旧文档已归档到 `_archive/` 或 `backend/_archive/`，不参与当前主流程。当前主流程禁止从 `_archive/` import。
