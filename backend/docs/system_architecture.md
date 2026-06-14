@@ -37,31 +37,31 @@ FastAPI routes.report
 
 ```mermaid
 flowchart TD
-    A[input date / 输入日期] --> B[load_daily_inputs / 读取输入]
-    B --> C[PLC daily data / PLC 日数据]
-    B --> D[official evidence_db / 正式 evidence_db]
+    in_date["input date<br/>输入日期"] --> load_inputs["load_daily_inputs<br/>读取输入"]
+    load_inputs --> plc_data["PLC daily data<br/>PLC 日数据"]
+    load_inputs --> evdb["official evidence_db<br/>正式 evidence_db"]
 
-    C --> E[PLC quality and operation / 质量与工况识别]
-    E --> F[Gas and response aggregation / 气体与响应聚合]
-    F --> G[cell_response_df]
+    plc_data --> plc_proc["PLC quality and operation<br/>质量与工况识别"]
+    plc_proc --> gas_resp["Gas and response aggregation<br/>气体与响应聚合"]
+    gas_resp --> cell_resp["cell_response_df"]
 
-    D --> H[normalize_evidence_df]
-    H --> I[filter_available_evidence]
-    I --> J[Report scope filter / 日报范围筛选]
-    J --> K[project_evidence_to_cells]
-    K --> L[geo_states_df]
+    evdb --> normalize["normalize_evidence_df"]
+    normalize --> available["filter_available_evidence"]
+    available --> scope_filter["Report scope filter<br/>日报范围筛选"]
+    scope_filter --> projector["project_evidence_to_cells"]
+    projector --> geo_states["geo_states_df"]
 
-    G --> M[ConstructionStateCell]
-    L --> M
-    M --> N[RAI GRS GRCI / 核心指标]
-    N --> O[Forward Profile / 前方画像]
-    N --> P[Twin State / 孪生状态]
-    N --> Q[Prompt Evidence Pack / 证据包]
+    cell_resp --> cs_cell["ConstructionStateCell"]
+    geo_states --> cs_cell
+    cs_cell --> metrics["RAI / GRS / GRCI<br/>核心指标"]
+    metrics --> forward["Forward Profile<br/>前方画像"]
+    metrics --> twin["Twin State<br/>孪生状态"]
+    metrics --> pack["Prompt Evidence Pack<br/>证据包"]
 
-    Q --> R[Report Generation / 报告生成]
-    R --> S[Quality Grounding Trace / 质量核验追踪]
-    S --> T[DailyReportResult]
-    T --> U[API and export scripts / API 与导出脚本]
+    pack --> report_gen["Report Generation<br/>报告生成"]
+    report_gen --> qtrace["Quality / Grounding / Trace<br/>质量核验追踪"]
+    qtrace --> result["DailyReportResult"]
+    result --> api_export["API and export scripts<br/>API 与导出脚本"]
 ```
 
 ## 3. 证据范围分层
@@ -70,19 +70,19 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    A[time_valid evidence] --> B[daily_review]
-    A --> C[forward_attention]
-    A --> D[local_background]
-    A --> E[excluded_by_distance]
+    time_valid["time_valid evidence"] --> review["daily_review"]
+    time_valid --> forward["forward_attention"]
+    time_valid --> background["local_background"]
+    time_valid --> excluded["excluded_by_distance"]
 
-    B --> F[excavated review / 已掘复核]
-    F --> G[GRCI allowed / 可算 GRCI]
+    review --> excavated["excavated review<br/>已掘复核"]
+    excavated --> grci_ok["GRCI allowed<br/>可算 GRCI"]
 
-    C --> H[forward attention / 前方关注]
-    H --> I[GRS hazards source_trace only / 仅用 GRS 与 trace]
+    forward --> forward_tip["forward attention<br/>前方关注"]
+    forward_tip --> grs_only["GRS / hazards / source_trace only<br/>仅用 GRS 与 trace"]
 
-    D --> J[local background / 局部背景]
-    E --> K[excluded from main report / 不进主报告]
+    background --> bg_use["local background<br/>局部背景"]
+    excluded --> excluded_use["excluded from main report<br/>不进主报告"]
 ```
 
 语义边界：
@@ -96,24 +96,24 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    A[Prompt Evidence Pack] --> B{generation_mode}
-    B -->|template| C[Template report / 模板报告]
-    B -->|evidence_pack_llm| D[Evidence Pack prompt / 证据包提示词]
-    B -->|evidence_pack_llm_with_revision| E[Draft plus revision loop / 初稿加修订]
-    B -->|evidence_pack_planner_llm| F[Report Planner]
+    pack["Prompt Evidence Pack"] --> mode{"generation_mode"}
+    mode -- "template" --> template["Template report<br/>模板报告"]
+    mode -- "evidence_pack_llm" --> llm_prompt["Evidence Pack prompt<br/>证据包提示词"]
+    mode -- "evidence_pack_llm_with_revision" --> llm_loop["Draft plus revision loop<br/>初稿加修订"]
+    mode -- "evidence_pack_planner_llm" --> planner["Report Planner"]
 
-    F --> G[Plan Validation / 计划校验]
-    G --> H[Generator / 生成器]
-    D --> H
-    E --> H
-    H --> I[LLM post process / LLM 后处理]
-    I --> J[Quality Trace / 质量追踪]
-    J --> K{Revision / 修订}
-    K -->|Yes| L[Revision Prompt / 修订提示词]
-    L --> M[Final Quality Trace / 最终质量追踪]
-    K -->|No| M
-    C --> M
-    M --> N[report quality trace audit / 报告与审计输出]
+    planner --> plan_check["Plan Validation<br/>计划校验"]
+    plan_check --> generator["Generator<br/>生成器"]
+    llm_prompt --> generator
+    llm_loop --> generator
+    generator --> post["LLM post process<br/>LLM 后处理"]
+    post --> qtrace["Quality Trace<br/>质量追踪"]
+    qtrace --> revision{"Revision<br/>修订"}
+    revision -- "Yes" --> revision_prompt["Revision Prompt<br/>修订提示词"]
+    revision_prompt --> final_trace["Final Quality Trace<br/>最终质量追踪"]
+    revision -- "No" --> final_trace
+    template --> final_trace
+    final_trace --> audit["report quality trace audit<br/>报告与审计输出"]
 ```
 
 LLM 只能消费 Evidence Pack 和经过验证的 planner 结果。LLM 不读取原始 PLC，不读取完整 evidence_db，不计算 RAI、GRS、GRCI，也不决定 forward cell。
@@ -122,13 +122,13 @@ LLM 只能消费 Evidence Pack 和经过验证的 planner 结果。LLM 不读取
 
 ```mermaid
 flowchart TD
-    A[PLC directory / PLC 目录] --> B[audit_plc_dates.py]
-    C[evidence_db.csv] --> D[audit_evidence_db.py]
-    B --> E[classify_experiment_dates.py]
-    D --> E
-    E --> F[usable date list / 可运行日期]
-    F --> G[run_batch_pipeline.py]
-    F --> H[run_batch_llm_generation.py]
+    plc_dir["PLC directory<br/>PLC 目录"] --> plc_audit["audit_plc_dates.py"]
+    evdb["evidence_db.csv"] --> ev_audit["audit_evidence_db.py"]
+    plc_audit --> classify["classify_experiment_dates.py"]
+    ev_audit --> classify
+    classify --> date_list["usable date list<br/>可运行日期"]
+    date_list --> batch_pipeline["run_batch_pipeline.py"]
+    date_list --> batch_llm["run_batch_llm_generation.py"]
 ```
 
 批量脚本只调用现有单日 pipeline，不改变单日 pipeline 的计算逻辑。
@@ -137,15 +137,15 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A[raw geology text / 原始地质文本] --> B[LLM geology extraction / LLM 文本抽取]
-    B --> C[schema validation / schema 校验]
-    C --> D[candidate evidence / 候选证据]
-    D --> E[candidate_evidence_db]
+    raw_text["raw geology text<br/>原始地质文本"] --> llm_extract["LLM geology extraction<br/>LLM 文本抽取"]
+    llm_extract --> schema_check["schema validation<br/>schema 校验"]
+    schema_check --> candidate["candidate evidence<br/>候选证据"]
+    candidate --> candidate_db["candidate_evidence_db"]
 
-    E -. no write / 不写入 .-> F[official evidence_db]
-    E -. no entry / 不进入 .-> G[time_valid spatial_relevant]
-    E -. no use / 不参与 .-> H[RAI GRS GRCI]
-    E -. no entry / 不进入 .-> I[Evidence Pack]
+    candidate_db -. "no write<br/>不写入" .-> evdb["official evidence_db"]
+    candidate_db -. "no entry<br/>不进入" .-> scope_gate["time_valid / spatial_relevant"]
+    candidate_db -. "no use<br/>不参与" .-> metrics["RAI / GRS / GRCI"]
+    candidate_db -. "no entry<br/>不进入" .-> pack["Evidence Pack"]
 ```
 
 P3 定位为 sidecar candidate evidence module：

@@ -80,63 +80,63 @@ PLC 与多源地质证据
 
 ```mermaid
 flowchart TD
-    A[PLC daily CSV / PLC 日运行 CSV] --> B[PLC processing / PLC 处理]
-    C[official evidence_db / 正式 evidence_db] --> D[Geology normalize / 地质标准化]
-    D --> E[Time valid filter / 时间可用过滤]
-    E --> F[Report scope filter / 日报范围筛选]
-    B --> G[cell response / cell 响应]
-    F --> H[geology state / 地质状态]
-    G --> I[ConstructionStateCell]
-    H --> I
-    I --> J[RAI GRS GRCI / 三类核心指标]
-    J --> K[Evidence Pack]
-    K --> L[Template or LLM / 模板或 LLM]
-    L --> M[Quality Grounding Trace / 质量核验追踪]
-    M --> N[API and exports / API 与导出]
+    plc["PLC daily CSV<br/>PLC 日运行 CSV"] --> plc_proc["PLC processing<br/>PLC 处理"]
+    evdb["official evidence_db<br/>正式 evidence_db"] --> geo_norm["Geology normalize<br/>地质标准化"]
+    geo_norm --> time_filter["Time valid filter<br/>时间可用过滤"]
+    time_filter --> scope_filter["Report scope filter<br/>日报范围筛选"]
+    plc_proc --> cell_resp["cell response<br/>cell 响应"]
+    scope_filter --> geo_state["geology state<br/>地质状态"]
+    cell_resp --> cs_cell["ConstructionStateCell"]
+    geo_state --> cs_cell
+    cs_cell --> core_metrics["RAI / GRS / GRCI<br/>三类核心指标"]
+    core_metrics --> pack["Evidence Pack"]
+    pack --> gen["Template or LLM<br/>模板或 LLM"]
+    gen --> qtrace["Quality / Grounding / Trace<br/>质量核验追踪"]
+    qtrace --> api_export["API and exports<br/>API 与导出"]
 ```
 
 ## 证据分层结构图
 
 ```mermaid
 flowchart LR
-    A[time_valid evidence] --> B[daily_review]
-    A --> C[forward_attention]
-    A --> D[local_background]
-    A --> E[excluded_by_distance]
+    time_valid["time_valid evidence"] --> review["daily_review"]
+    time_valid --> forward["forward_attention"]
+    time_valid --> background["local_background"]
+    time_valid --> excluded["excluded_by_distance"]
 
-    B --> F[review cells with GRCI / 已掘复核 cell]
-    C --> G[forward cells use GRS only / 前方 cell 只用 GRS]
-    D --> H[local background context / 局部背景上下文]
-    E --> I[excluded from main report / 不进入主报告]
+    review --> review_use["review cells with GRCI<br/>已掘复核 cell"]
+    forward --> forward_use["forward cells use GRS only<br/>前方 cell 只用 GRS"]
+    background --> background_use["local background context<br/>局部背景上下文"]
+    excluded --> excluded_use["excluded from main report<br/>不进入主报告"]
 ```
 
 ## 方法增强旁路图
 
 ```mermaid
 flowchart TD
-    A[ConstructionStateCell / 统一 cell 对象] --> B[Evidence Pack / 证据包]
-    B --> C[Report Quality Trace / 报告与核验]
-    A -. statistics only / 仅统计 .-> D[Batch metrics / 批量指标]
-    A -. sensitivity only / 仅敏感性分析 .-> E[GRCI and cell size sensitivity / GRCI 与 cell 尺寸敏感性]
-    B -. export only / 仅导出 .-> F[Allowed claims / 允许 claim 清单]
+    cs_cell["ConstructionStateCell<br/>统一 cell 对象"] --> pack["Evidence Pack<br/>证据包"]
+    pack --> report_qt["Report / Quality / Trace<br/>报告与核验"]
+    cs_cell -. "statistics only<br/>仅统计" .-> batch_metrics["Batch metrics<br/>批量指标"]
+    cs_cell -. "sensitivity only<br/>仅敏感性分析" .-> sensitivity["GRCI and cell size sensitivity<br/>GRCI 与 cell 尺寸敏感性"]
+    pack -. "export only<br/>仅导出" .-> allowed_claims["Allowed claims<br/>允许 claim 清单"]
 ```
 
 ## LLM 生成结构图
 
 ```mermaid
 flowchart TD
-    A[Evidence Pack] --> B[Report Planner]
-    B --> C[Plan Validation / 计划校验]
-    C --> D[Report Prompt / 报告提示词]
-    D --> E[LLM Draft / 初稿]
-    E --> F[Post-process / 后处理]
-    F --> G[Quality Trace / 质量追踪]
-    G --> H{Revision enabled / 启用修订}
-    H -- No --> I[Final Report / 最终报告]
-    H -- Yes --> J[Revision Prompt / 修订提示词]
-    J --> K[Revised Report / 修订报告]
-    K --> L[Final Quality Trace / 最终质量追踪]
-    L --> I
+    pack["Evidence Pack"] --> planner["Report Planner"]
+    planner --> plan_check["Plan Validation<br/>计划校验"]
+    plan_check --> prompt["Report Prompt<br/>报告提示词"]
+    prompt --> draft["LLM Draft<br/>初稿"]
+    draft --> post["Post-process<br/>后处理"]
+    post --> qtrace["Quality Trace<br/>质量追踪"]
+    qtrace --> revision{"Revision enabled<br/>启用修订"}
+    revision -- "No" --> final_report["Final Report<br/>最终报告"]
+    revision -- "Yes" --> revision_prompt["Revision Prompt<br/>修订提示词"]
+    revision_prompt --> revised["Revised Report<br/>修订报告"]
+    revised --> final_trace["Final Quality Trace<br/>最终质量追踪"]
+    final_trace --> final_report
 ```
 
 ## 已合并或移除的旧文档
