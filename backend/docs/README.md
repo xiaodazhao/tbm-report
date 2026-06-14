@@ -47,19 +47,19 @@ routes.report
 
 ```mermaid
 flowchart TD
-    A[PLC daily CSV] --> B[PLC processing]
-    C[official evidence_db] --> D[Geology normalize]
-    D --> E[Time valid filter]
-    E --> F[Report scope filter]
-    B --> G[cell response]
-    F --> H[geology state]
+    A[PLC daily CSV / PLC 日运行 CSV] --> B[PLC processing / PLC 处理]
+    C[official evidence_db / 正式 evidence_db] --> D[Geology normalize / 地质标准化]
+    D --> E[Time valid filter / 时间可用过滤]
+    E --> F[Report scope filter / 日报范围筛选]
+    B --> G[cell response / cell 响应]
+    F --> H[geology state / 地质状态]
     G --> I[ConstructionStateCell]
     H --> I
-    I --> J[RAI GRS GRCI]
+    I --> J[RAI GRS GRCI / 三类核心指标]
     J --> K[Evidence Pack]
-    K --> L[Template or LLM]
-    L --> M[Quality Grounding Trace]
-    M --> N[API and exports]
+    K --> L[Template or LLM / 模板或 LLM]
+    L --> M[Quality Grounding Trace / 质量核验追踪]
+    M --> N[API and exports / API 与导出]
 ```
 
 ## 证据分层结构图
@@ -71,10 +71,10 @@ flowchart LR
     A --> D[local_background]
     A --> E[excluded_by_distance]
 
-    B --> F[review cells with GRCI]
-    C --> G[forward cells use GRS only]
-    D --> H[local background context]
-    E --> I[excluded from main report]
+    B --> F[review cells with GRCI / 已掘复核 cell]
+    C --> G[forward cells use GRS only / 前方 cell 只用 GRS]
+    D --> H[local background context / 局部背景上下文]
+    E --> I[excluded from main report / 不进入主报告]
 ```
 
 ## LLM 生成结构图
@@ -82,16 +82,16 @@ flowchart LR
 ```mermaid
 flowchart TD
     A[Evidence Pack] --> B[Report Planner]
-    B --> C[Plan Validation]
-    C --> D[Report Prompt]
-    D --> E[LLM Draft]
-    E --> F[Post-process]
-    F --> G[Quality / Trace]
-    G --> H{Revision enabled}
-    H -- No --> I[Final Report]
-    H -- Yes --> J[Revision Prompt]
-    J --> K[Revised Report]
-    K --> L[Final Quality Trace]
+    B --> C[Plan Validation / 计划校验]
+    C --> D[Report Prompt / 报告提示词]
+    D --> E[LLM Draft / 初稿]
+    E --> F[Post-process / 后处理]
+    F --> G[Quality Trace / 质量追踪]
+    G --> H{Revision enabled / 启用修订}
+    H -- No --> I[Final Report / 最终报告]
+    H -- Yes --> J[Revision Prompt / 修订提示词]
+    J --> K[Revised Report / 修订报告]
+    K --> L[Final Quality Trace / 最终质量追踪]
     L --> I
 ```
 
