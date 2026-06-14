@@ -1,92 +1,179 @@
 # TBM 日报后端系统架构
 
-本文描述当前真实执行的后端架构。历史代码、旧 Agent、旧 routes 和旧 segment GRCI 均不参与本文所述主流程。
+本文描述当前代码真实执行的后端架构。旧 Agent、旧 `routes/tbm.py`、旧 segment 级 GRCI、旧 history memory 和 `_archive/` 中的历史代码都不参与本文所述主流程。
 
-## 1. 正式日报生成主链路
+相关文档：
+
+- [字段契约](backend_field_contract.md)
+- [方法与计算逻辑白皮书](method_calculation_whitepaper.md)
+- [LLM 生成模式](llm_generation_modes.md)
+- [批量审计与多日期运行](batch_pipeline.md)
+- [旁路式地质文本结构化](geology_text_extraction.md)
+
+## 1. 当前唯一日报主链路
 
 ```text
-正式 evidence_db
--> time_valid filter
--> spatial_relevant filter
+FastAPI routes.report
+-> run_daily_report_pipeline
 -> ConstructionStateCell
--> RAI / GRS / GRCI
 -> Evidence Pack
--> template / LLM / planner LLM
+-> template / evidence_pack_llm / evidence_pack_llm_with_revision / evidence_pack_planner_llm
 -> Quality / Trace
--> Revision
--> Report
+-> Report / Debug / Export
 ```
 
-主入口是 `backend/routes/report.py` 调用 `backend/pipeline/daily_report_pipeline.py::run_daily_report_pipeline`。输入包括指定日期的 PLC CSV 和正式地质证据库 `EVIDENCE_DB_PATH`。地质证据必须先经过 online 时间合法性过滤和日报空间范围筛选，才能进入报告级 cell 建模。
+代码入口：
 
-## 2. LLM 生成链路
+- API 注册：`backend/app.py`
+- API 路由：`backend/routes/report.py`
+- 主函数：`backend/pipeline/daily_report_pipeline.py::run_daily_report_pipeline`
+- 核心 cell schema：`backend/schemas/pipeline.py::ConstructionStateCell`
 
-```text
-Prompt Evidence Pack
--> Report Planner
--> Plan Validation
--> Generator
--> Quality / Trace
--> Revision
--> Final Report
+## 2. 主流程结构图
+
+```mermaid
+flowchart TD
+    A[指定 date] --> B[load_daily_inputs]
+    B --> C[PLC 日运行数据]
+    B --> D[正式 evidence_db.csv]
+
+    C --> E[PLC 质量检查 / 工况识别]
+    E --> F[气体统计 / 施工响应聚合]
+    F --> G[cell_response_df]
+
+    D --> H[normalize_evidence_df]
+    H --> I[filter_available_evidence]
+    I --> J[日报空间范围筛选]
+    J --> K[project_evidence_to_cells]
+    K --> L[geo_states_df]
+
+    G --> M[ConstructionStateCell]
+    L --> M
+    M --> N[RAI / GRS / GRCI 语义收敛]
+    N --> O[Forward Profile]
+    N --> P[Twin State]
+    N --> Q[Prompt Evidence Pack]
+
+    Q --> R[Report Generation]
+    R --> S[Quality / Grounding / Trace]
+    S --> T[DailyReportResult]
+    T --> U[API / Export Scripts]
 ```
 
-LLM 不直接读取原始 PLC 或完整 evidence_db，也不计算 RAI、GRS、GRCI。LLM 只消费 Evidence Pack 和经过验证的 plan。Quality / Trace 会检查报告 claim 是否有结构化证据支撑，并识别前方提示误写、GRCI 概率误用、对齐范围误写为实际推进等错误。
+## 3. 证据范围分层
 
-## 3. 批量运行链路
+当前日报不再保留全局地质 cell 作为主流程，而是围绕当日施工范围和当前掌子面构建局部日报 cell。
 
-```text
-PLC audit
--> evidence audit
--> date classification
--> batch pipeline
--> batch LLM generation
+```mermaid
+flowchart LR
+    A[time_valid evidence] --> B[daily_review]
+    A --> C[forward_attention]
+    A --> D[local_background]
+    A --> E[excluded_by_distance]
+
+    B --> F[已掘区段复核]
+    F --> G[允许计算 GRCI]
+
+    C --> H[当前掌子面前方关注]
+    H --> I[只使用 GRS / hazards / source_trace]
+
+    D --> J[局部背景上下文]
+    E --> K[不进入日报主证据链]
 ```
 
-对应脚本：
+语义边界：
 
-- `scripts/audit_plc_dates.py`
-- `scripts/audit_evidence_db.py`
-- `scripts/classify_experiment_dates.py`
-- `scripts/run_batch_pipeline.py`
-- `scripts/run_batch_llm_generation.py`
+- `daily_review`：已掘区段复核，只有同时具备 GRS、RAI 和 PLC response 的 cell 才能计算正式 GRCI。
+- `forward_attention`：当前掌子面前方关注提示，不使用 GRCI，不写成已发生事实。
+- `local_background`：只提供局部背景上下文，不进入 high GRCI。
+- `excluded_by_distance`：距离当日报告范围过远，不进入日报主链路。
 
-该链路用于后续实验准备，不改变单日主 pipeline 行为。
+## 4. LLM 生成链路
 
-## 4. P3 旁路地质文本结构化链路
+```mermaid
+flowchart TD
+    A[Prompt Evidence Pack] --> B{generation_mode}
+    B -->|template| C[模板报告]
+    B -->|evidence_pack_llm| D[Evidence Pack 约束 prompt]
+    B -->|evidence_pack_llm_with_revision| E[初稿 + Quality/Trace 反馈修订]
+    B -->|evidence_pack_planner_llm| F[Report Planner]
 
-```text
-raw_text / source_text / original_text_span
--> LLM geology extraction
--> candidate evidence
--> schema validation
--> candidate_evidence_db
+    F --> G[Plan Validation]
+    G --> H[Generator]
+    D --> H
+    E --> H
+    H --> I[LLM 输出后处理]
+    I --> J[Quality / Trace]
+    J --> K{是否 revision}
+    K -->|是| L[Revision Prompt]
+    L --> M[Final Quality / Trace]
+    K -->|否| M
+    C --> M
+    M --> N[report_text / quality / trace / audit files]
 ```
 
-P3 的定位是 sidecar candidate module：
+LLM 只能消费 Evidence Pack 和经过验证的 planner 结果。LLM 不读取原始 PLC，不读取完整 evidence_db，不计算 RAI、GRS、GRCI，也不决定 forward cell。
 
-- 不写入正式 `evidence_db`；
-- 不进入 `time_valid / spatial_relevant`；
-- 不进入 GRS、RAI、GRCI；
+## 5. 批量审计与多日期运行
+
+```mermaid
+flowchart TD
+    A[PLC 文件目录] --> B[audit_plc_dates.py]
+    C[evidence_db.csv] --> D[audit_evidence_db.py]
+    B --> E[classify_experiment_dates.py]
+    D --> E
+    E --> F[可运行日期清单]
+    F --> G[run_batch_pipeline.py]
+    F --> H[run_batch_llm_generation.py]
+```
+
+批量脚本只调用现有单日 pipeline，不改变单日 pipeline 的计算逻辑。
+
+## 6. P3 旁路式地质文本结构化
+
+```mermaid
+flowchart TD
+    A[raw geology text] --> B[LLM geology extraction]
+    B --> C[schema validation]
+    C --> D[candidate evidence]
+    D --> E[candidate_evidence_db]
+
+    E -. 不写入 .-> F[official evidence_db.csv]
+    E -. 不进入 .-> G[time_valid / spatial_relevant]
+    E -. 不参与 .-> H[RAI / GRS / GRCI]
+    E -. 不进入 .-> I[Evidence Pack]
+```
+
+P3 定位为 sidecar candidate evidence module：
+
+- 不写入正式 `evidence_db.csv`；
+- 不进入正式 `time_valid / spatial_relevant`；
+- 不参与 GRS、RAI、GRCI；
 - 不进入 Evidence Pack；
 - 不影响 Report 生成；
 - 输出必须标记 `candidate_only=true`、`requires_manual_review=true`、`not_used_by_main_pipeline=true`。
 
-## 5. 当前主目录职责
+## 7. 目录职责
 
-- `pipeline/`：日报主 pipeline、输入读取、输出组织。
-- `plc/`：PLC 工况、响应、气体和 cell response。
-- `geology_v2/`：正式地质证据标准化、过滤、投影、融合、forward profile。
-- `coupling/`：ConstructionStateCell 与 GRS/RAI/GRCI。
-- `llm/`：Evidence Pack、prompt、LLM generation、planner、quality、trace、revision。
+- `routes/`：当前 API，只保留日报与调试接口。
+- `pipeline/`：单日主 pipeline、输入、输出和 evidence scope。
+- `plc/`：PLC 工况、响应、气体和 cell response 聚合。
+- `geology_v2/`：正式地质证据标准化、过滤、投影、融合和 forward profile。
+- `coupling/`：cell 级 RAI / GRS / GRCI 计算和语义边界。
+- `twin/`：从 ConstructionStateCell 构建孪生状态摘要。
+- `llm/`：Evidence Pack、prompt、planner、模板报告、LLM 调用、质量检查、grounding 与 trace。
 - `geology_text/`：P3 旁路候选地质文本结构化。
-- `scripts/`：smoke、导出、批量审计、批量运行、P3 旁路抽取。
-- `tests/`：契约测试和回归测试。
+- `scripts/`：smoke、导出、批量审计、批量运行、LLM 生成、P3 抽取。
+- `tests/`：字段契约、语义边界、质量检查、批量脚本和 P3 sidecar 的回归测试。
+- `docs/`：当前有效文档。
+- `_archive/`：历史代码归档，不允许主流程 import。
 
-## 6. 关键边界
+## 8. 关键语义边界
 
-`daily_plc_range` 是实际 PLC 推进范围；`daily_excavated_scope` 是 10m cell 对齐后的复核范围。前者可写作实际施工推进，后者只能写作建模与复核范围。
-
-`forward_attention` 是当前掌子面前方关注提示，不表示已发生事实。前方 cell 不进入 high GRCI。
-
-`GRCI` 是地质-施工响应耦合关注度，不是灾害概率，也不是前方风险。
+- `daily_plc_range` 是 PLC 实测当日推进范围。
+- `daily_excavated_scope` 是 10m cell 对齐后的已掘复核范围，不能写成实际推进范围。
+- `GRCI` 是地质-施工响应耦合关注度，不是灾害概率，也不是前方风险。
+- 没有 RAI 或没有 PLC response 的 cell 不计算正式 GRCI。
+- forward cell 不进入 high GRCI。
+- `stop_ratio` 只是施工响应关注信号；当前 PLC 字段未区分计划停机与非计划停机，不能把停机直接写成异常原因。
+- 前方关注提示来自当前掌子面前方可用地质证据，只能写成关注/提示，不得写成已揭露事实。

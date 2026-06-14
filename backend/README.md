@@ -1,64 +1,98 @@
-# TBM 日报后端研究原型
+# TBM 日报后端
 
-本后端当前只保留一条主流程：
+当前后端是一个面向 TBM 施工日报生成、证据约束报告生成和方法复现实验的研究原型。主流程已经收束为单链路：
 
 ```text
 routes.report
 -> run_daily_report_pipeline
 -> ConstructionStateCell
 -> Evidence Pack
--> Report
+-> Report Planner / Generator / Revision
 -> Quality / Trace
+-> API / Export
 ```
 
-旧版 Agent、旧 `routes/tbm.py`、旧 segment 级 GRCI、旧 history memory、旧多流程报告链路均不参与当前主流程。
+旧 Agent、旧 `routes/tbm.py`、旧 segment 级 GRCI、旧 history memory 和 `_archive/` 中的历史代码不参与当前主流程。
 
-## 当前主流程目录说明
+完整文档入口见：[docs/README.md](docs/README.md)。
 
-参与当前主流程的核心目录：
+## 1. 目录说明
 
-- `routes/report.py`：当前唯一报告 API。
-- `pipeline/`：日报主 pipeline，入口为 `run_daily_report_pipeline(date, use_llm=False)`，默认 `generation_mode=template`。
-- `plc/`：PLC 工况、气体、施工响应和 cell 响应聚合。
-- `geology_v2/`：当前唯一地质证据结构化、投影、融合和 forward profile 链路。
-- `coupling/`：cell 级 `GRS / RAI / GRCI` 计算。
-- `twin/`：由 `ConstructionStateCell` 构建当前孪生状态摘要。
-- `llm/`：Evidence Pack、prompt、模板报告、质量检查、grounding 和 trace。
-- `schemas/`：API、pipeline、ConstructionStateCell 等数据结构。
-- `analysis/`：当前仅保留 PLC response 仍依赖的基础分析函数，不是旧主流程。
-- `utils/`、`contracts/`、`configs/`：当前主流程和质量检查使用的辅助定义。
-- `scripts/`：smoke test、结果导出和证据导入辅助脚本。
-- `tests/`：当前回归测试。
-- `docs/`：字段契约、方法定义、指标定义、边界说明和归档计划。
+当前主流程相关目录：
+
+- `app.py`：FastAPI 应用入口。
+- `routes/report.py`：当前唯一日报 API 路由。
+- `pipeline/`：单日主 pipeline、输入读取、输出组织、evidence scope。
+- `plc/`：PLC 工况识别、气体统计、施工响应与 cell response 聚合。
+- `geology_v2/`：正式地质证据标准化、可用性过滤、投影、融合和 forward profile。
+- `coupling/`：cell 级 RAI / GRS / GRCI 计算。
+- `twin/`：基于 ConstructionStateCell 的状态摘要。
+- `llm/`：Evidence Pack、prompt、模板报告、LLM 生成、planner、revision、Quality、Grounding、Trace。
+- `schemas/`：API 与 pipeline 数据结构。
+- `scripts/`：smoke test、导出、批量审计、批量运行、LLM 生成、P3 抽取。
+- `tests/`：回归测试。
+- `docs/`：当前有效文档。
+- `geology_text/`：P3 旁路式 LLM 地质文本结构化，只生成候选证据，不进入正式主链路。
 
 归档目录：
 
-- `_archive/`：历史代码归档，仅作参考，不参与当前主流程。
-- 当前主流程禁止从 `_archive/` import 任何内容。
+- `_archive/`：历史代码和旧流程，仅作参考。当前主流程禁止从 `_archive/` import。
 
-## 配置 DATA_ROOT
+## 2. 环境配置
 
 复制 `.env.example` 为 `.env`，至少配置：
 
 ```env
 DATA_ROOT=G:/我的云端硬盘/TBM9
+DATA_DIR=G:/我的云端硬盘/TBM9/TBM9_2023
+EVIDENCE_DB_PATH=G:/我的云端硬盘/TBM9/DB/evidence_db.csv
 USE_LLM=false
+LLM_PROVIDER=
+LLM_API_KEY=
 ```
 
-也可以显式配置：
-
-```env
-DATA_DIR=
-EVIDENCE_DB_PATH=
-```
-
-如果未设置 `DATA_ROOT`，系统会尝试旧路径自动探测，并在 pipeline warnings 中提示。对于只读数据目录，可以设置：
+如果没有配置 `DATA_ROOT`，系统会尝试旧路径自动探测，并在 pipeline warnings 中提示。生产或只读环境可设置：
 
 ```env
 ENSURE_DIRS_ON_IMPORT=false
 ```
 
-## 运行 no-LLM smoke test
+## 3. 启动 API
+
+```bash
+cd backend
+uvicorn app:app --reload --port 8000
+```
+
+当前 API：
+
+- `GET /api/tbm/health`
+- `GET /api/tbm/dates`
+- `POST /api/tbm/report`
+- `POST /api/tbm/report/debug`
+
+`/api/tbm/report` 请求示例：
+
+```json
+{
+  "date": "2023-12-30",
+  "use_llm": false
+}
+```
+
+核心返回：
+
+- `date`
+- `report_text`
+- `quality_summary`
+- `trace_summary`
+- `forward_profile`
+- `high_grci_cells`
+- `warnings`
+
+`/api/tbm/report/debug` 返回完整中间结果，包括 operation、gas、normalized evidence、construction cells、Evidence Pack、prompt、quality、trace 等。
+
+## 4. 单日与多日期 smoke test
 
 ```bash
 cd backend
@@ -66,19 +100,19 @@ python scripts/smoke_test_daily_pipeline.py --date 2023-12-30 --no-llm
 python scripts/smoke_test_daily_pipeline.py --dates 2023-12-30,2023-12-28,2023-09-15 --no-llm --out outputs/smoke_summary.json
 ```
 
-输出指标包括：
+smoke 输出会记录：
 
-- 当日里程范围和推进量；
+- PLC 实测当日里程范围；
 - `cell_response_df` 数量；
 - `construction_state_cells` 数量；
 - `GRCI_available` 数量；
 - high GRCI cell 数量；
 - forward cell 数量；
 - Evidence Pack `key_cells` 数量；
-- grounding、quality、unsupported claim 指标；
+- Quality / Grounding / Trace 指标；
 - warnings。
 
-## 导出完整中间结果
+## 5. 导出完整中间结果
 
 ```bash
 cd backend
@@ -98,158 +132,77 @@ python scripts/export_daily_pipeline_outputs.py --dates 2023-12-30,2023-12-28 --
 - `high_grci_cells.json`
 - `warnings.json`
 - `summary.json`
+- `method_metrics.json`
 
-## Evidence Pack 约束 LLM 生成
+## 6. LLM 生成模式
 
-默认报告生成模式仍然是 `template`，即不调用外部 LLM。LLM 只允许接在 Evidence Pack 之后，用于文本生成和修订，不参与 PLC 处理、地质证据筛选、ConstructionStateCell 构建或 `RAI / GRS / GRCI` 计算。
+默认模式仍为 `template`，不调用外部 LLM。
 
 支持的 `generation_mode`：
 
 - `template`：稳定模板报告，默认模式。
-- `evidence_pack_llm`：基于 Evidence Pack 构建约束 prompt，生成 LLM 初稿，并运行 Quality / Trace。
-- `evidence_pack_llm_with_revision`：先生成初稿，再根据 Quality / Trace 反馈构建 revision prompt，修订后再次运行 Quality / Trace。
+- `evidence_pack_llm`：基于 Evidence Pack 构建约束 prompt，生成 LLM 初稿，再运行 Quality / Trace。
+- `evidence_pack_llm_with_revision`：初稿生成后，根据 Quality / Trace 反馈构建 revision prompt 并再次检查。
+- `evidence_pack_planner_llm`：先生成结构化 Report Plan，验证后再生成报告。
+- `evidence_pack_planner_llm_with_revision`：planner + generator + revision 的完整 LLM 链路。
 
-独立脚本：
+示例：
 
 ```bash
 cd backend
 python scripts/run_llm_report_generation.py --dates 2023-12-30 --generation-mode evidence_pack_llm --mock-llm --out-dir outputs/llm_exports
-python scripts/run_llm_report_generation.py --dates 2023-12-30 --generation-mode evidence_pack_llm_with_revision --mock-llm --out-dir outputs/llm_exports
+python scripts/run_llm_report_generation.py --dates 2023-12-30 --generation-mode evidence_pack_planner_llm --mock-llm --enable-planner --out-dir outputs/llm_exports
 ```
 
-真实 DeepSeek / OpenAI-compatible 调用使用：
+真实 DeepSeek / OpenAI-compatible 调用示例：
 
 ```bash
-python scripts/run_llm_report_generation.py --dates 2023-12-30 --generation-mode evidence_pack_llm --provider openai_or_compatible --model deepseek-chat --out-dir outputs/llm_exports
+python scripts/run_llm_report_generation.py --dates 2023-12-30 --generation-mode evidence_pack_planner_llm --provider openai_or_compatible --model deepseek-chat --enable-planner --out-dir outputs/llm_exports
 ```
 
-注意：真实 LLM 调用会把 Evidence Pack 派生内容发送到外部模型服务，应在确认数据可外发后再运行。
+真实 LLM 调用会把 Evidence Pack 派生内容发送到外部模型服务，应在确认数据可外发后再运行。
 
-LLM 审计导出文件包括：
-
-- `llm_mode.json`
-- `llm_prompt.txt`
-- `llm_request.json`
-- `llm_raw_response.txt`
-- `llm_report_draft.txt`
-- `llm_quality_before_revision.json`
-- `llm_trace_before_revision.json`
-- `llm_revision_prompt.txt`
-- `llm_revision_request.json`
-- `llm_revision_response.txt`
-- `llm_report_final.txt`
-- `llm_quality_after_revision.json`
-- `llm_trace_after_revision.json`
-- `llm_summary.json`
-
-## 启动 FastAPI
+## 7. 批量审计与运行
 
 ```bash
 cd backend
-uvicorn app:app --reload --port 8000
+python scripts/audit_plc_dates.py --out outputs/audit/plc_dates.json
+python scripts/audit_evidence_db.py --out outputs/audit/evidence_db.json
+python scripts/classify_experiment_dates.py --out outputs/audit/date_classes.json
+python scripts/run_batch_pipeline.py --dates 2023-12-30,2023-12-28,2023-09-15 --no-llm --out-dir outputs/batch_pipeline --continue-on-error
 ```
 
-## 当前 API
+批量脚本只调用当前单日 pipeline，不改变单日逻辑。
 
-### `GET /api/tbm/health`
+## 8. P3 旁路式地质文本结构化
 
-健康检查。
+P3 是独立 sidecar 模块，输出候选地质证据，不写入正式 `evidence_db.csv`，不进入日报主链路。
 
-### `GET /api/tbm/dates`
-
-返回可用 PLC 日运行数据日期。
-
-### `POST /api/tbm/report`
-
-请求示例：
-
-```json
-{
-  "date": "2023-12-30",
-  "use_llm": false
-}
+```bash
+cd backend
+python scripts/run_geology_text_extraction.py --input-file outputs/geology_extraction/sample_geology_text.txt --source-type HSP --mock-llm --out-dir outputs/geology_extraction
 ```
 
-核心返回：
+候选输出必须标记：
 
-- `date`
-- `report_text`
-- `quality_summary`
-- `trace_summary`
-- `forward_profile`
-- `high_grci_cells`
-- `warnings`
+- `candidate_only=true`
+- `requires_manual_review=true`
+- `not_used_by_main_pipeline=true`
 
-### `POST /api/tbm/report/debug`
+## 9. 回归测试
 
-返回完整中间结果，适合工程调试和论文实验复核：
+```bash
+cd backend
+python -m pytest tests -q
+```
 
-- `operation_summary`
-- `cluster_summary`
-- `gas_summary`
-- `normalized_evidence_summary`
-- `construction_state_cells`
-- `prompt_evidence_pack`
-- `prompt_text`
-- `report_text`
-- `quality`
-- `trace`
-- `warnings`
+测试覆盖字段契约、RAI/GRS/GRCI 公式项、Evidence Pack 字段、Quality / Trace 分类、E14 对齐范围误用、批量脚本契约和 P3 sidecar 契约。
 
-## ConstructionStateCell
+## 10. 核心语义边界
 
-`ConstructionStateCell` 是当前系统的核心 cell 对象，定义在 `schemas/pipeline.py`，由 `pipeline/daily_report_pipeline.py` 构建。
-
-它统一承载：
-
-- cell 空间位置：`cell_id`、`cell_start`、`cell_end`、`cell_center`；
-- PLC 响应：`has_plc_response`、`plc_metrics`、`RAI`；
-- 地质融合：`has_geology_evidence`、`GRS_geo_base`、`main_hazards`、`supporting_evidence_ids`；
-- 耦合结果：`GRCI`、`GRCI_available`、`GRCI_source`、`GRCI_unavailable_reason`、`coupling_level`；
-- 空间语义：`is_excavated_today`、`is_current_face_cell`、`is_forward_cell`；
-- 追溯信息：`source_trace`、`trace_refs`。
-
-重要语义：
-
-- `GRCI` 不是灾害概率；
-- `GRCI` 不是前方风险；
-- 只有同时存在 `GRS_geo_base`、`RAI` 和 PLC response evidence 时，`GRCI_available=True`；
-- 缺少 RAI 的 cell 不计算正式 GRCI；
-- forward cell 使用 `GRS_geo_base / forward_profile / source_trace`，不进入 `high_grci_cells`。
-
-## Evidence Pack / Quality / Trace
-
-Evidence Pack 是报告生成的证据约束输入，主要包含：
-
-- `operation_evidence`
-- `cluster_evidence`
-- `gas_evidence`
-- `geology_evidence`
-- `coupling_evidence`
-- `forward_evidence`
-- `source_trace`
-- `generation_constraints`
-
-`geology_evidence.key_cells` 是正式字段；`selected_cells` 是短期兼容字段，两者当前内容一致。
-
-Quality / Trace 用于核验报告：
-
-- `quality_score`：报告质量分；
-- `grounding_rate`：claim 可被 Evidence Pack 支撑的比例；
-- `unsupported_claim_count`：未支撑 claim 数；
-- `report_trace`：claim 到 evidence 的追溯结果。
-
-## 当前边界
-
-当前后端不做：
-
-- 前端展示；
-- Agent 问答；
-- 旧接口兼容；
-- 真实外部 LLM 调用；
-- TSP/HSP 原始探测信号重新解释；
-- TBM 物理仿真数字孪生；
-- 地质灾害概率预测；
-- 论文实验批量评价。
-
-这些内容如需参考历史代码，请查看 `_archive/`。
+- `GRCI` 是地质-施工响应耦合关注度，不是灾害概率。
+- `GRCI` 只在已掘复核 cell 中可用；forward cell 不进入 high GRCI。
+- `daily_plc_range` 是 PLC 实测推进范围。
+- `daily_excavated_scope` 是 10m cell 对齐后的复核范围，不能写成实际推进量。
+- 当前 PLC 字段未区分计划停机与非计划停机，`stop_ratio` 不能直接解释为异常原因。
+- 前方关注提示只能写成关注/提示，不能写成已揭露事实。

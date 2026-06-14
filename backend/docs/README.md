@@ -1,55 +1,108 @@
 # TBM 日报后端文档索引
 
-本目录记录当前单主线后端的字段契约、方法定义、指标解释、边界说明、案例说明和归档计划。当前主流程仍然是：
+本目录只保留当前后端研究原型仍需要阅读和维护的文档。当前后端主线为：
 
 ```text
 routes.report
 -> run_daily_report_pipeline
 -> ConstructionStateCell
 -> Evidence Pack
--> Report
+-> Planner / Generator / Revision
 -> Quality / Trace
+-> Report / Export
 ```
 
-## 推荐阅读顺序
+`_archive/`、旧 Agent、旧 `routes/tbm.py`、旧 segment 级 GRCI、旧 history memory 不参与当前主流程。
 
-1. [当前后端系统说明书](current_backend_system_manual.md)
-   - 面向陌生读者的系统级说明，解释当前版本到底怎么跑。
+## 推荐阅读路径
 
-2. [方法定义文档](method_definition.md)
-   - 说明当前系统任务、PLC 和地质证据的作用、已掘复核与前方提示的区别。
+1. [系统架构与执行路线](system_architecture.md)  
+   面向首次阅读者，说明当前后端真实如何从 PLC 与地质证据生成日报，并包含主流程结构图。
 
-3. [字段契约文档](backend_field_contract.md)
-   - 说明 `DailyReportResult`、`ConstructionStateCell`、Evidence Pack、Quality / Trace 和 API 输出字段。
+2. [字段契约](backend_field_contract.md)  
+   说明 `DailyReportResult`、`ConstructionStateCell`、Evidence Pack、Quality / Trace、API 与导出字段。
 
-4. [指标定义文档](metrics_definition.md)
-   - 解释 `GRS_geo_base`、`RAI`、`GRCI`、`quality_score`、`grounding_rate`、`trace_coverage` 等指标。
+3. [方法与计算逻辑白皮书](method_calculation_whitepaper.md)  
+   面向方法复盘和论文写作，详细解释 RAI、GRS、GRCI、证据分层、字段来源和计算公式。
 
-5. [方法与计算逻辑白皮书](method_calculation_whitepaper.md)
-   - 更细的计算链路、字段来源、公式复盘和导出说明。
+4. [LLM 生成模式](llm_generation_modes.md)  
+   说明 `template`、`evidence_pack_llm`、`evidence_pack_llm_with_revision`、`evidence_pack_planner_llm`、`evidence_pack_planner_llm_with_revision` 的差异、约束和导出文件。
 
-6. [Quality / Trace 方法边界句分类说明](quality_trace_boundary_update.md)
-   - 说明 `method_boundary / policy_support / E12_METHOD_BOUNDARY_STATEMENT` 的最新分类规则。
-   - 记录 2023-12-30 中“如无当日可用掌子面素描，不把前方证据写成已揭露事实。”这类句子的修正结果。
+5. [批量审计与多日期运行](batch_pipeline.md)  
+   说明 90 天数据审计、日期分类、批量 no-LLM pipeline、批量 LLM 生成脚本。
 
-7. [范围与限制说明](scope_and_limitations.md)
-   - 说明当前系统不做什么，例如不做灾害概率预测、不重新解释 TSP/HSP 原始信号、不接入 Agent 主流程。
+6. [旁路式地质文本结构化](geology_text_extraction.md)  
+   说明 P3 sidecar 模块如何把地质文本抽取成候选证据，以及为什么不进入正式主链路。
 
-8. [2023-12-30 案例说明](case_2023-12-30.md)
-   - 用真实日期说明数据读取、cell 构建、Evidence Pack、报告、Quality / Trace 的完整流转。
+7. [论文写作上下文包](paper_writing_context.md)  
+   给论文写作或外部 LLM 使用的项目上下文，强调当前系统已经实现什么、没有实现什么。
 
-9. [归档计划](archive_plan.md)
-   - 说明哪些历史模块已归档，哪些目录参与当前主流程。
+8. [LLM 简版上下文](llm_context_brief.md)  
+   更短的上下文包，适合快速贴给外部模型。
 
-## 当前 Quality / Trace 关键语义
+9. [实验规划](experiment_plan.md)  
+   说明后续论文实验可以如何基于当前导出结果展开。
 
-方法边界句不是普通技术 claim，也不是 unsupported 技术结论。当前会归为：
+## 当前主流程结构图
 
-```text
-claim_type = method_boundary
-support_type = recommendation_policy
-trace_support_type = policy_support
-error_type = E12_METHOD_BOUNDARY_STATEMENT
+```mermaid
+flowchart TD
+    A[PLC 日运行 CSV] --> B[PLC 质量检查 / 工况识别 / 气体统计 / 响应聚合]
+    C[正式 evidence_db.csv] --> D[地质证据标准化]
+    D --> E[时间可用性过滤]
+    E --> F[日报空间范围筛选]
+    B --> G[10m cell response]
+    F --> H[geology_state cell]
+    G --> I[ConstructionStateCell]
+    H --> I
+    I --> J[RAI / GRS / GRCI]
+    J --> K[Evidence Pack]
+    K --> L[Template 或 LLM 生成]
+    L --> M[Quality / Grounding / Trace]
+    M --> N[API 返回与导出文件]
 ```
 
-真正无证据的技术判断不会因此被放宽。GRCI 概率误用仍归为 `E3_GRCI_AS_PROBABILITY`，把 `stop_ratio` 直接写成异常原因仍归为 `E13_STOP_REASON_OVERINTERPRETATION`。
+## 证据分层结构图
+
+```mermaid
+flowchart LR
+    A[time_valid evidence] --> B[daily_review]
+    A --> C[forward_attention]
+    A --> D[local_background]
+    A --> E[excluded_by_distance]
+
+    B --> F[可计算 GRCI 的已掘复核 cell]
+    C --> G[只使用 GRS / source_trace 的前方关注]
+    D --> H[局部背景上下文]
+    E --> I[不进入日报主证据链]
+```
+
+## LLM 生成结构图
+
+```mermaid
+flowchart TD
+    A[Evidence Pack] --> B[Report Planner]
+    B --> C[Plan Validation]
+    C --> D[Report Prompt]
+    D --> E[LLM Draft]
+    E --> F[Post-process]
+    F --> G[Quality / Trace]
+    G --> H{是否启用修订}
+    H -- 否 --> I[Final Report]
+    H -- 是 --> J[Revision Prompt]
+    J --> K[Revised Report]
+    K --> L[Quality / Trace 再检查]
+    L --> I
+```
+
+## 已合并或移除的旧文档
+
+以下文档属于阶段性说明或旧索引，内容已经合并到上述当前文档中，因此不再保留在 `backend/docs` 根目录：
+
+- `current_backend_system_manual.md`：合并到 [系统架构与执行路线](system_architecture.md) 与 [方法与计算逻辑白皮书](method_calculation_whitepaper.md)。
+- `case_2023-12-30.md`：真实案例信息合并到 [方法与计算逻辑白皮书](method_calculation_whitepaper.md) 的复盘说明与导出字段解释中。
+- `quality_trace_boundary_update.md`：合并到 [字段契约](backend_field_contract.md)、[LLM 生成模式](llm_generation_modes.md) 与白皮书的 Quality / Trace 部分。
+- `method_definition.md`、`metrics_definition.md`、`scope_and_limitations.md`：合并到 [方法与计算逻辑白皮书](method_calculation_whitepaper.md) 与 [论文写作上下文包](paper_writing_context.md)。
+- `archive_plan.md`：归档说明合并到根 README、后端 README 和本文档。
+
+后续如果新增文档，请优先放入上述阅读路径；不要再新增只记录单次修复过程的临时说明。
