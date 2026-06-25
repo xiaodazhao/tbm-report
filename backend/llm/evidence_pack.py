@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from schemas.pipeline import ConstructionStateCell
+from schemas.twin import DailyConstructionTwin, TwinCellView
 
 
 GENERATION_CONSTRAINTS = [
@@ -148,6 +149,123 @@ def build_prompt_evidence_pack(
         },
         "warnings": warnings or [],
     }
+
+
+def build_evidence_pack_from_twin(
+    *,
+    twin: DailyConstructionTwin,
+    operation_summary: dict[str, Any] | None = None,
+    cluster_summary: dict[str, Any] | None = None,
+    gas_summary: dict[str, Any] | None = None,
+    forward_profile: dict[str, Any] | None = None,
+    high_grci_cells: list[dict[str, Any]] | None = None,
+    excluded_evidence_summary: dict[str, Any] | None = None,
+    priority_cells: dict[str, list[dict[str, Any]]] | None = None,
+    quality_evidence: dict[str, Any] | None = None,
+    top_k_review_cells: int = 10,
+    top_k_forward_cells: int = 8,
+    top_k_background_cells: int = 8,
+) -> dict[str, Any]:
+    """Build the report Evidence Pack from the DailyConstructionTwin contract."""
+    scope = twin.scope.model_dump()
+    scope.setdefault("date", twin.date)
+    scope.setdefault("current_chainage", scope.get("current_chainage") or scope.get("face_chainage"))
+    scope.setdefault("cell_length_m", scope.get("cell_length_m") or 10)
+    scope.setdefault("cell_count", len(twin.cells))
+
+    excavated_cells = [_twin_cell_for_pack(cell, "daily_review") for cell in twin.daily_review_cells[:top_k_review_cells]]
+    forward_cells = [
+        _twin_cell_for_forward_pack(cell, "forward_attention")
+        for cell in twin.forward_attention_cells[:top_k_forward_cells]
+    ]
+    background_cells = [
+        _twin_cell_for_pack(cell, "local_background")
+        for cell in twin.local_background_cells[:top_k_background_cells]
+    ]
+    key_cells = _merge_pack_cells(excavated_cells, forward_cells, background_cells)
+    priority_cells = priority_cells or {}
+    governance = twin.governance.model_dump()
+
+    pack = {
+        "schema_version": "twin_evidence_pack_v1",
+        "evidence_pack_source": "daily_construction_twin",
+        "report_scope": scope,
+        "scope_summary": scope,
+        "operation_evidence": operation_summary or twin.summaries.operation_summary,
+        "cluster_evidence": cluster_summary or (twin.summaries.response_summary or {}).get("cluster_summary", {}),
+        "gas_evidence": gas_summary or twin.summaries.gas_summary,
+        "geology_evidence": {
+            "key_cells": key_cells,
+            "selected_cells": key_cells,
+            "excavated_review_cells": excavated_cells,
+            "forward_attention_cells": forward_cells,
+            "background_context_cells": background_cells,
+        },
+        "daily_review_evidence": {
+            "daily_review_cells": excavated_cells,
+            "review_cells": excavated_cells,
+            "high_priority_cells": priority_cells.get("high_priority_cells", []),
+            "medium_priority_cells": priority_cells.get("medium_priority_cells", []),
+            "low_priority_cells": priority_cells.get("low_priority_cells", []),
+            "note": "Daily review cells are excavated review cells. GRCI is available only when PLC response and geology evidence are both present.",
+        },
+        "excavated_review_evidence": {
+            "high_grci_cells": high_grci_cells or twin.high_grci_cells,
+            "review_cells": excavated_cells,
+            "note": "GRCI is a review-priority/co-attention index for excavated review cells, not a disaster probability.",
+        },
+        "forward_evidence": {
+            **(forward_profile if isinstance(forward_profile, dict) else twin.summaries.forward_summary),
+            "forward_attention_cells": forward_cells,
+            "note": "Forward evidence is an attention/indication profile and does not use GRCI.",
+        },
+        "forward_attention_evidence": {
+            "forward_profile": forward_profile if isinstance(forward_profile, dict) else twin.summaries.forward_summary,
+            "forward_attention_cells": forward_cells,
+            "note": "Forward attention cells are not excavated review cells and must not be described as occurred facts.",
+        },
+        "background_context_evidence": {
+            "background_context_cells": background_cells,
+            "note": "Background cells provide local geological context only.",
+        },
+        "local_background_evidence": {
+            "local_background_cells": background_cells,
+            "background_context_cells": background_cells,
+            "note": "Local background cells do not enter daily GRCI review.",
+        },
+        "excluded_evidence_summary": excluded_evidence_summary or {},
+        "coupling_evidence": {
+            "high_grci_cells": high_grci_cells or twin.high_grci_cells,
+            "legacy_high_grci_cells": high_grci_cells or twin.high_grci_cells,
+            "review_cells": priority_cells.get("review_cells", high_grci_cells or twin.high_grci_cells),
+            "high_priority_cells": priority_cells.get("high_priority_cells", []),
+            "medium_priority_cells": priority_cells.get("medium_priority_cells", []),
+            "low_priority_cells": priority_cells.get("low_priority_cells", []),
+            "review_priority_cells": high_grci_cells or twin.high_grci_cells,
+            "note": "high_grci_cells are daily_review cells only. GRCI is not forward risk.",
+        },
+        "quality_evidence": quality_evidence or {},
+        "source_trace": _collect_twin_source_trace(twin.cells),
+        "evidence_governance": governance,
+        "source_role_boundaries": governance.get("role_rules", {}),
+        "metric_boundaries": governance.get("metric_boundaries", {}),
+        "allowed_claims": governance.get("allowed_claims", []),
+        "forbidden_claims": governance.get("forbidden_claims", []),
+        "generation_constraints": GENERATION_CONSTRAINTS
+        + list(governance.get("forbidden_claims", []))
+        + [
+            "Evidence Pack comes from DailyConstructionTwin; do not infer beyond cell role and trace state.",
+            "forward_attention cells use GRS/source_trace only and must not be ranked by GRCI.",
+        ],
+        "selection_config": {
+            "top_k_review_cells": top_k_review_cells,
+            "top_k_forward_cells": top_k_forward_cells,
+            "top_k_background_cells": top_k_background_cells,
+            "source": "DailyConstructionTwin role-separated cell views",
+        },
+        "warnings": twin.warnings,
+    }
+    return pack
 
 
 def render_evidence_pack_text(pack: dict[str, Any]) -> str:
@@ -430,6 +548,156 @@ def _pack_cells_with_selection(cells: list[ConstructionStateCell], role: str) ->
     for index, item in enumerate(scored, start=1):
         item["selection_rank"] = index
     return scored
+
+
+def _twin_cell_for_pack(cell: TwinCellView, role: str) -> dict[str, Any]:
+    response = cell.response_state or {}
+    geology = cell.geology_state or {}
+    coupling = cell.coupling_state or {}
+    position = cell.position_state or {}
+    trace = cell.trace_state or {}
+    payload = {
+        "cell_id": cell.cell_id,
+        "cell_start": cell.mileage_start,
+        "cell_end": cell.mileage_end,
+        "cell_center": _center(cell),
+        "cell_role": cell.cell_role,
+        "evidence_role": role,
+        "distance_to_face_m": cell.distance_to_face_m,
+        "is_excavated_today": position.get("is_excavated_today"),
+        "is_current_face_cell": position.get("is_current_face_cell"),
+        "is_forward_cell": position.get("is_forward_cell"),
+        "RAI": response.get("RAI"),
+        "RAI_formula_text": response.get("RAI_formula_text"),
+        "speed_mean": response.get("speed_mean"),
+        "thrust_mean": response.get("thrust_mean"),
+        "torque_mean": response.get("torque_mean"),
+        "GRS_geo_base": geology.get("GRS_geo_base"),
+        "GRS_available": geology.get("GRS_available"),
+        "GRS_unavailable_reason": geology.get("GRS_unavailable_reason"),
+        "fused_grade": geology.get("fused_grade"),
+        "main_hazards": geology.get("main_hazards"),
+        "hazard_scores": geology.get("hazard_scores"),
+        "confidence_score": geology.get("confidence_score"),
+        "supporting_evidence_ids": geology.get("supporting_evidence_ids"),
+        "source_trace": geology.get("source_trace") or trace.get("source_trace"),
+        "GRCI": coupling.get("GRCI"),
+        "GRCI_available": coupling.get("GRCI_available"),
+        "GRCI_source": coupling.get("GRCI_source"),
+        "GRCI_unavailable_reason": coupling.get("GRCI_unavailable_reason"),
+        "coupling_level": coupling.get("coupling_level"),
+        "coupling_explanation": coupling.get("coupling_explanation"),
+        "trace_refs": trace.get("trace_refs"),
+        "trace_completeness": trace.get("trace_completeness"),
+    }
+    if role == "daily_review":
+        metrics = _twin_plc_enhanced_metrics_for_pack(cell)
+        if metrics:
+            payload["plc_enhanced_metrics"] = metrics
+    score, method, reason = _twin_selection_score(cell, role)
+    payload.update(
+        {
+            "selection_score": score,
+            "selection_method": method,
+            "selection_reason": reason,
+            "selected_by_score": True,
+        }
+    )
+    return payload
+
+
+def _twin_cell_for_forward_pack(cell: TwinCellView, role: str) -> dict[str, Any]:
+    payload = _twin_cell_for_pack(cell, role)
+    payload.pop("RAI", None)
+    payload.pop("RAI_formula_text", None)
+    payload.pop("plc_enhanced_metrics", None)
+    payload["GRCI"] = None
+    payload["GRCI_available"] = False
+    payload["GRCI_source"] = "not_applicable_forward_attention"
+    payload["GRCI_unavailable_reason"] = "forward_attention_uses_grs_not_grci"
+    payload["boundary"] = "Forward attention cells use GRS/source_trace only, not GRCI or PLC response evidence."
+    return payload
+
+
+def _twin_selection_score(cell: TwinCellView, role: str) -> tuple[float | None, str, str]:
+    response = cell.response_state or {}
+    geology = cell.geology_state or {}
+    coupling = cell.coupling_state or {}
+    forward = cell.forward_state or {}
+    trace = cell.trace_state or {}
+    if role == "daily_review":
+        terms = [
+            ("GRCI", 0.40, coupling.get("GRCI") if coupling.get("GRCI_available") else None),
+            ("RAI", 0.25, response.get("RAI")),
+            ("GRS", 0.25, geology.get("GRS_geo_base") if geology.get("GRS_available") else None),
+            ("trace_completeness", 0.10, trace.get("trace_completeness")),
+        ]
+        method = "daily_review_twin_selection_score_v1"
+    elif role == "forward_attention":
+        terms = [
+            ("GRS", 0.45, geology.get("GRS_geo_base") if geology.get("GRS_available") else None),
+            ("forward_distance_weight", 0.25, forward.get("forward_distance_weight")),
+            ("trace_completeness", 0.30, trace.get("trace_completeness")),
+        ]
+        method = "forward_attention_twin_selection_score_v1_no_grci"
+    else:
+        terms = [
+            ("GRS", 0.50, geology.get("GRS_geo_base") if geology.get("GRS_available") else None),
+            ("trace_completeness", 0.50, trace.get("trace_completeness")),
+        ]
+        method = "local_background_twin_selection_score_v1"
+    available = [(name, weight, _bounded(value)) for name, weight, value in terms if value is not None]
+    if not available:
+        return None, method, "no_available_selection_terms"
+    total_weight = sum(weight for _, weight, _ in available) or 1.0
+    score = sum((weight / total_weight) * value for _, weight, value in available)
+    reason = ", ".join(f"{name}={value:.3f}" for name, _, value in available)
+    return round(float(score), 4), method, reason
+
+
+def _twin_plc_enhanced_metrics_for_pack(cell: TwinCellView) -> dict[str, Any]:
+    response = cell.response_state or {}
+    keys = [
+        "working_sample_count",
+        "working_ratio",
+        "working_speed_cv",
+        "working_thrust_cv",
+        "working_torque_cv",
+        "penetration_mean",
+        "cutterhead_power_proxy",
+        "thrust_per_penetration",
+        "torque_per_penetration",
+        "insufficient_working_samples",
+    ]
+    out = {key: response.get(key) for key in keys if response.get(key) is not None}
+    if out:
+        out["interpretation_boundary"] = (
+            "PLC enhanced metrics are excavated daily-review response evidence only; "
+            "proxy fields are not strict physical quantities or geological-risk proof."
+        )
+    return out
+
+
+def _collect_twin_source_trace(cells: list[TwinCellView]) -> list[dict[str, Any]]:
+    seen = set()
+    traces = []
+    for cell in cells:
+        for trace in (cell.trace_state or {}).get("source_trace", []) or []:
+            key = trace.get("evidence_id") or str(trace)
+            if key in seen:
+                continue
+            seen.add(key)
+            traces.append(trace)
+    return traces
+
+
+def _center(cell: TwinCellView) -> float | None:
+    try:
+        if cell.mileage_start is None or cell.mileage_end is None:
+            return None
+        return (float(cell.mileage_start) + float(cell.mileage_end)) / 2.0
+    except Exception:
+        return None
 
 
 def _merge_pack_cells(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -204,3 +204,86 @@ P3 candidate evidence 不进入正式 `evidence_db`，不进入 GRS/GRCI，不�
 - `quality`
 - `trace`
 - `warnings`
+# DailyConstructionTwin 字段补充
+
+当前后端在 `ConstructionStateCell` 之上新增 `DailyConstructionTwin`，用于统一组织施工状态、证据治理、查询、Evidence Pack 和 Trace 导出。它不改变 RAI / GRS / GRCI 的计算公式。
+
+## DailyReportResult 新增字段
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `daily_construction_twin` | `dict` | `DailyConstructionTwin` 的完整 JSON 结构，主要用于 debug 和导出 |
+| `twin_summary` | `dict` | twin 的紧凑摘要，包括 cell 数量、分层数量、operation/response/geology/forward/coupling/quality 摘要 |
+| `twin_boundary_summary` | `dict` | 报告文本是否违反 twin 语义边界的检查结果 |
+
+## DailyConstructionTwin
+
+| 字段 | 含义 |
+| --- | --- |
+| `date` | 日期 |
+| `scope` | 当日 PLC 实测范围、cell 对齐复核范围、前方范围和背景范围 |
+| `cells` | 全部 `TwinCellView` |
+| `daily_review_cells` | 已掘复核 cell，可使用 RAI / GRS / GRCI |
+| `forward_attention_cells` | 当前掌子面前方关注 cell，只使用 GRS / source_trace，不使用 GRCI |
+| `local_background_cells` | 局部背景 cell，只提供上下文 |
+| `high_grci_cells` | 已掘复核范围内的 high/top GRCI cell，不包含 forward cell |
+| `summaries` | operation、response、plc、geology、forward、gas、coupling、quality 摘要 |
+| `trace_index` | cell、PLC、geology、source evidence、warning 索引 |
+| `governance` | 证据角色规则、指标边界、allowed/forbidden claims |
+| `debug` | pipeline 调试信息 |
+| `warnings` | warning 列表 |
+
+## TwinCellView
+
+| 字段 | 含义 |
+| --- | --- |
+| `cell_id` | cell 编号 |
+| `mileage_start` / `mileage_end` | cell 起止里程 |
+| `cell_role` | `daily_review` / `forward_attention` / `local_background` 等角色 |
+| `distance_to_face_m` | 距当前掌子面的距离 |
+| `position_state` | 里程位置、是否已掘、是否前方、forward distance band |
+| `operation_state` | 工况、停机、异常和停机语义边界 |
+| `response_state` | RAI、PLC 均值、working-only enhanced PLC proxy |
+| `geology_state` | GRS、围岩等级、hazards、supporting evidence、source trace |
+| `forward_state` | 前方关注边界。forward cell 的 `GRCI_available=false` |
+| `gas_state` | 气体状态入口，当前以日级 gas summary 为主 |
+| `coupling_state` | GRCI、coupling level、解释文本和边界说明 |
+| `quality_state` | has_plc_response、has_geology_evidence、GRS/GRCI 可用性、warnings |
+| `trace_state` | supporting evidence ids、trace refs、source trace、trace completeness |
+
+## Evidence Pack 新增字段
+
+当 Evidence Pack 从 `DailyConstructionTwin` 构建时，新增：
+
+| 字段 | 含义 |
+| --- | --- |
+| `evidence_pack_source` | 固定为 `daily_construction_twin` |
+| `evidence_governance` | 完整证据治理上下文 |
+| `source_role_boundaries` | daily_review / forward_attention / local_background 的使用边界 |
+| `metric_boundaries` | RAI / GRS / GRCI / proxy 指标语义边界 |
+| `allowed_claims` | Evidence Pack 支撑的允许表达类型 |
+| `forbidden_claims` | 报告中禁止表达的 claim 类型 |
+
+兼容字段仍然保留：
+
+| 字段 | 说明 |
+| --- | --- |
+| `geology_evidence.key_cells` | 正式关键 cell 字段 |
+| `geology_evidence.selected_cells` | 短期兼容字段，内容与 `key_cells` 一致 |
+
+## Twin Boundary Check
+
+`twin_boundary_summary` 用于检查报告是否违反 twin 语义边界，重点包括：
+
+- GRCI 被写成灾害概率；
+- forward attention 被写成已发生事实；
+- forward cell 使用 GRCI；
+- PLC proxy 被写成严格物理功率；
+- stop_ratio 被写成异常停机原因。
+
+检查结果进入：
+
+- `quality.twin_boundary_check`
+- `quality_summary.twin_boundary_violation_count`
+- `quality_summary.twin_boundary_has_violation`
+- `DailyReportResult.twin_boundary_summary`

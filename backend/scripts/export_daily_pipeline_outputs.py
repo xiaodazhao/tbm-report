@@ -139,6 +139,7 @@ def _export_one(
             "unsupported_claim_count": result.quality_summary.get("unsupported_claim_count"),
             "error_type_counts": result.quality.get("error_type_counts", {}),
             "support_type_distribution": result.trace.get("support_type_distribution", {}),
+            "twin_boundary_violation_count": result.twin_boundary_summary.get("violation_count"),
             "warnings": result.warnings,
             "generation_mode": result.generation_mode,
             "llm_summary": (result.llm_generation or {}).get("summary", {}),
@@ -162,11 +163,21 @@ def _export_one(
         _write_json(target / "geo_states_df.json", result.geo_state_records)
         _write_json(target / "cell_evidence_df.json", result.cell_evidence_records)
         _write_json(target / "warnings.json", result.warnings)
+        _write_json(target / "daily_construction_twin.json", result.daily_construction_twin)
+        _write_json(target / "twin_summary.json", result.twin_summary)
+        _write_json(target / "twin_boundary_summary.json", result.twin_boundary_summary)
+        twin_cell_views = (result.daily_construction_twin or {}).get("cells", [])
+        _write_json(target / "twin_cell_views.json", twin_cell_views)
         _write_json(target / "summary.json", summary)
         _write_llm_outputs(target, result.llm_generation)
 
         csv_rows = [_csv_safe(item) for item in cells]
         pd.DataFrame(csv_rows).to_csv(target / "construction_state_cells.csv", index=False, encoding="utf-8-sig")
+        pd.DataFrame([_csv_safe(dict(row)) for row in twin_cell_views]).to_csv(
+            target / "twin_cell_views.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
         _write_csv(target / "time_valid_evidence.csv", result.time_valid_evidence)
         _write_csv(target / "spatial_relevant_evidence.csv", result.spatial_relevant_evidence)
         _write_csv(target / "excluded_evidence.csv", result.excluded_evidence)

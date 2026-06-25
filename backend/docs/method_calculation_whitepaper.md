@@ -428,3 +428,26 @@ P3 不写入正式 `evidence_db.csv`，不进入 time_valid / spatial_relevant�
 - 让报告生成受 Evidence Pack 约束；
 - 让 Quality / Trace 暴露无证据 claim 和语义误用；
 - 为后续论文实验提供可复现导出。
+# DailyConstructionTwin 架构层说明
+
+当前版本在 `ConstructionStateCell` 之上新增 `DailyConstructionTwin`。该层的作用是组织状态、证据角色、trace index、governance rules 和可解释导出，不改变 RAI / GRS / GRCI 的计算公式。
+
+新的方法主线可以概括为：
+
+```text
+PLC 与正式地质证据
+-> ConstructionStateCell
+-> DailyConstructionTwin
+-> Evidence Governance
+-> Twin Evidence Pack
+-> Template / Optional LLM
+-> Quality / Trace / Twin Boundary Check
+```
+
+需要特别强调：
+
+- `DailyConstructionTwin` 不是物理仿真数字孪生，而是 cell-level 施工状态和证据治理底座。
+- `daily_review` cell 可以使用 RAI / GRS / GRCI 做已掘复核。
+- `forward_attention` cell 只能使用 GRS、source_trace 和 forward_profile 表示当前掌子面前方关注提示，不能使用 GRCI。
+- PLC enhanced proxy 只作为已掘区段施工响应证据，不是严格物理量，也不是地质风险证明。
+- `twin_boundary_check` 只检查报告是否越过这些语义边界，不改变 Quality / Trace 的基本 grounding 逻辑。

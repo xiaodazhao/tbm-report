@@ -10,11 +10,12 @@ from geology_v2.forward_profile import build_forward_profile
 from geology_v2.fusion_engine import fuse_geo_states
 from geology_v2.evidence_normalizer import summarize_normalized_evidence
 from geology_v2.pipeline import run_geology_v2_context
-from llm.evidence_pack import build_prompt_evidence_pack, build_template_report
+from llm.evidence_pack import build_evidence_pack_from_twin, build_template_report
 from llm.llm_report_generator import generate_llm_report, normalize_generation_mode
 from llm.report_prompt import build_prompt
 from llm.report_quality_checker import check_report_quality
 from llm.report_trace_builder import build_report_trace, summarize_report_trace
+from llm.twin_boundary_checker import check_twin_boundary_violations
 from pipeline.inputs import json_safe, load_daily_inputs
 from pipeline.evidence_scope import (
     apply_spatial_relevance_filter,
@@ -23,6 +24,7 @@ from pipeline.evidence_scope import (
 )
 from plc.response import analyze_plc_response
 from schemas.pipeline import DailyReportResult
+from twin.construction_twin import build_daily_construction_twin
 from twin.twin_state import build_twin_state
 
 
@@ -131,20 +133,34 @@ def run_daily_report_pipeline(
     gas_summary = json_safe(plc_result.get("gas_summary", {}))
     forward_profile = json_safe(forward_profile)
 
-    prompt_evidence_pack = build_prompt_evidence_pack(
+    daily_construction_twin = build_daily_construction_twin(
         date=active_date,
-        current_chainage=current_chainage,
+        construction_state_cells=construction_state_cells,
         operation_summary=operation_summary,
         cluster_summary=cluster_summary,
         gas_summary=gas_summary,
-        construction_state_cells=construction_state_cells,
         forward_profile=forward_profile,
         high_grci_cells=high_cells,
         scope_summary=scope_summary,
+        warnings=warnings,
+        debug={
+            "normalized_evidence_summary": normalized_evidence_summary,
+            "cell_response_row_count": len(_df(cell_response_df)),
+            "geo_state_row_count": len(_df(geo_states_df)),
+            "cell_evidence_row_count": len(_df(cell_evidence_df)),
+        },
+    )
+
+    prompt_evidence_pack = build_evidence_pack_from_twin(
+        twin=daily_construction_twin,
+        operation_summary=operation_summary,
+        cluster_summary=cluster_summary,
+        gas_summary=gas_summary,
+        forward_profile=forward_profile,
+        high_grci_cells=high_cells,
         excluded_evidence_summary=_excluded_evidence_summary(_df(geology_result.get("excluded_evidence_df"))),
         priority_cells=priority_cells,
         quality_evidence=json_safe(plc_result.get("quality_report", {})),
-        warnings=warnings,
     )
     prompt_text = build_prompt(prompt_evidence_pack)
     template_report = build_template_report(prompt_evidence_pack)
@@ -160,6 +176,8 @@ def run_daily_report_pipeline(
         high_grci_cells=high_cells,
         warnings=warnings,
     )
+    twin_state["daily_construction_twin"] = json_safe(daily_construction_twin.model_dump())
+    twin_state["twin_summary"] = json_safe(daily_construction_twin.summaries.model_dump())
 
     llm_generation = {}
     if active_generation_mode == "template":
@@ -208,8 +226,16 @@ def run_daily_report_pipeline(
         twin_state=twin_state,
         prompt_evidence_pack=prompt_evidence_pack,
     )
+    twin_boundary_summary = check_twin_boundary_violations(
+        report_text,
+        evidence_pack=prompt_evidence_pack,
+        twin=daily_construction_twin.model_dump(),
+    )
+    quality["twin_boundary_check"] = twin_boundary_summary
 
     quality_summary = _quality_summary(quality)
+    quality_summary["twin_boundary_violation_count"] = twin_boundary_summary.get("violation_count", 0)
+    quality_summary["twin_boundary_has_violation"] = twin_boundary_summary.get("has_violation", False)
     trace_summary = summarize_report_trace(trace)
 
     return DailyReportResult(
@@ -233,6 +259,9 @@ def run_daily_report_pipeline(
         medium_priority_cells=json_safe(priority_cells.get("medium_priority_cells", [])),
         low_priority_cells=json_safe(priority_cells.get("low_priority_cells", [])),
         twin_state=json_safe(twin_state),
+        daily_construction_twin=json_safe(daily_construction_twin.model_dump()),
+        twin_summary=json_safe(daily_construction_twin.summaries.model_dump()),
+        twin_boundary_summary=json_safe(twin_boundary_summary),
         scope_summary=json_safe(scope_summary),
         time_valid_evidence=json_safe(_df(geology_result.get("time_valid_evidence_df")).to_dict(orient="records")),
         spatial_relevant_evidence=json_safe(_df(geology_result.get("spatial_relevant_evidence_df")).to_dict(orient="records")),
