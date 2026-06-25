@@ -544,6 +544,15 @@ def _response_metrics(response: dict[str, Any]) -> dict[str, Any]:
         "speed_drop_component",
         "torque_component",
         "speed_volatility_component",
+        "working_sample_count",
+        "working_ratio",
+        "working_speed_cv",
+        "working_thrust_cv",
+        "working_torque_cv",
+        "penetration_mean",
+        "cutterhead_power_proxy",
+        "thrust_per_penetration",
+        "torque_per_penetration",
         "RAI",
     ]:
         if key in response:
@@ -552,10 +561,11 @@ def _response_metrics(response: dict[str, Any]) -> dict[str, Any]:
         "dominant_component",
         "RAI_formula_text",
         "stop_interpretation_warning",
+        "working_mask_warning",
     ]:
         if key in response:
             out[key] = _text(response.get(key))
-    for key in ["stop_reason_available", "planned_stop_distinguishable"]:
+    for key in ["stop_reason_available", "planned_stop_distinguishable", "insufficient_working_samples"]:
         if key in response:
             out[key] = bool(response.get(key))
     return {key: value for key, value in out.items() if value is not None}

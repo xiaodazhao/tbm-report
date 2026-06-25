@@ -34,10 +34,18 @@ def project_plc_response_to_cells(
     else:
         df = df.sort_values("chainage").copy()
 
-    _copy_numeric(df, resolved.get("speed_col"), "__speed")
-    _copy_numeric(df, resolved.get("thrust_col"), "__thrust")
-    _copy_numeric(df, resolved.get("torque_col"), "__torque")
-    _copy_numeric(df, resolved.get("rpm_col"), "__rpm")
+    motion_cols = resolved.get("motion_cols", {}) or {}
+    advance_speed_col = motion_cols.get("advance_speed") or resolved.get("speed_col") or resolved.get("advance_speed_col")
+    thrust_col = motion_cols.get("thrust") or resolved.get("thrust_col")
+    torque_col = motion_cols.get("torque") or resolved.get("torque_col")
+    rpm_col = motion_cols.get("rpm") or resolved.get("rpm_col")
+    penetration_col = motion_cols.get("penetration") or resolved.get("penetration_col")
+
+    _copy_numeric(df, advance_speed_col, "__speed")
+    _copy_numeric(df, thrust_col, "__thrust")
+    _copy_numeric(df, torque_col, "__torque")
+    _copy_numeric(df, rpm_col, "__rpm")
+    _copy_numeric(df, penetration_col, "__penetration")
 
     df["__duration_sec"] = _infer_row_duration_seconds(df)
     if "is_working" not in df.columns:
@@ -72,6 +80,7 @@ def project_plc_response_to_cells(
         torque_mean = _safe_mean(group.get("__torque"))
         torque_std = _safe_std(group.get("__torque"))
         rpm_mean = _safe_mean(group.get("__rpm"))
+        working_metrics = _working_only_metrics(group)
 
         stop_ratio = stop_sec / duration_sec if duration_sec > 0 else 0.0
         abnormal_ratio = abnormal_sec / duration_sec if duration_sec > 0 else 0.0
@@ -120,6 +129,7 @@ def project_plc_response_to_cells(
                 "speed_drop_score": speed_drop_score,
                 "torque_volatility_score": torque_volatility_score,
                 "speed_volatility_score": speed_volatility_score,
+                **working_metrics,
                 **rai_components,
                 "abnormal_score": abnormal_score,
                 "RAI": abnormal_score,
@@ -136,6 +146,7 @@ def project_plc_response_to_cells(
                     "speed_drop_score": speed_drop_score,
                     "torque_volatility_score": torque_volatility_score,
                     "speed_volatility_score": speed_volatility_score,
+                    **working_metrics,
                     **rai_components,
                     "RAI": abnormal_score,
                     "RAI_formula_text": RAI_FORMULA_TEXT,
@@ -158,6 +169,7 @@ RAI_FORMULA_TEXT = (
 STOP_INTERPRETATION_WARNING = (
     "当前 PLC 字段未区分计划停机与非计划停机，stop_ratio 仅作为施工响应关注信号，不直接作为异常原因。"
 )
+MIN_WORKING_SAMPLE_COUNT = 20
 
 
 def _rai_components(
@@ -197,6 +209,16 @@ def _empty_cell_response_df() -> pd.DataFrame:
             "stop_duration_min",
             "abnormal_score",
             "RAI",
+            "working_sample_count",
+            "working_ratio",
+            "insufficient_working_samples",
+            "working_speed_cv",
+            "working_thrust_cv",
+            "working_torque_cv",
+            "penetration_mean",
+            "cutterhead_power_proxy",
+            "thrust_per_penetration",
+            "torque_per_penetration",
             "response_support_count",
             "response_metrics",
         ]
@@ -245,6 +267,21 @@ def _safe_std(series: pd.Series | None) -> float | None:
     return None if pd.isna(value) else float(value)
 
 
+def _safe_cv(series: pd.Series | None, min_count: int = MIN_WORKING_SAMPLE_COUNT) -> float | None:
+    if series is None:
+        return None
+    numeric = pd.to_numeric(series, errors="coerce").dropna()
+    if len(numeric) < min_count:
+        return None
+    mean = float(numeric.mean())
+    if abs(mean) < 1e-6:
+        return None
+    std = float(numeric.std())
+    if pd.isna(std):
+        return None
+    return std / abs(mean)
+
+
 def _safe_quantile(series: pd.Series | None, q: float) -> float:
     if series is None:
         return 0.0
@@ -256,6 +293,71 @@ def _bounded(value: float) -> float:
     if pd.isna(value):
         return 0.0
     return float(max(0.0, min(1.0, value)))
+
+
+def _working_only_metrics(group: pd.DataFrame) -> dict[str, Any]:
+    mask, fallback_warning = _working_mask(group)
+    working = group.loc[mask].copy()
+    working_sample_count = int(len(working))
+    working_ratio = working_sample_count / int(len(group)) if len(group) else 0.0
+    insufficient = working_sample_count < MIN_WORKING_SAMPLE_COUNT
+
+    speed = pd.to_numeric(working.get("__speed"), errors="coerce") if "__speed" in working.columns else None
+    thrust = pd.to_numeric(working.get("__thrust"), errors="coerce") if "__thrust" in working.columns else None
+    torque = pd.to_numeric(working.get("__torque"), errors="coerce") if "__torque" in working.columns else None
+    rpm = pd.to_numeric(working.get("__rpm"), errors="coerce") if "__rpm" in working.columns else None
+    penetration = pd.to_numeric(working.get("__penetration"), errors="coerce") if "__penetration" in working.columns else None
+
+    penetration_positive = penetration[penetration > 1e-6] if penetration is not None else pd.Series(dtype=float)
+    penetration_mean = _safe_mean(penetration_positive)
+    thrust_mean = _safe_mean(thrust)
+    torque_mean = _safe_mean(torque)
+    power_proxy = None
+    if torque is not None and rpm is not None and not torque.empty and not rpm.empty:
+        valid_power = pd.DataFrame({"torque": torque, "rpm": rpm}).dropna()
+        valid_power = valid_power[(valid_power["torque"] > 0) & (valid_power["rpm"] > 0)]
+        power_proxy = _safe_mean(valid_power["torque"] * valid_power["rpm"]) if not valid_power.empty else None
+
+    thrust_per_penetration = None
+    torque_per_penetration = None
+    if penetration_mean is not None and penetration_mean > 1e-6:
+        if thrust_mean is not None:
+            thrust_per_penetration = thrust_mean / penetration_mean
+        if torque_mean is not None:
+            torque_per_penetration = torque_mean / penetration_mean
+
+    out = {
+        "working_sample_count": working_sample_count,
+        "working_ratio": working_ratio,
+        "insufficient_working_samples": insufficient,
+        "working_speed_cv": None if insufficient else _safe_cv(speed),
+        "working_thrust_cv": None if insufficient else _safe_cv(thrust),
+        "working_torque_cv": None if insufficient else _safe_cv(torque),
+        "penetration_mean": None if insufficient else penetration_mean,
+        "cutterhead_power_proxy": None if insufficient else power_proxy,
+        "thrust_per_penetration": None if insufficient else thrust_per_penetration,
+        "torque_per_penetration": None if insufficient else torque_per_penetration,
+    }
+    if fallback_warning:
+        out["working_mask_warning"] = fallback_warning
+    return out
+
+
+def _working_mask(group: pd.DataFrame) -> tuple[pd.Series, str | None]:
+    speed = pd.to_numeric(group.get("__speed", pd.Series(np.nan, index=group.index)), errors="coerce")
+    thrust = pd.to_numeric(group.get("__thrust", pd.Series(np.nan, index=group.index)), errors="coerce")
+    torque = pd.to_numeric(group.get("__torque", pd.Series(np.nan, index=group.index)), errors="coerce")
+    rpm = pd.to_numeric(group.get("__rpm", pd.Series(np.nan, index=group.index)), errors="coerce")
+    response_mask = speed.gt(0) & thrust.gt(0) & torque.gt(0) & rpm.gt(0)
+
+    if "is_working" in group.columns:
+        return group["is_working"].fillna(False).astype(bool) & response_mask, None
+    if "is_stopped" in group.columns:
+        return (~group["is_stopped"].fillna(False).astype(bool)) & response_mask, "working_mask_fallback_without_operation_mode"
+    state = group.get("operation_mode")
+    if state is not None:
+        return state.astype(str).eq("work") & response_mask, "working_mask_fallback_without_operation_mode"
+    return speed.gt(0) & thrust.gt(0) & torque.gt(0), "working_mask_fallback_without_operation_mode"
 
 
 def _dominant_operation_state(work_sec: float, stop_sec: float, abnormal_sec: float, duration_sec: float) -> str:

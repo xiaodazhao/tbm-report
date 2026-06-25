@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from coupling.grs_rai_grci import build_construction_state_cells, compute_cell_grci, high_grci_cells
+from plc.cell_response import project_plc_response_to_cells
 from llm.evidence_pack import build_prompt_evidence_pack
 from llm.report_grounding_checker import check_claim_grounding
 from llm.report_trace_builder import build_report_trace
@@ -16,6 +17,74 @@ from pipeline.evidence_scope import apply_spatial_relevance_filter, build_scope_
 import pipeline.daily_report_pipeline as daily_pipeline
 import routes.report as report_routes
 from schemas.pipeline import ConstructionStateCell
+
+
+def test_cell_response_reads_motion_cols_and_exports_working_only_metrics():
+    rows = []
+    for idx in range(25):
+        is_work = idx >= 5
+        rows.append(
+            {
+                "运行时间-time": f"2023-12-30 00:{idx:02d}:00",
+                "导向盾首里程": 1014601.0 + idx * 0.1,
+                "掘进状态": 1 if is_work else 0,
+                "推进速度": 10.0 + idx if is_work else 0.0,
+                "推力": 1000.0 + idx * 10.0 if is_work else 0.0,
+                "刀盘扭矩": 200.0 + idx * 2.0 if is_work else 0.0,
+                "刀盘实际转速": 5.0 + idx * 0.1 if is_work else 0.0,
+                "贯入度": 0.5 + idx * 0.01 if is_work else 0.0,
+                "is_working": is_work,
+                "is_stopped": not is_work,
+                "is_abnormal": False,
+            }
+        )
+    out = project_plc_response_to_cells(pd.DataFrame(rows), cell_length=10.0)
+    assert len(out) == 1
+    row = out.iloc[0]
+    assert row["speed_mean"] is not None
+    assert row["thrust_mean"] is not None
+    assert row["torque_mean"] is not None
+    assert row["rpm_mean"] is not None
+    assert row["working_sample_count"] == 20
+    assert row["working_ratio"] == 20 / 25
+    assert bool(row["insufficient_working_samples"]) is False
+    assert row["working_speed_cv"] is not None
+    assert row["working_thrust_cv"] is not None
+    assert row["working_torque_cv"] is not None
+    assert row["penetration_mean"] is not None
+    assert row["cutterhead_power_proxy"] is not None
+    assert row["thrust_per_penetration"] is not None
+    assert row["torque_per_penetration"] is not None
+    metrics = row["response_metrics"]
+    assert metrics["working_sample_count"] == 20
+    assert metrics["cutterhead_power_proxy"] == row["cutterhead_power_proxy"]
+
+
+def test_cell_response_marks_insufficient_working_samples_and_safe_ratios():
+    rows = []
+    for idx in range(10):
+        rows.append(
+            {
+                "运行时间-time": f"2023-12-30 00:{idx:02d}:00",
+                "导向盾首里程": 1014601.0 + idx * 0.1,
+                "掘进状态": 1,
+                "推进速度": 10.0,
+                "推力": 1000.0,
+                "刀盘扭矩": 200.0,
+                "刀盘实际转速": 5.0,
+                "贯入度": 0.0,
+                "is_working": True,
+                "is_stopped": False,
+                "is_abnormal": False,
+            }
+        )
+    out = project_plc_response_to_cells(pd.DataFrame(rows), cell_length=10.0)
+    row = out.iloc[0]
+    assert row["working_sample_count"] == 10
+    assert bool(row["insufficient_working_samples"]) is True
+    assert pd.isna(row["working_speed_cv"])
+    assert pd.isna(row["thrust_per_penetration"])
+    assert pd.isna(row["torque_per_penetration"])
 
 
 def test_evidence_pack_exposes_key_cells_for_grounding_checker():
@@ -264,6 +333,16 @@ def test_components_and_semantic_boundaries_are_exported():
                 "stop_reason_available": False,
                 "planned_stop_distinguishable": False,
                 "stop_interpretation_warning": "当前 PLC 字段未区分计划停机与非计划停机，stop_ratio 仅作为施工响应关注信号，不直接作为异常原因。",
+                "working_sample_count": 24,
+                "working_ratio": 0.8,
+                "insufficient_working_samples": False,
+                "working_speed_cv": 0.12,
+                "working_thrust_cv": 0.08,
+                "working_torque_cv": 0.18,
+                "penetration_mean": 0.55,
+                "cutterhead_power_proxy": 12345.0,
+                "thrust_per_penetration": 1800.0,
+                "torque_per_penetration": 400.0,
             }
         ]
     )
@@ -346,6 +425,10 @@ def test_components_and_semantic_boundaries_are_exported():
     assert daily.stop_reason_available is False
     assert daily.planned_stop_distinguishable is False
     assert daily.stop_interpretation_warning
+    assert daily.plc_metrics["working_sample_count"] == 24
+    assert daily.plc_metrics["working_ratio"] == 0.8
+    assert daily.plc_metrics["working_speed_cv"] == 0.12
+    assert daily.plc_metrics["cutterhead_power_proxy"] == 12345.0
     assert round(0.45 * daily.grade_score_component + 0.45 * daily.hazard_component + 0.10 * daily.confidence_component, 6) == round(daily.GRS_geo_base, 6)
     assert daily.GRS_available is True
     assert round(daily.grs_term + daily.rai_term + daily.interaction_term, 4) == daily.GRCI
@@ -360,6 +443,22 @@ def test_components_and_semantic_boundaries_are_exported():
     assert background.GRS_unavailable_reason == "missing_spatial_relevant_geology_evidence"
     assert background.GRCI_available is False
     assert not high_grci_cells(result) or all(cell["cell_role"] == "daily_review" for cell in high_grci_cells(result))
+
+    pack = build_prompt_evidence_pack(
+        date="2023-12-30",
+        current_chainage=10.0,
+        operation_summary={},
+        cluster_summary={},
+        gas_summary={},
+        construction_state_cells=result,
+        forward_profile={},
+        high_grci_cells=high_grci_cells(result),
+    )
+    daily_pack = pack["daily_review_evidence"]["daily_review_cells"][0]
+    assert daily_pack["plc_enhanced_metrics"]["working_sample_count"] == 24
+    assert "cutterhead_power_proxy" not in daily_pack["plc_enhanced_metrics"]
+    forward_pack = pack["forward_attention_evidence"]["forward_attention_cells"][0]
+    assert "plc_enhanced_metrics" not in forward_pack
 
 
 def test_stop_boundary_statement_gets_policy_support():

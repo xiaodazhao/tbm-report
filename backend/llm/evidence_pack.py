@@ -498,7 +498,7 @@ def _is_local_background_cell(cell: ConstructionStateCell) -> bool:
 
 
 def _cell_for_pack(cell: ConstructionStateCell) -> dict[str, Any]:
-    return cell.model_dump(
+    payload = cell.model_dump(
         include={
             "cell_id",
             "cell_start",
@@ -579,6 +579,10 @@ def _cell_for_pack(cell: ConstructionStateCell) -> dict[str, Any]:
             "trace_refs",
         }
     )
+    enhanced = _plc_enhanced_metrics_for_pack(cell)
+    if enhanced:
+        payload["plc_enhanced_metrics"] = enhanced
+    return payload
 
 
 def _cell_for_forward_pack(cell: ConstructionStateCell) -> dict[str, Any]:
@@ -628,6 +632,28 @@ def _cell_for_forward_pack(cell: ConstructionStateCell) -> dict[str, Any]:
             "trace_refs",
         }
     )
+
+
+def _plc_enhanced_metrics_for_pack(cell: ConstructionStateCell) -> dict[str, Any]:
+    metrics = cell.plc_metrics if isinstance(cell.plc_metrics, dict) else {}
+    keys = [
+        "working_sample_count",
+        "working_ratio",
+        "working_speed_cv",
+        "working_torque_cv",
+        "penetration_mean",
+        "thrust_per_penetration",
+        "torque_per_penetration",
+        "insufficient_working_samples",
+    ]
+    out = {key: metrics.get(key) for key in keys if key in metrics and metrics.get(key) is not None}
+    if not out:
+        return {}
+    out["interpretation_boundary"] = (
+        "该单元 PLC 增强指标仅作为已掘区段施工响应证据，不单独构成地质风险判断，"
+        "也不表示当前掌子面前方地质事实。"
+    )
+    return out
 
 
 def _collect_source_trace(cells: list[ConstructionStateCell]) -> list[dict[str, Any]]:
