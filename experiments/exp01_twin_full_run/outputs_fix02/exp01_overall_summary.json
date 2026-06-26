@@ -1,0 +1,18 @@
+{
+  "total_dates": 91,
+  "success_count": 91,
+  "failed_count": 0,
+  "success_rate": 1.0,
+  "average_quality_score": 100.0,
+  "average_grounding_rate": 1.0,
+  "unsupported_claim_count_total": 0,
+  "forward_cell_entered_high_grci_cells_count": 0,
+  "twin_boundary_violation_count_total": 0,
+  "E14_ALIGNED_SCOPE_AS_ACTUAL_ADVANCE_count": 0,
+  "role_boundary_failed_count": 0,
+  "unsupported_claim_count_total_raw": 42,
+  "unsupported_claim_count_total_effective": 0,
+  "heading_fragment_false_positive_count": 42,
+  "average_grounding_rate_raw": 0.9781747252747254,
+  "average_grounding_rate_effective": 1.0
+}

@@ -1,0 +1,11 @@
+﻿test_sentence,expected_violation_type,detected,detected_type,matched_text
+GRCI 表示灾害概率,grci_probability_misuse,True,grci_probability_misuse,GRCI 表示灾害概率
+PLC 证明前方异常,forward_fact_misuse,True,forward_fact_misuse,PLC 证明前方异常
+cutterhead_power_proxy 是真实功率,plc_proxy_misuse,True,plc_proxy_misuse,cutterhead_power_proxy 是真实功率
+stop_ratio 说明设备异常,stop_causality_misuse,True,stop_causality_misuse,stop_ratio 说明设备异常
+local_background 证明当日异常,local_background_scope_misuse,True,local_background_scope_misuse,local_background 证明当日异常
+GRCI indicates disaster probability,grci_probability_misuse,True,grci_probability_misuse;grci_probability_misuse,GRCI indicates disaster probability;GRCI indicates disaster probability
+PLC proves forward abnormal geology,forward_fact_misuse,True,forward_fact_misuse,PLC proves forward abnormal geology
+cutterhead_power_proxy is true physical power,plc_proxy_misuse,True,plc_proxy_misuse,cutterhead_power_proxy is true physical power
+stop_ratio proves equipment failure,stop_causality_misuse,True,stop_causality_misuse,stop_ratio proves equipment failure
+local background proves today's abnormal condition,local_background_scope_misuse,True,local_background_scope_misuse,local background proves today's abnormal condition

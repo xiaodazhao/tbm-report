@@ -5,7 +5,7 @@ from llm.report_quality_checker import check_report_quality
 
 def test_quality_output_contains_error_taxonomy_fields():
     quality = check_report_quality(
-        "GRCI 是灾害概率。停机直接说明异常原因。",
+        "GRCI 表示灾害概率。stop_ratio 直接说明异常原因。",
         prompt_evidence_pack={},
         include_claim_results=True,
     )
@@ -21,23 +21,24 @@ def test_quality_output_contains_error_taxonomy_fields():
 
 
 def test_method_boundary_statement_gets_e12_policy_support():
+    text = (
+        "当前 PLC 字段未区分计划停机与非计划停机，stop_ratio 仅作为施工响应关注信号，"
+        "不直接作为异常原因。"
+    )
     grounding = check_claim_grounding(
-        [
-            {
-                "claim_id": "boundary",
-                "claim_type": "recommendation",
-                "text": "当前 PLC 字段未区分计划停机与非计划停机，stop_ratio 仅作为施工响应关注信号，不直接作为异常原因。",
-            }
-        ],
+        [{"claim_id": "boundary", "claim_type": "recommendation", "text": text}],
         prompt_evidence_pack={},
     )
     quality = check_report_quality(
-        "当前 PLC 字段未区分计划停机与非计划停机，stop_ratio 仅作为施工响应关注信号，不直接作为异常原因。",
+        text,
         prompt_evidence_pack={},
         include_claim_results=True,
     )
 
-    assert grounding["claim_results"][0]["trace_support_type"] == "policy_support"
+    claim = grounding["claim_results"][0]
+    assert claim["claim_type"] == "method_boundary"
+    assert claim["grounded"] is True
+    assert claim["trace_support_type"] == "policy_support"
     assert any(
         item.get("error_type") == "E12_METHOD_BOUNDARY_STATEMENT"
         for item in quality.get("claim_results") or []
@@ -47,13 +48,7 @@ def test_method_boundary_statement_gets_e12_policy_support():
 def test_forward_evidence_boundary_statement_gets_method_boundary_policy_support():
     text = "如无当日可用掌子面素描，不把前方证据写成已揭露事实。"
     grounding = check_claim_grounding(
-        [
-            {
-                "claim_id": "boundary-forward",
-                "claim_type": "forward_segment",
-                "text": text,
-            }
-        ],
+        [{"claim_id": "boundary-forward", "claim_type": "forward_segment", "text": text}],
         prompt_evidence_pack={},
     )
     quality = check_report_quality(
@@ -78,6 +73,19 @@ def test_forward_evidence_boundary_statement_gets_method_boundary_policy_support
         for item in quality_claims
     )
     assert quality["error_type_counts"]["E11_HEADING_FALSE_POSITIVE"] == 0
+
+
+def test_gas_none_fragment_is_excluded_from_grounding_denominator():
+    quality = check_report_quality(
+        "涉及气体为 无。",
+        prompt_evidence_pack={},
+        include_claim_results=True,
+    )
+
+    assert quality["claim_count"] == 0
+    assert quality["unsupported_claim_count"] == 0
+    assert quality.get("claim_results") == []
+    assert quality["stats"]["excluded_non_technical_claim_count"] >= 1
 
 
 def test_real_unsupported_technical_claim_does_not_get_policy_support():

@@ -608,15 +608,37 @@ def _twin_cell_for_pack(cell: TwinCellView, role: str) -> dict[str, Any]:
 
 def _twin_cell_for_forward_pack(cell: TwinCellView, role: str) -> dict[str, Any]:
     payload = _twin_cell_for_pack(cell, role)
-    payload.pop("RAI", None)
-    payload.pop("RAI_formula_text", None)
-    payload.pop("plc_enhanced_metrics", None)
+    _strip_forward_plc_response_fields(payload)
     payload["GRCI"] = None
     payload["GRCI_available"] = False
     payload["GRCI_source"] = "not_applicable_forward_attention"
     payload["GRCI_unavailable_reason"] = "forward_attention_uses_grs_not_grci"
     payload["boundary"] = "Forward attention cells use GRS/source_trace only, not GRCI or PLC response evidence."
     return payload
+
+
+def _strip_forward_plc_response_fields(payload: dict[str, Any]) -> None:
+    """Remove excavated PLC response fields from forward Evidence Pack cells."""
+    for key in [
+        "RAI",
+        "RAI_formula_text",
+        "speed_mean",
+        "thrust_mean",
+        "torque_mean",
+        "rpm_mean",
+        "plc_enhanced_metrics",
+        "working_sample_count",
+        "working_ratio",
+        "insufficient_working_samples",
+        "working_speed_cv",
+        "working_thrust_cv",
+        "working_torque_cv",
+        "penetration_mean",
+        "cutterhead_power_proxy",
+        "thrust_per_penetration",
+        "torque_per_penetration",
+    ]:
+        payload.pop(key, None)
 
 
 def _twin_selection_score(cell: TwinCellView, role: str) -> tuple[float | None, str, str]:

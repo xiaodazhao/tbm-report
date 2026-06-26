@@ -18,7 +18,7 @@ BOUNDARY_RULES: dict[str, dict[str, Any]] = {
     "forward_fact_misuse": {
         "severity": "error",
         "patterns": [
-            r"(前方|当前掌子面前方).{0,24}(已发生|已经发生|已揭示|已揭露|现场揭露|存在异常|发生异常)",
+            r"(前方|当前掌子面前方).{0,24}(已发生|已经发生|已揭示|已经揭示|已揭露|现场揭露|存在异常|发生异常)",
             r"PLC.{0,16}(证明|表明|说明).{0,16}(前方|当前掌子面前方).{0,24}(异常|不良地质|风险|灾害)",
             r"(已掘|已开挖).{0,12}PLC.{0,16}(证明|表明|说明).{0,16}(前方|当前掌子面前方)",
             r"forward_attention.{0,16}(证明|表明|说明).{0,16}(前方|风险|异常)",
@@ -59,6 +59,13 @@ BOUNDARY_RULES: dict[str, dict[str, Any]] = {
 }
 
 SAFE_BOUNDARY_PATTERNS = [
+    r"(不把|不能|不应|不得|不可).{0,32}(写成|表述为|解释为)",
+    r"(不表示|不代表).{0,32}已发生",
+    r"(不能证明|不证明).{0,32}前方",
+    r"前方.{0,24}(不能证明|不证明)",
+    r"(不能|不得|不应|不可).{0,24}证明.{0,24}前方",
+    r"(仅表示|仅作为|只表示|只作为).{0,32}提示",
+    r"(不作为|不能作为|不得作为).{0,32}(事实|结论)",
     r"GRCI.{0,16}(不是|不表示|不等同于|不得写成|不能写成).{0,16}(灾害概率|风险概率|概率)",
     r"(不得|不能|不应).{0,12}(把)?GRCI.{0,16}(写成|表述为|解释为).{0,16}(灾害概率|风险概率|概率)",
     r"RAI.{0,16}(不是|不表示|不等同于).{0,16}(风险概率|灾害概率|概率)",
@@ -73,6 +80,7 @@ SAFE_BOUNDARY_PATTERNS = [
     r"stop_ratio.{0,24}(不能|不得|不应).{0,24}(直接解释|解释为|证明).{0,24}(异常原因|设备异常|非计划停机)",
     r"local_background.{0,24}(仅作为|只作为).{0,24}(背景|解释)",
     r"local_background.{0,24}(不作为|不能作为|不得作为).{0,24}(当日结论|结论)",
+    r"(does not indicate|does not represent|should not be written as|must not be written as|cannot prove|does not prove|only indicates|only serves as|is not a fact|is not evidence of|should not be treated as|must not be treated as)",
     r"GRCI.{0,24}(is not|does not mean|must not be written as).{0,24}(disaster probability|risk probability|probability)",
     r"forward attention.{0,24}(only indicates|does not indicate|does not mean).{0,24}(attention|occurred fact|fact)",
     r"stop[_ ]?ratio.{0,24}(only serves|does not directly prove|must not be interpreted).{0,24}(signal|abnormal cause|unplanned shutdown)",

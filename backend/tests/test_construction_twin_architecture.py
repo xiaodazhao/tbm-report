@@ -76,6 +76,20 @@ def test_daily_construction_twin_separates_roles_and_strips_forward_grci():
 def test_evidence_pack_from_twin_keeps_forward_out_of_grci_and_adds_governance():
     review = _cell("cell_0_10", "daily_review", start=0, end=10, rai=0.4, grci=0.52, grci_available=True)
     forward = _cell("cell_10_20", "forward_attention", start=10, end=20, is_forward=True)
+    forward.speed_mean = 8.0
+    forward.thrust_mean = 1200.0
+    forward.torque_mean = 300.0
+    forward.plc_metrics = {
+        "working_sample_count": 12,
+        "working_ratio": 0.6,
+        "working_speed_cv": 0.2,
+        "working_thrust_cv": 0.3,
+        "working_torque_cv": 0.4,
+        "penetration_mean": 5.0,
+        "cutterhead_power_proxy": 9000.0,
+        "thrust_per_penetration": 240.0,
+        "torque_per_penetration": 60.0,
+    }
     twin = build_daily_construction_twin(
         date="2023-12-30",
         construction_state_cells=[review, forward],
@@ -93,6 +107,16 @@ def test_evidence_pack_from_twin_keeps_forward_out_of_grci_and_adds_governance()
     assert forward_cell["GRCI"] is None
     assert forward_cell["GRCI_available"] is False
     assert "plc_enhanced_metrics" not in forward_cell
+    for field in [
+        "speed_mean",
+        "thrust_mean",
+        "torque_mean",
+        "working_sample_count",
+        "working_ratio",
+        "thrust_per_penetration",
+        "torque_per_penetration",
+    ]:
+        assert field not in forward_cell
 
 
 def test_state_interpreter_and_twin_boundary_checker_are_template_only():

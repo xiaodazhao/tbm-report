@@ -1,0 +1,13 @@
+{
+  "total_dates": 91,
+  "success_count": 91,
+  "failed_count": 0,
+  "success_rate": 1.0,
+  "average_quality_score": 100.0,
+  "average_grounding_rate": 0.9781747252747254,
+  "unsupported_claim_count_total": 42,
+  "forward_cell_entered_high_grci_cells_count": 0,
+  "twin_boundary_violation_count_total": 0,
+  "E14_ALIGNED_SCOPE_AS_ACTUAL_ADVANCE_count": 0,
+  "role_boundary_failed_count": 0
+}

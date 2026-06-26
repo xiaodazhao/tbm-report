@@ -349,6 +349,8 @@ def _is_non_technical_claim_text(text: str) -> bool:
         return True
 
     compact = raw.strip().strip("*").strip()
+    if _is_heading_fragment_false_positive(compact):
+        return True
     normalized_title = re.sub(r"^\s*(#+\s*)?\d+[\.\、]\s*", "", compact).strip()
     normalized_title = re.sub(r"（.*?）", "", normalized_title).strip()
     if normalized_title in {
@@ -486,6 +488,20 @@ def _is_non_technical_claim_text(text: str) -> bool:
         return True
 
     return False
+
+
+def _is_heading_fragment_false_positive(text: str) -> bool:
+    """Return True for short template fragments that are not engineering claims."""
+    compact = _normalize_space(text).strip("。；;，,：:")
+    if not compact:
+        return True
+    gas_none_patterns = [
+        r"^涉及气体为[:：]?\s*无$",
+        r"^涉及气体[:：]\s*无$",
+        r"^气体为[:：]?\s*无$",
+        r"^气体[:：]\s*无$",
+    ]
+    return any(re.match(pattern, compact) for pattern in gas_none_patterns)
 
 
 def _filter_quality_claims(claims: list[Any]) -> tuple[list[Any], int]:
