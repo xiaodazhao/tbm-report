@@ -2,6 +2,8 @@
 
 本目录保存当前主线以外的旧版本材料。它们不参与当前后端主流程，也不应被当前后端 import。
 
+更完整的当前目录说明见根目录 [PROJECT_STRUCTURE.md](../PROJECT_STRUCTURE.md)。根目录 `_archive/` 主要保存旧前端、旧论文草稿、旧实验脚本和本地快照；后端旧模块统一保存在 `backend/_archive/`。
+
 当前有效主线在：
 
 ```text

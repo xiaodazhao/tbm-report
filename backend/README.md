@@ -25,6 +25,8 @@ routes.report
 
 完整文档入口见：[docs/README.md](docs/README.md)。
 
+代码清理与归档边界见：[docs/cleanup_audit.md](docs/cleanup_audit.md)。其中需要特别注意：`analysis/` 当前仍是 PLC 响应分析依赖，不是可整体归档的旧目录。
+
 ## 1. 当前目录说明
 
 参与当前主流程的核心目录：
@@ -47,6 +49,10 @@ routes.report
 归档目录：
 
 - `_archive/`：历史代码，仅作参考。当前主流程禁止从 `_archive/` import。
+  - `legacy_previous/`：此前已经归档的旧 Agent、旧 route、旧服务、旧地质链路、旧测试和调试脚本。
+  - `legacy_analysis/`：本轮归档的旧分析辅助代码；当前 PLC cell response 以 `plc/cell_response.py` 为准。
+  - `legacy_schemas/`：本轮归档的旧 API / CST / twin contract schema；当前 schema 以 `schemas/api.py`、`schemas/pipeline.py`、`schemas/twin.py` 为准。
+  - `legacy_services/`：本轮归档的旧 cache、run metadata、twin diff/event/store/builder 服务；当前主流程不依赖这些服务。
 
 ## 2. 环境配置
 
@@ -240,4 +246,3 @@ python -m pytest tests -q
 - `stop_ratio` 不能直接解释为异常停机原因。
 - PLC enhanced proxy 不是严格物理量，也不能单独证明地质异常。
 - 当前掌子面前方关注提示只能写成关注/提示，不得写成已揭露事实。
-

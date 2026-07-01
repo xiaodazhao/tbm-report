@@ -45,6 +45,9 @@ TBM 施工状态数字孪生底座
 11. [简版 LLM 上下文](llm_context_brief.md)  
     更短的上下文摘要，便于快速粘贴给外部模型。
 
+12. [后端清理审计记录](cleanup_audit.md)  
+    说明当前主流程必须保留的模块、历史归档目录、实验输出管理和后续代码瘦身边界。
+
 ## 当前主流程
 
 ```text
@@ -83,5 +86,4 @@ routes.report
 - `schemas/`：API、pipeline、twin schema。
 - `scripts/`：smoke、导出、批量、LLM、sidecar 工具。
 - `tests/`：回归测试。
-- `_archive/`：历史代码，仅作参考，主流程禁止 import。
-
+- `_archive/`：历史代码，仅作参考，主流程禁止 import。本轮新增归档区包括 `legacy_analysis/`、`legacy_schemas/` 和 `legacy_services/`，用于放置已确认不参与当前主流程的旧分析、旧 schema 和旧服务。

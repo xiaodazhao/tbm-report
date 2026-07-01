@@ -26,6 +26,7 @@ _archive/old_frontend/.env
 # Generated reports / debug artifacts
 outputs/
 backend/outputs/
+experiments/**/outputs*/
 backend/data/logs/
 backend/data/DB/*.sqlite3
 backend/data/result/

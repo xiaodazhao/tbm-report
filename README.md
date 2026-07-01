@@ -4,17 +4,30 @@
 
 后端完整文档入口：[backend/docs/README.md](backend/docs/README.md)。
 
+项目目录与归档边界说明：[PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md)。
+
 ## 当前主线
 
 ```text
 backend/routes/report.py
 -> backend/pipeline/daily_report_pipeline.py::run_daily_report_pipeline
 -> ConstructionStateCell
+-> DailyConstructionTwin
 -> Prompt Evidence Pack
 -> template / evidence_pack_llm / evidence_pack_planner_llm
 -> Quality / Trace
 -> Report / Export
 ```
+
+## 当前目录边界
+
+- `backend/`：当前后端主工程。
+- `frontend/`：当前轻量日报生成工作台。
+- `experiments/`：当前实验体系，包括 Exp01、Exp02、Exp03。
+- `_archive/`：根目录旧前端、旧文档、旧实验和本地快照归档。
+- `backend/_archive/`：后端旧 route、旧 Agent、旧 services、旧 schema、旧地质链路和旧测试归档。
+
+当前主流程禁止从 `_archive/` 或 `backend/_archive/` import 代码。实验输出目录 `experiments/**/outputs*` 默认作为本地运行结果保存，不再作为 Git 常规提交内容。
 
 ## 项目目标
 
