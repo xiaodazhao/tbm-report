@@ -64,6 +64,8 @@ SAFE_BOUNDARY_PATTERNS = [
     r"(不能证明|不证明).{0,32}前方",
     r"前方.{0,24}(不能证明|不证明)",
     r"(不能|不得|不应|不可).{0,24}证明.{0,24}前方",
+    r"(需|应|建议).{0,12}结合.{0,12}(后续)?现场揭露.{0,16}(复核|核查|验证)",
+    r"结合.{0,12}(后续)?现场揭露.{0,16}(复核|核查|验证)",
     r"(仅表示|仅作为|只表示|只作为).{0,32}提示",
     r"(不作为|不能作为|不得作为).{0,32}(事实|结论)",
     r"GRCI.{0,16}(不是|不表示|不等同于|不得写成|不能写成).{0,16}(灾害概率|风险概率|概率)",
@@ -130,4 +132,34 @@ def check_twin_boundary_violations(
 
 def _is_safe_boundary_statement(text: str) -> bool:
     """Return True for explicit policy/boundary statements, not violations."""
-    return any(re.search(pattern, text or "", flags=re.IGNORECASE) for pattern in SAFE_BOUNDARY_PATTERNS)
+    return _has_forward_fact_negation(text) or any(
+        re.search(pattern, text or "", flags=re.IGNORECASE)
+        for pattern in SAFE_BOUNDARY_PATTERNS
+    )
+
+
+def _has_forward_fact_negation(text: str) -> bool:
+    """Whitelist explicit statements that forward evidence is not an occurred fact."""
+    compact = text or ""
+    return any(
+        phrase in compact
+        for phrase in [
+            "非已发生",
+            "并非已发生",
+            "不是已发生",
+            "不属于已发生",
+            "不等同于已发生",
+            "非已发生事实",
+            "非已发生现场事实",
+            "仅为关注提示",
+            "仅作为关注提示",
+            "属于关注与提示性质",
+            "关注性提示",
+            "非灾害发生概率",
+            "非灾害概率",
+            "非风险概率",
+            "不是灾害发生概率",
+            "不是灾害概率",
+            "不是风险概率",
+        ]
+    )

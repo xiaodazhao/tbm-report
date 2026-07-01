@@ -18,15 +18,15 @@ DEFAULT_FORBIDDEN_TERMS = [
 ]
 
 DEFAULT_SECTION_REQUIREMENTS = [
-    "综合结论摘要",
-    "总体施工运行概况",
-    "基础工况统计分析",
-    "聚类施工状态与效率分析",
-    "当前掌子面描述",
-    "已开挖区段地质与响应异常复核",
-    "气体监测分析",
-    "前方关注提示",
-    "结论与建议",
+    "综合摘要",
+    "总体概况",
+    "工况统计",
+    "聚类状态与效率分析",
+    "掌子面与地质揭示",
+    "已掘区段地质-施工响应复核",
+    "气体监测",
+    "前方地质关注提示",
+    "结论与施工建议",
 ]
 
 DEFAULT_SCORE_WEIGHTS = {
@@ -145,15 +145,42 @@ def split_sentences(text: Any) -> list[str]:
         return []
 
     parts: list[str] = []
+
+    def should_split(line: str, index: int) -> bool:
+        ch = line[index]
+        if ch in "。！？；;!?":
+            return True
+        if ch != ".":
+            return False
+
+        prev_ch = line[index - 1] if index > 0 else ""
+        next_ch = line[index + 1] if index + 1 < len(line) else ""
+
+        # Do not split decimals, dates, mileage-like values, or list markers.
+        if prev_ch.isdigit():
+            return False
+        if next_ch.isdigit():
+            return False
+        return True
+
     for line in re.split(r"[\r\n]+", raw):
         line = line.strip()
         if not line:
             continue
-        pieces = re.split(r"(?<=[。！？；;.!?])\s*", line)
-        for piece in pieces:
-            piece = piece.strip()
+
+        start = 0
+        for index, _ in enumerate(line):
+            if not should_split(line, index):
+                continue
+            piece = line[start:index + 1].strip()
             if piece:
                 parts.append(piece)
+            start = index + 1
+
+        tail = line[start:].strip()
+        if tail:
+            parts.append(tail)
+
     return parts
 
 

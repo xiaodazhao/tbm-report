@@ -126,3 +126,105 @@ def test_exp02_dry_run_real_config_does_not_log_api_key(tmp_path, monkeypatch):
     assert result["checks"]["output_writable"] is True
     assert result["prompt_files"]["M3_twin_evidence_pack_llm"].endswith("M3_twin_evidence_pack_llm_prompt.md")
 
+
+def test_exp02_revision_prompt_preserves_full_draft_report():
+    exp02 = _load_exp02()
+    full_report = "\n\n".join(
+        f"## {title}\n" + ("段落内容。" * 120)
+        for title in exp02.M4_REQUIRED_SECTION_TITLES
+    )
+
+    payload = {"draft_report": full_report}
+    prompt_json = exp02._prompt_json(payload)
+
+    assert "<truncated" not in prompt_json
+    for title in exp02.M4_REQUIRED_SECTION_TITLES:
+        assert f"## {title}" in prompt_json
+
+
+def test_exp02_m4_section_guard_uses_placeholder_for_missing_revision_sections():
+    exp02 = _load_exp02()
+    draft = "\n\n".join(
+        f"## {title}\n初稿 {title} 内容。"
+        for title in exp02.M4_REQUIRED_SECTION_TITLES
+    )
+    revised = "\n\n".join(
+        f"## {title}\n修订 {title} 内容。"
+        for title in exp02.M4_REQUIRED_SECTION_TITLES[:5]
+    )
+
+    repaired = exp02._ensure_m4_required_sections(
+        revised_report=revised,
+        draft_report=draft,
+    )
+
+    for title in exp02.M4_REQUIRED_SECTION_TITLES:
+        assert f"## {title}" in repaired
+    assert "初稿 已掘区段地质-施工响应复核 内容。" not in repaired
+    assert "当前 Evidence Pack 未提供足够证据，不作扩展判断。" in repaired
+    assert "修订 综合摘要 内容。" in repaired
+
+
+def test_exp02_m4_section_guard_reports_metadata_for_added_sections():
+    exp02 = _load_exp02()
+    revised = f"## {exp02.M4_REQUIRED_SECTION_TITLES[0]}\n修订后内容。"
+
+    repaired, meta = exp02._ensure_m4_required_sections_with_meta(
+        revised_report=revised,
+        draft_report="",
+        pre_eval={},
+    )
+
+    assert meta["section_guard_applied"] is True
+    assert exp02.M4_REQUIRED_SECTION_TITLES[1] in meta["guard_added_sections"]
+    assert meta["guard_strategy"] == "placeholder_for_missing_sections"
+    assert "当前 Evidence Pack 未提供足够证据，不作扩展判断。" in repaired
+
+
+def test_exp02_revision_feedback_contains_actionable_sentence_and_section():
+    exp02 = _load_exp02()
+    draft = "\n\n".join(
+        [
+            "## 总体概况\nPLC 实测日进尺：1.0m。",
+            "## 前方地质关注提示\n前方关注范围：DK1013+200 至 DK1013+230。",
+        ]
+    )
+    quality = {
+        "claim_results": [
+            {
+                "grounded": False,
+                "claim_text": "0m",
+                "error_type": "E10_NUMERIC_VALUE_UNGROUNDED",
+            },
+            {
+                "grounded": False,
+                "claim_text": "前方关注范围：DK1013+200 至 DK1013+230。",
+                "error_type": "E1_UNSUPPORTED_CLAIM",
+            },
+        ]
+    }
+
+    feedback = exp02._build_revision_feedback(
+        draft_report=draft,
+        quality=quality,
+        boundary={},
+    )
+
+    assert feedback
+    first = feedback[0]
+    assert first["section"] == "总体概况"
+    assert first["sentence_text"] == "PLC 实测日进尺：1.0m。"
+    assert first["error_type"] == "E10_NUMERIC_VALUE_UNGROUNDED"
+    assert first["suggested_action"]
+
+
+def test_exp02_revision_feedback_has_specific_actions_for_e14_and_forward_boundary():
+    exp02 = _load_exp02()
+
+    e14_action = exp02._suggested_revision_action("E14_ALIGNED_SCOPE_AS_ACTUAL_ADVANCE")
+    forward_action = exp02._suggested_revision_action("boundary:forward_fact_misuse")
+
+    assert "用于已掘复核的 10m 对齐单元范围" in e14_action
+    assert "实际推进范围" in e14_action
+    assert "前方提示" in forward_action
+    assert "后续现场揭露进行复核" in forward_action

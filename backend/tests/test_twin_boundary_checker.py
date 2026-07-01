@@ -60,10 +60,13 @@ def test_twin_boundary_checker_detects_chinese_and_english_violations(text: str,
         "stop_ratio 只能作为施工运行中断关注信号，不能直接解释为异常原因。",
         "local_background 仅作为背景解释，不作为当日结论。",
         "GRCI is not a disaster probability.",
+        "GRCI 为地质-施工响应耦合关注度，非灾害发生概率。",
         "forward attention only indicates attention and does not indicate an occurred fact.",
         "Forward evidence should not be written as an occurred fact.",
         "PLC evidence cannot prove forward abnormal geology.",
         "stop_ratio only serves as an operation interruption signal.",
+        "前方关注证据需结合后续现场揭露进行复核。",
+        "前方关注证据，需结合现场揭露进行核查。",
     ],
 )
 def test_twin_boundary_checker_does_not_flag_safe_boundary_statements(text: str):
@@ -72,3 +75,17 @@ def test_twin_boundary_checker_does_not_flag_safe_boundary_statements(text: str)
     assert result["has_violation"] is False
     assert result["violation_count"] == 0
     assert result["violations"] == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "该提示基于前方地质证据，属于关注与提示性质，非已发生现场事实。",
+        "该提示基于前方地质预报证据，为关注性提示，非已发生事实。",
+    ],
+)
+def test_twin_boundary_checker_allows_forward_fact_negation(text: str):
+    result = check_twin_boundary_violations(text)
+
+    assert result["has_violation"] is False
+    assert result["violation_count"] == 0

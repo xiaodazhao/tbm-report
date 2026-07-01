@@ -59,6 +59,32 @@ def _safe_text(value: Any) -> str:
     return str(value).strip()
 
 
+def _is_gas_negated_concentration_context(text: str) -> bool:
+    try:
+        if is_gas_negated_concentration_context(text):
+            return True
+    except NameError:
+        pass
+    compact = _safe_text(text)
+    return any(
+        phrase in compact
+        for phrase in [
+            "不宜直接按浓度解释",
+            "不宜按浓度解释",
+            "不直接按浓度解释",
+            "不作浓度异常判断",
+            "不作为浓度异常判断",
+            "字段单位或含义未确认",
+            "字段语义未确认",
+            "未见异常",
+            "无异常",
+            "未超限",
+            "低于阈值",
+            "处于正常范围",
+        ]
+    )
+
+
 def _safe_int(value: Any, default: int = 0) -> int:
     try:
         if value is None:
@@ -78,6 +104,130 @@ def _safe_float(value: Any, default: float | None = None) -> float | None:
         return number
     except Exception:
         return default
+
+
+def _number_variants(value: float | None) -> set[str]:
+    if value is None:
+        return set()
+    out = {f"{value:.1f}", f"{value:g}"}
+    if abs(value - round(value)) < 1e-6:
+        out.add(str(int(round(value))))
+    return out
+
+
+def _chainage_to_dk(value: float | None) -> str:
+    if value is None:
+        return ""
+    km = int(float(value) // 1000)
+    meter = float(value) - km * 1000
+    if abs(meter - round(meter)) < 1e-6:
+        meter_text = f"{int(round(meter)):03d}"
+    else:
+        meter_text = f"{meter:06.1f}".rstrip("0").rstrip(".")
+    return f"DK{km}+{meter_text}"
+
+
+def _contains_chainage(text: str, value: float | None) -> bool:
+    if value is None:
+        return False
+    compact = _normalize_range_dk(text)
+    dk = _normalize_range_dk(_chainage_to_dk(value))
+    if dk and dk in compact:
+        return True
+    return any(item and item in text for item in _number_variants(value))
+
+
+def _contains_value(text: str, value: float | None) -> bool:
+    if value is None:
+        return False
+    for item in _number_variants(value):
+        if not item:
+            continue
+        pattern = rf"(?<![\d.]){re.escape(item)}(?:\.0)?\s*(?:m|M|米|%|分钟|min)?(?![\d.])"
+        if re.search(pattern, text):
+            return True
+    return False
+
+
+def _scope_values(prompt_evidence_pack: dict[str, Any], twin_state: dict[str, Any]) -> dict[str, Any]:
+    scope = _as_dict(prompt_evidence_pack.get("report_scope") or prompt_evidence_pack.get("scope_summary"))
+    if not scope:
+        scope = _as_dict(twin_state.get("scope"))
+
+    raw = _as_dict(scope.get("daily_plc_range") or scope.get("daily_chainage_raw"))
+    aligned = _as_dict(scope.get("daily_excavated_scope"))
+    forward = _as_dict(scope.get("forward_scope"))
+    background = _as_dict(scope.get("local_background_scope"))
+    return {
+        "date": _safe_text(scope.get("date") or prompt_evidence_pack.get("date") or twin_state.get("date")),
+        "raw_start": _safe_float(raw.get("start_chainage"), _safe_float(scope.get("daily_chainage_min"))),
+        "raw_end": _safe_float(raw.get("end_chainage"), _safe_float(scope.get("daily_chainage_max"))),
+        "raw_advance": _safe_float(raw.get("daily_advance_m"), _safe_float(scope.get("daily_advance_m"))),
+        "face": _safe_float(scope.get("current_chainage"), _safe_float(scope.get("face_chainage"))),
+        "aligned_start": _safe_float(aligned.get("start")),
+        "aligned_end": _safe_float(aligned.get("end")),
+        "forward_start": _safe_float(forward.get("start")),
+        "forward_end": _safe_float(forward.get("end")),
+        "background_start": _safe_float(background.get("start")),
+        "background_end": _safe_float(background.get("end")),
+    }
+
+
+def _has_actual_advance_misuse(text: str) -> bool:
+    return any(word in text for word in ["实际推进范围", "实际掘进范围", "当日推进范围", "实际进尺", "日进尺"])
+
+
+def _is_scope_metadata_claim(
+    claim_text: str,
+    *,
+    prompt_evidence_pack: dict[str, Any],
+    twin_state: dict[str, Any],
+) -> tuple[bool, str]:
+    text = _safe_text(claim_text)
+    if not text:
+        return False, ""
+
+    values = _scope_values(prompt_evidence_pack, twin_state)
+    date = values["date"]
+    if date and date in text and any(word in text for word in ["报告日期", "施工日期", "本日", "日期"]):
+        return True, "report date is supported by report_scope.date"
+
+    raw_start = values["raw_start"]
+    raw_end = values["raw_end"]
+    raw_advance = values["raw_advance"]
+    if any(word in text for word in ["PLC 实测", "PLC实测", "日进尺", "日推进", "推进范围", "实测推进"]):
+        has_range = _contains_chainage(text, raw_start) and _contains_chainage(text, raw_end)
+        has_advance = _contains_value(text, raw_advance)
+        if has_range or has_advance:
+            return True, "PLC measured range/advance is supported by daily_plc_range"
+
+    face = values["face"]
+    if any(word in text for word in ["当前掌子面", "掌子面里程", "face_chainage"]) and _contains_chainage(text, face):
+        return True, "current face chainage is supported by report_scope"
+
+    forward_start = values["forward_start"]
+    forward_end = values["forward_end"]
+    if any(word in text for word in ["前方关注范围", "forward_scope", "前方范围"]):
+        if any(word in text for word in ["已发生", "已揭露", "已揭示", "现场揭露"]):
+            return False, ""
+        if _contains_chainage(text, forward_start) and _contains_chainage(text, forward_end):
+            return True, "forward attention scope is supported by report_scope.forward_scope"
+
+    aligned_start = values["aligned_start"]
+    aligned_end = values["aligned_end"]
+    if any(word in text for word in ["已掘复核范围", "复核范围", "10m 对齐", "10m对齐", "对齐单元"]):
+        if _has_actual_advance_misuse(text):
+            return False, ""
+        if _contains_chainage(text, aligned_start) and _contains_chainage(text, aligned_end):
+            return True, "aligned excavated review scope is supported by daily_excavated_scope"
+
+    background_start = values["background_start"]
+    background_end = values["background_end"]
+    if any(word in text for word in ["局部背景范围", "本地背景范围", "背景范围", "local_background"]):
+        if _contains_chainage(text, background_start) and _contains_chainage(text, background_end):
+            return True, "local background scope is supported by report_scope.local_background_scope"
+
+    return False, ""
 
 
 def _dedup(items: list[str]) -> list[str]:
@@ -617,6 +767,8 @@ def _trace_support_type(
 
     if support_type in {"operation_context", "cluster_context", "gas_context"}:
         return "statistical_support"
+    if support_type == "scope_metadata":
+        return "scope_metadata_support"
     if support_type == "coupling_context":
         return "coupling_review_support"
     if support_type == "forward_segment":
@@ -674,6 +826,17 @@ def check_claim_grounding(
                     result,
                     support_type="recommendation_policy",
                     message="方法边界/生成约束说明，按 policy_support 支撑。",
+                )
+
+            elif (scope_match := _is_scope_metadata_claim(
+                claim_text,
+                prompt_evidence_pack=prompt_evidence_pack,
+                twin_state=twin_state,
+            ))[0]:
+                _mark_grounded(
+                    result,
+                    support_type="scope_metadata",
+                    message=scope_match[1] or "找到可支撑的 scope/metadata 结构化证据。",
                 )
 
             elif _is_stop_boundary_statement(claim_text):

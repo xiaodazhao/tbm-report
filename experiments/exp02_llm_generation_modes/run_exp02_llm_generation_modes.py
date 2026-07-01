@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import traceback
@@ -77,8 +78,25 @@ SUMMARY_COLUMNS = [
     "pre_revision_unsupported_claim_count_effective",
     "post_revision_unsupported_claim_count_effective",
     "revision_error_reduction_rate",
+    "section_guard_applied",
+    "guard_added_sections",
+    "guard_strategy",
     "error_message",
 ]
+
+M4_REQUIRED_SECTION_TITLES = [
+    "综合摘要",
+    "总体概况",
+    "工况统计",
+    "聚类状态与效率分析",
+    "掌子面与地质揭示",
+    "已掘区段地质-施工响应复核",
+    "气体监测",
+    "前方地质关注提示",
+    "结论与施工建议",
+]
+
+REPORT_TEXT_KEYS = {"draft_report", "initial_report", "report", "report_text"}
 
 
 def main() -> None:
@@ -259,6 +277,7 @@ def _run_mode(
     pre_eval = _evaluate_report(report, baseline)
     final_report = report
     post_eval = pre_eval
+    section_guard = _empty_section_guard_meta()
 
     if mode == "M4_full_twin_governance_trace_boundary_reviser":
         revision_prompt = _build_revision_prompt(
@@ -278,10 +297,15 @@ def _run_mode(
         )
         revision_raw_response = str(revision.get("raw_response") or revision.get("text") or "")
         if revision.get("ok") and str(revision.get("text") or "").strip():
-            final_report = (
+            revised_candidate = (
                 baseline.report_text
                 if llm_mode == "mock"
                 else _clean_llm_text(str(revision.get("text") or ""))
+            )
+            final_report, section_guard = _ensure_m4_required_sections_with_meta(
+                revised_report=revised_candidate,
+                draft_report=report,
+                pre_eval=pre_eval,
             )
             revision_applied = True
         else:
@@ -300,6 +324,7 @@ def _run_mode(
         report=final_report,
         elapsed=elapsed,
         revision_applied=revision_applied,
+        section_guard=section_guard,
         error_message=error_message,
         high_grci_cells=baseline.high_grci_cells,
     )
@@ -315,6 +340,8 @@ def _run_mode(
     _write_json(target_dir / "boundary_summary.json", post_eval["boundary"])
     if revised_report:
         _write_text(target_dir / "revised_report.md", revised_report)
+    if mode == "M4_full_twin_governance_trace_boundary_reviser":
+        _write_json(target_dir / "section_guard_summary.json", section_guard)
     if revision_prompt:
         _write_text(target_dir / "revision_prompt.md", revision_prompt)
         _write_text(target_dir / "revision_response_raw.txt", revision_raw_response)
@@ -399,6 +426,11 @@ def _build_revision_prompt(
 ) -> str:
     payload = {
         "draft_report": draft_report,
+        "revision_feedback": _build_revision_feedback(
+            draft_report=draft_report,
+            quality=quality,
+            boundary=boundary,
+        ),
         "quality": {
             "quality_score": quality.get("quality_score"),
             "error_type_counts": quality.get("error_type_counts", {}),
@@ -422,6 +454,214 @@ def _build_revision_prompt(
     }
     template = (PROMPT_DIR / "M4_revision_prompt.md").read_text(encoding="utf-8")
     return template.replace("{{INPUT_JSON}}", _prompt_json(payload))
+
+
+def _build_revision_feedback(
+    *,
+    draft_report: str,
+    quality: dict[str, Any],
+    boundary: dict[str, Any],
+    limit: int = 80,
+) -> list[dict[str, Any]]:
+    feedback: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for item in quality.get("claim_results") or []:
+        if not isinstance(item, dict) or item.get("grounded"):
+            continue
+        claim_text = _safe_text(item.get("claim_text") or item.get("text") or item.get("sentence"))
+        if not claim_text:
+            continue
+        error_type = _safe_text(item.get("error_type")) or _infer_claim_error_type(item)
+        sentence = _find_complete_sentence(draft_report, claim_text)
+        section = _section_for_sentence(draft_report, sentence or claim_text)
+        key = (error_type, sentence or claim_text)
+        if key in seen:
+            continue
+        seen.add(key)
+        feedback.append(
+            {
+                "section": section,
+                "error_type": error_type,
+                "claim_text": claim_text,
+                "sentence_text": sentence or claim_text,
+                "suggested_action": _suggested_revision_action(error_type),
+            }
+        )
+        if len(feedback) >= limit:
+            break
+
+    for item in boundary.get("violations") or []:
+        if not isinstance(item, dict):
+            continue
+        violation_type = _safe_text(item.get("violation_type") or item.get("type"))
+        matched = _safe_text(item.get("matched_text") or item.get("phrase") or item.get("message"))
+        if not matched:
+            continue
+        sentence = _find_complete_sentence(draft_report, matched)
+        key = (violation_type, sentence or matched)
+        if key in seen:
+            continue
+        seen.add(key)
+        feedback.append(
+            {
+                "section": _section_for_sentence(draft_report, sentence or matched),
+                "error_type": f"boundary:{violation_type}",
+                "claim_text": matched,
+                "sentence_text": sentence or matched,
+                "suggested_action": _suggested_revision_action(f"boundary:{violation_type}"),
+            }
+        )
+        if len(feedback) >= limit:
+            break
+
+    return feedback
+
+
+def _infer_claim_error_type(item: dict[str, Any]) -> str:
+    text = _safe_text(item.get("claim_text") or item.get("text"))
+    messages = " ".join(_safe_text(value) for value in item.get("messages") or [])
+    if any(char.isdigit() for char in text) and not item.get("grounded"):
+        return "E10_NUMERIC_VALUE_UNGROUNDED"
+    if "GRCI" in text and "概率" in text:
+        return "E3_GRCI_AS_PROBABILITY"
+    if "前方" in text and any(word in text for word in ["已发生", "已揭露", "已揭示"]):
+        return "E2_FORECAST_AS_FACT"
+    if messages:
+        return "E1_UNSUPPORTED_CLAIM"
+    return "E1_UNSUPPORTED_CLAIM"
+
+
+def _suggested_revision_action(error_type: str) -> str:
+    if error_type == "E10_NUMERIC_VALUE_UNGROUNDED":
+        return "如果该数值不能在 Evidence Pack 中直接核验，删除具体数值或改为定性表述；不要保留孤立小数、百分比、范围或里程数值。"
+    if error_type == "E14_ALIGNED_SCOPE_AS_ACTUAL_ADVANCE":
+        return "将 daily_excavated_scope/aligned_scope/10m 对齐范围改为“用于已掘复核的 10m 对齐单元范围”或“已掘区段地质-施工响应复核范围”；不得保留“实际推进范围、当日推进范围、施工里程范围、日进尺”等语义。"
+    if error_type.startswith("boundary:"):
+        if error_type == "boundary:forward_fact_misuse":
+            return "把“前方揭示/前方已揭露/前方存在异常”等表述改为“前方提示/前方关注提示/超前预报提示”；如需使用现场揭露，只能写“需结合后续现场揭露进行复核”。"
+        return "按 violation_type 改写边界违规句，保留章节结构；不要把前方、GRCI、PLC proxy、stop_ratio 或 local_background 写成越界含义。"
+    if error_type == "E2_FORECAST_AS_FACT":
+        return "把前方证据改为“关注提示/需复核”，不得写成已发生或现场已揭露事实。"
+    if error_type == "E3_GRCI_AS_PROBABILITY":
+        return "把 GRCI 改写为地质-施工响应耦合关注度，不得写成灾害概率、风险概率或预测概率。"
+    return "如果该句无法由 Evidence Pack 直接支撑，删除该句、降级为“需结合现场复核”，或改为 Evidence Pack 已明确支持的保守表述。"
+
+
+def _feedback_sentence_candidates(text: str) -> list[str]:
+    out: list[str] = []
+    for line in (text or "").splitlines():
+        candidate = line.strip()
+        if not candidate:
+            continue
+        if candidate.startswith("#"):
+            continue
+        out.append(candidate)
+    return out
+
+
+def _find_complete_sentence(report: str, claim_text: str) -> str:
+    needle = _safe_text(claim_text)
+    if not needle:
+        return ""
+    for sentence in _feedback_sentence_candidates(report):
+        if needle in sentence:
+            return sentence
+        if _compact_numeric_fragment(needle) and needle.replace(" ", "") in sentence.replace(" ", ""):
+            return sentence
+    return needle
+
+
+def _compact_numeric_fragment(text: str) -> bool:
+    stripped = _safe_text(text)
+    return bool(stripped) and len(stripped) <= 12 and any(char.isdigit() for char in stripped)
+
+
+def _section_for_sentence(report: str, sentence: str) -> str:
+    target = _safe_text(sentence)
+    current = ""
+    for line in (report or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            title = stripped[3:].strip()
+            if title in M4_REQUIRED_SECTION_TITLES:
+                current = title
+            continue
+        if target and target in stripped:
+            return current or "unknown"
+    return "unknown"
+
+
+def _section_heading_pattern() -> re.Pattern[str]:
+    return re.compile(r"(?m)^\s*##\s+(.+?)\s*$")
+
+
+def _section_body_map(report: str) -> dict[str, str]:
+    """Extract standard M4 report sections from markdown text."""
+    text = report or ""
+    matches = list(_section_heading_pattern().finditer(text))
+    sections: dict[str, str] = {}
+    for idx, match in enumerate(matches):
+        title = match.group(1).strip()
+        if title not in M4_REQUIRED_SECTION_TITLES:
+            continue
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        body = text[match.end():end].strip()
+        sections[title] = body
+    return sections
+
+
+def _has_all_m4_sections(report: str) -> bool:
+    sections = _section_body_map(report)
+    return all(title in sections for title in M4_REQUIRED_SECTION_TITLES)
+
+
+def _empty_section_guard_meta() -> dict[str, Any]:
+    return {
+        "section_guard_applied": False,
+        "guard_added_sections": [],
+        "guard_strategy": "not_applicable",
+    }
+
+
+def _ensure_m4_required_sections(*, revised_report: str, draft_report: str) -> str:
+    report, _ = _ensure_m4_required_sections_with_meta(
+        revised_report=revised_report,
+        draft_report=draft_report,
+        pre_eval={},
+    )
+    return report
+
+
+def _ensure_m4_required_sections_with_meta(
+    *,
+    revised_report: str,
+    draft_report: str,
+    pre_eval: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """
+    Keep M4 revision deterministic: if the LLM revision drops required sections,
+    add explicit no-evidence placeholders. This protects structure only and does
+    not reintroduce unsupported/numeric claims from the initial draft.
+    """
+    if _has_all_m4_sections(revised_report):
+        return revised_report, _empty_section_guard_meta()
+
+    revised_sections = _section_body_map(revised_report)
+    output: list[str] = []
+    added_sections: list[str] = []
+    for title in M4_REQUIRED_SECTION_TITLES:
+        body = revised_sections.get(title)
+        if body is None:
+            added_sections.append(title)
+        if not body:
+            body = "当前 Evidence Pack 未提供足够证据，不作扩展判断。"
+        output.append(f"## {title}\n{body.strip()}")
+    return "\n\n".join(output).strip(), {
+        "section_guard_applied": bool(added_sections),
+        "guard_added_sections": added_sections,
+        "guard_strategy": "placeholder_for_missing_sections",
+    }
 
 
 def _generate_with_retry(
@@ -545,6 +785,7 @@ def _summary_row(
     report: str,
     elapsed: float,
     revision_applied: bool,
+    section_guard: dict[str, Any],
     error_message: str,
     high_grci_cells: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -592,6 +833,9 @@ def _summary_row(
         "pre_revision_unsupported_claim_count_effective": pre_unsupported,
         "post_revision_unsupported_claim_count_effective": post_unsupported,
         "revision_error_reduction_rate": _reduction_rate(pre_boundary + pre_unsupported, post_boundary + post_unsupported),
+        "section_guard_applied": bool(section_guard.get("section_guard_applied")),
+        "guard_added_sections": ";".join(str(item) for item in (section_guard.get("guard_added_sections") or [])),
+        "guard_strategy": section_guard.get("guard_strategy"),
         "error_message": error_message,
     }
 
@@ -1026,6 +1270,8 @@ def _compact_for_prompt(value: Any, *, depth: int = 0, key_name: str = "") -> An
         return out
     if isinstance(value, list):
         limit = 10 if depth <= 2 else 4
+        if key_name == "revision_feedback":
+            limit = 80
         if key_name in {"source_trace", "local_background", "local_background_cells"}:
             limit = 4
         if key_name in {"key_cells", "selected_cells", "daily_review_cells", "forward_attention_cells"}:
@@ -1035,8 +1281,9 @@ def _compact_for_prompt(value: Any, *, depth: int = 0, key_name: str = "") -> An
             compacted.append({"_truncated_items": len(value) - limit})
         return compacted
     if isinstance(value, str):
-        if len(value) > 1200:
-            return value[:1200].rstrip() + f"...<truncated {len(value) - 1200} chars>"
+        limit = 16000 if key_name in REPORT_TEXT_KEYS else 1200
+        if len(value) > limit:
+            return value[:limit].rstrip() + f"...<truncated {len(value) - limit} chars>"
         return value
     return value
 
@@ -1218,6 +1465,12 @@ def _safe_int(value: Any) -> int:
         return int(float(value))
     except Exception:
         return 0
+
+
+def _safe_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
 
 
 def _safe_float(value: Any) -> float | None:

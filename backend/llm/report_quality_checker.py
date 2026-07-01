@@ -82,6 +82,54 @@ def _contains_number(text: str, value: float | None) -> bool:
     return any(item and item in text for item in _num_variants(value))
 
 
+def _chainage_label_variants(value: float | None) -> set[str]:
+    """Return standalone numeric and DK-style variants for a chainage value."""
+    variants = _num_variants(value)
+    if value is None:
+        return variants
+    try:
+        number = float(value)
+    except Exception:
+        return variants
+    km = int(number // 1000)
+    meter = number - km * 1000
+    if km > 0 and 0 <= meter < 1000:
+        variants.add(f"DK{km}+{meter:03.0f}")
+        variants.add(f"D K{km}+{meter:03.0f}")
+        variants.add(f"K{km}+{meter:03.0f}")
+    return variants
+
+
+def _contains_scope_number(text: str, value: float | None) -> bool:
+    """Match scope values without counting cell_id fragments as range values."""
+    if value is None:
+        return False
+    for item in _chainage_label_variants(value):
+        if not item:
+            continue
+        if item.upper().startswith(("DK", "D K", "K")):
+            if item in text:
+                return True
+            continue
+        pattern = rf"(?<![A-Za-z0-9_+]){re.escape(item)}(?:\.0)?(?![A-Za-z0-9_])"
+        if re.search(pattern, text):
+            return True
+    return False
+
+
+def _contains_distance_value(text: str, value: float | None) -> bool:
+    if value is None:
+        return False
+    for item in _num_variants(value):
+        if not item:
+            continue
+        pattern = rf"(?<![\d.]){re.escape(item)}(?:\.0)?\s*(?:m|M|\u7c73)(?![A-Za-z0-9])"
+        if re.search(pattern, text):
+            return True
+    return False
+
+
+
 def _daily_scope_values(prompt_evidence_pack: dict[str, Any]) -> dict[str, float | None]:
     scope = _as_dict(prompt_evidence_pack.get("report_scope") or prompt_evidence_pack.get("scope_summary"))
     raw = _as_dict(scope.get("daily_plc_range") or scope.get("daily_chainage_raw"))
@@ -115,18 +163,62 @@ def _is_aligned_scope_as_actual_advance(sentence: str, prompt_evidence_pack: dic
         return False
     if raw_advance is not None and abs(float(aligned_advance) - float(raw_advance)) < 1e-6:
         return False
-    if any(word in text for word in ["对齐", "复核范围", "10m cell", "10 m cell", "不等同", "不是实际"]):
+    if any(
+        word in text
+        for word in [
+            "对齐",
+            "复核范围",
+            "已掘复核",
+            "已开挖复核",
+            "复核单元",
+            "10m cell",
+            "10 m cell",
+            "10m 对齐",
+            "10m对齐",
+            "10m 对齐单元",
+            "10米对齐",
+            "10 米对齐",
+            "不等同",
+            "不是实际",
+        ]
+    ):
         return False
 
-    has_aligned_range = _contains_number(text, aligned_start) and _contains_number(text, aligned_end)
-    has_advance_context = any(word in text for word in ["推进", "掘进", "施工里程", "实际推进", "日推进"])
+    has_aligned_range = _contains_scope_number(text, aligned_start) and _contains_scope_number(text, aligned_end)
+    has_advance_context = any(
+        word in text
+        for word in [
+            "实际推进范围",
+            "PLC 实测推进范围",
+            "PLC实测推进范围",
+            "实测推进范围",
+            "当日推进范围",
+            "本日推进范围",
+            "实际掘进范围",
+            "施工里程范围",
+            "由",
+            "推进至",
+        ]
+    )
     if has_aligned_range and has_advance_context:
         return True
 
-    has_aligned_advance = _contains_number(text, aligned_advance)
-    has_distance_unit = any(unit in text for unit in ["米", "m", "M"])
-    has_distance_context = any(word in text for word in ["共计掘进", "掘进", "推进", "日推进", "advance"])
-    return bool(has_aligned_advance and has_distance_unit and has_distance_context)
+    has_aligned_advance = _contains_distance_value(text, aligned_advance)
+    has_distance_context = any(
+        word in text
+        for word in [
+            "共计掘进",
+            "共计推进",
+            "实际推进",
+            "实际掘进",
+            "日推进量",
+            "日进尺",
+            "完成 PLC 实测推进",
+            "完成PLC实测推进",
+            "advance",
+        ]
+    )
+    return bool(has_aligned_advance and has_distance_context)
 
 
 def _load_policy() -> dict[str, Any]:
@@ -137,6 +229,31 @@ def _load_policy() -> dict[str, Any]:
 
 def _normalize_space(text: str) -> str:
     return policy_normalize_space(text)
+
+
+SECTION_TITLE_ALIASES = {
+    "综合摘要": ["综合结论摘要"],
+    "总体概况": ["总体施工运行概况", "今日施工运行概况"],
+    "工况统计": ["基础工况统计分析", "PLC 工况统计分析", "PLC工况统计分析"],
+    "聚类状态与效率分析": ["聚类施工状态与效率分析"],
+    "掌子面与地质揭示": ["当前掌子面描述"],
+    "已掘区段地质-施工响应复核": ["已开挖区段地质与响应异常复核", "已掘区段地质施工响应复核"],
+    "气体监测": ["气体监测分析"],
+    "前方地质关注提示": ["前方关注提示", "当前掌子面前方关注提示"],
+    "结论与施工建议": ["结论与建议"],
+}
+
+
+def _section_title_pattern(title: str) -> re.Pattern[str]:
+    escaped = re.escape(_safe_text(title))
+    return re.compile(
+        rf"(?m)^\s*(?:#{{1,6}}\s*)?(?:\*\*)?\s*(?:\d+[\.\、]\s*)?{escaped}\s*(?:\*\*)?\s*$"
+    )
+
+
+def _has_section_title(text: str, title: str) -> bool:
+    candidates = [_safe_text(title), *SECTION_TITLE_ALIASES.get(_safe_text(title), [])]
+    return any(candidate and _section_title_pattern(candidate).search(text) for candidate in candidates)
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -182,7 +299,29 @@ def _is_allowed_forbidden_probability_phrase(
 
 
 def _is_gas_negated_concentration_context(text: str) -> bool:
-    return policy_is_gas_negated_concentration_context(text)
+    try:
+        if policy_is_gas_negated_concentration_context(text):
+            return True
+    except NameError:
+        pass
+    compact = _safe_text(text)
+    return any(
+        phrase in compact
+        for phrase in [
+            "不宜直接按浓度解释",
+            "不宜按浓度解释",
+            "不直接按浓度解释",
+            "不作浓度异常判断",
+            "不作为浓度异常判断",
+            "字段单位或含义未确认",
+            "字段语义未确认",
+            "未见异常",
+            "无异常",
+            "未超限",
+            "低于阈值",
+            "处于正常范围",
+        ]
+    )
 
 
 def _is_stop_boundary_statement(text: str) -> bool:
@@ -872,7 +1011,7 @@ def check_report_quality(
         missing_sections = [
             title
             for title in section_titles
-            if _safe_text(title) and _safe_text(title) not in text
+            if _safe_text(title) and not _has_section_title(text, _safe_text(title))
         ]
 
         if missing_sections:
