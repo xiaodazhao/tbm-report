@@ -369,6 +369,17 @@ def build_template_report(pack: dict[str, Any]) -> str:
     forward_cells = forward.get("forward_attention_cells", []) if isinstance(forward, dict) else []
     profile = forward.get("profile", []) if isinstance(forward, dict) else []
     date = scope.get("date")
+    return _build_aligned_template_report(
+        date=date,
+        scope=scope,
+        operation=operation,
+        cluster=cluster,
+        gas=gas,
+        high_grci=high_grci,
+        forward=forward,
+        forward_cells=forward_cells,
+        profile=profile,
+    )
 
     lines = [
         f"# TBM 施工日报（{date}）",
@@ -434,6 +445,125 @@ def build_template_report(pack: dict[str, Any]) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+def _build_aligned_template_report(
+    *,
+    date: Any,
+    scope: dict[str, Any],
+    operation: dict[str, Any],
+    cluster: dict[str, Any],
+    gas: dict[str, Any],
+    high_grci: list[dict[str, Any]],
+    forward: dict[str, Any],
+    forward_cells: list[dict[str, Any]],
+    profile: list[Any],
+) -> str:
+    lines = [
+        f"# TBM 施工日报（{date}）",
+        "",
+        "## 综合摘要",
+        (
+            f"本日报基于 {date} 的 PLC 日运行数据、online 可用地质证据、"
+            "cell 级 GRS/RAI/GRCI 和 source_trace 生成。"
+        ),
+        f"本日形成 {len(high_grci)} 个已掘区段复核优先 cell；GRCI 仅用于已掘区段复核排序。",
+        f"前方地质关注提示来自 forward_profile，共 {len(profile)} 个前方窗口，仅用于提示和复核。",
+        "",
+        "## 总体概况",
+        _scope_text(scope),
+        "",
+        "## 工况统计",
+        (
+            f"PLC 工况统计显示，主导工况为 "
+            f"{operation.get('dominant_mode_cn') or operation.get('dominant_mode') or '未识别'}；"
+            f"稳定掘进约 {_num(operation.get('work_total_min')):.1f} 分钟，"
+            f"停机约 {_num(operation.get('stop_total_min')):.1f} 分钟，"
+            f"过渡约 {_num(operation.get('transition_total_min')):.1f} 分钟。"
+        ),
+        (
+            f"PLC 统计记录中，稳定掘进段数量为 {operation.get('work_count', 0)}，"
+            f"停机段数量为 {operation.get('stop_count', 0)}，"
+            f"异常段数量为 {operation.get('abnormal_count', 0)}。"
+        ),
+        "",
+        "## 聚类状态与效率分析",
+        _cluster_text(cluster),
+        "",
+        "## 掌子面与地质揭示",
+        "如无当日可用掌子面素描，不把前方证据写成已揭露事实。",
+        "",
+        "## 已掘区段地质-施工响应复核",
+    ]
+    if high_grci:
+        for cell in high_grci[:5]:
+            lines.append(
+                f"- {cell.get('cell_id')}：GRCI 复核优先级为 {cell.get('coupling_level')}，"
+                f"GRCI 值约 {_format_score(cell.get('GRCI'))}；"
+                f"主要地质关注标签为 {_join_items(cell.get('main_hazards'))}。"
+                "该 cell 同时具备 GRS、RAI 和当日 PLC response，GRCI 只表示地质证据与施工响应的共现复核关注度。"
+            )
+    else:
+        lines.append("当前 Evidence Pack 未形成可用的已掘区段 review_cells，本日报不作进一步判断。")
+
+    lines.extend(
+        [
+            "",
+            "## 气体监测",
+            (
+                f"气体监测结构化结果显示，has_exceedance={gas.get('has_exceedance', False)}；"
+                f"涉及气体为 {_join_items(gas.get('exceed_gases'))}。"
+            ),
+            "",
+            "## 前方地质关注提示",
+            _forward_text(forward),
+            (
+                f"forward_attention_cells 数量为 {len(forward_cells)}；这些 cell 使用 "
+                "GRS_geo_base、main_hazards 和 source_trace，不使用 PLC、RAI、GRCI 或 steady-state PLC fields。"
+            ),
+            "",
+            "## 结论与建议",
+            "建议围绕 Evidence Pack 中的 review_cells 做已掘区段复核，围绕 forward_profile 做前方关注提示复核。",
+            "报告不得把 GRCI 写成确定性灾害判断，也不得把前方提示或 TSP/HSP 证据写成已发生事实。",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _scope_text(scope: dict[str, Any]) -> str:
+    daily_plc_range = scope.get("daily_plc_range") if isinstance(scope.get("daily_plc_range"), dict) else {}
+    start = daily_plc_range.get("start_chainage") or scope.get("daily_chainage_min")
+    end = daily_plc_range.get("end_chainage") or scope.get("daily_chainage_max")
+    advance = daily_plc_range.get("daily_advance_m") or scope.get("daily_advance_m")
+    aligned = scope.get("daily_excavated_scope") if isinstance(scope.get("daily_excavated_scope"), dict) else {}
+    aligned_start = aligned.get("start")
+    aligned_end = aligned.get("end")
+    if start is None and end is None:
+        return "当前 Evidence Pack 未提供足够的 PLC 实测推进范围，本日报不作扩展判断。"
+    return (
+        f"PLC 实测推进范围为 {start} 至 {end}，日推进约 {advance} m；"
+        f"系统按 10m cell 将已掘复核范围对齐为 {aligned_start} 至 {aligned_end}。"
+        "该对齐范围仅用于已掘区段复核，不等同于实际推进量。"
+    )
+
+
+def _cluster_text(cluster: dict[str, Any]) -> str:
+    if not isinstance(cluster, dict) or not cluster:
+        return "建议结合后续聚类统计复核，本日报不作扩展判断。"
+    state_summaries = cluster.get("state_summaries") or []
+    quality = cluster.get("cluster_quality") or {}
+    if state_summaries:
+        labels = _join_items([item.get("semantic_label") for item in state_summaries[:3] if isinstance(item, dict)])
+        return (
+            f"聚类状态与效率分析形成 {cluster.get('n_states', len(state_summaries))} 类状态，"
+            f"有效样本数为 {quality.get('valid_sample_count')}，"
+            f"状态切换次数为 {cluster.get('switch_count')}；"
+            f"主要状态标签包括 {labels}。"
+        )
+    state_summary = cluster.get("state_summary") or cluster.get("state_stats") or cluster.get("summary")
+    if state_summary:
+        return f"聚类状态与效率分析基于当日 PLC 参数分组结果；结构化摘要为 {state_summary}。"
+    return "建议结合后续聚类统计复核，本日报不作扩展判断。"
 
 
 def _select_pack_cells(cells: list[ConstructionStateCell]) -> list[ConstructionStateCell]:
