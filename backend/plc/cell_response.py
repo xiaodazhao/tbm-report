@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 from analysis.plc_contract import resolve_plc_columns
+from plc.paper_based_preprocessing import apply_paper_based_preprocessing
 
 
 def project_plc_response_to_cells(
@@ -67,6 +68,32 @@ def project_plc_response_to_cells(
         lambda row: f"cell_{_number_key(row['cell_start'])}_{_number_key(row['cell_end'])}",
         axis=1,
     )
+    preprocessing = apply_paper_based_preprocessing(df, cell_length=cell_length)
+    paper_samples = preprocessing.get("samples")
+    if isinstance(paper_samples, pd.DataFrame) and not paper_samples.empty:
+        for column in [
+            "is_shutdown_segment",
+            "shutdown_reason",
+            "auxiliary_shutdown",
+            "is_outlier",
+            "outlier_reason",
+            "valid_excavation_mask",
+            "working_interval_id",
+            "working_interval_is_valid",
+            "paper_plc_stage",
+            "steady_state_available",
+            "steady_state_fallback_used",
+            "steady_state_fallback_reason",
+        ]:
+            if column in paper_samples.columns:
+                df[column] = paper_samples[column]
+    paper_cell_metrics = {}
+    paper_cell_df = preprocessing.get("cell_metrics")
+    if isinstance(paper_cell_df, pd.DataFrame) and not paper_cell_df.empty and "cell_id" in paper_cell_df.columns:
+        paper_cell_metrics = {
+            str(row.get("cell_id")): {key: value for key, value in row.items() if key != "cell_id"}
+            for _, row in paper_cell_df.iterrows()
+        }
 
     records: list[dict[str, Any]] = []
     for cell_id, group in df.groupby("cell_id", sort=True):
@@ -81,6 +108,7 @@ def project_plc_response_to_cells(
         torque_std = _safe_std(group.get("__torque"))
         rpm_mean = _safe_mean(group.get("__rpm"))
         working_metrics = _working_only_metrics(group)
+        paper_metrics = paper_cell_metrics.get(str(cell_id), {})
 
         stop_ratio = stop_sec / duration_sec if duration_sec > 0 else 0.0
         abnormal_ratio = abnormal_sec / duration_sec if duration_sec > 0 else 0.0
@@ -124,6 +152,7 @@ def project_plc_response_to_cells(
                 "torque_mean": torque_mean,
                 "torque_std": torque_std,
                 "rpm_mean": rpm_mean,
+                **paper_metrics,
                 "stop_ratio": stop_ratio,
                 "abnormal_ratio": abnormal_ratio,
                 "speed_drop_score": speed_drop_score,
@@ -153,6 +182,7 @@ def project_plc_response_to_cells(
                     "stop_reason_available": False,
                     "planned_stop_distinguishable": False,
                     "stop_interpretation_warning": STOP_INTERPRETATION_WARNING,
+                    **paper_metrics,
                 },
             }
         )
@@ -219,6 +249,47 @@ def _empty_cell_response_df() -> pd.DataFrame:
             "cutterhead_power_proxy",
             "thrust_per_penetration",
             "torque_per_penetration",
+            "is_shutdown_segment",
+            "shutdown_reason",
+            "auxiliary_shutdown",
+            "is_outlier",
+            "outlier_reason",
+            "valid_excavation_mask",
+            "working_interval_id",
+            "working_interval_is_valid",
+            "paper_plc_stage",
+            "steady_state_available",
+            "steady_sample_count",
+            "steady_ratio",
+            "steady_to_working_ratio",
+            "steady_speed_mean",
+            "steady_speed_std",
+            "steady_speed_cv",
+            "steady_thrust_mean",
+            "steady_thrust_std",
+            "steady_thrust_cv",
+            "steady_torque_mean",
+            "steady_torque_std",
+            "steady_torque_cv",
+            "steady_rpm_mean",
+            "steady_rpm_std",
+            "steady_rpm_cv",
+            "steady_penetration_mean",
+            "steady_penetration_std",
+            "steady_penetration_cv",
+            "steady_cutterhead_power_proxy",
+            "steady_thrust_per_penetration",
+            "steady_torque_per_penetration",
+            "steady_state_fallback_used",
+            "steady_state_fallback_reason",
+            "steady_detection_signal",
+            "steady_threshold_value",
+            "steady_median_signal_value",
+            "steady_candidate_segment_count",
+            "plc_preprocessing_quality_grade",
+            "plc_preprocessing_quality_reason",
+            "plc_preprocessing_method",
+            "plc_preprocessing_boundary",
             "response_support_count",
             "response_metrics",
         ]
@@ -344,6 +415,8 @@ def _working_only_metrics(group: pd.DataFrame) -> dict[str, Any]:
 
 
 def _working_mask(group: pd.DataFrame) -> tuple[pd.Series, str | None]:
+    if "valid_excavation_mask" in group.columns:
+        return group["valid_excavation_mask"].fillna(False).astype(bool), "working_mask_uses_paper_based_valid_excavation"
     speed = pd.to_numeric(group.get("__speed", pd.Series(np.nan, index=group.index)), errors="coerce")
     thrust = pd.to_numeric(group.get("__thrust", pd.Series(np.nan, index=group.index)), errors="coerce")
     torque = pd.to_numeric(group.get("__torque", pd.Series(np.nan, index=group.index)), errors="coerce")

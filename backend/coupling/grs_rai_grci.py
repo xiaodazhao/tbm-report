@@ -553,6 +553,34 @@ def _response_metrics(response: dict[str, Any]) -> dict[str, Any]:
         "cutterhead_power_proxy",
         "thrust_per_penetration",
         "torque_per_penetration",
+        "raw_sample_count",
+        "shutdown_sample_count",
+        "outlier_sample_count",
+        "working_sample_count_paper",
+        "steady_sample_count",
+        "steady_ratio",
+        "steady_to_working_ratio",
+        "steady_speed_mean",
+        "steady_speed_std",
+        "steady_speed_cv",
+        "steady_thrust_mean",
+        "steady_thrust_std",
+        "steady_thrust_cv",
+        "steady_torque_mean",
+        "steady_torque_std",
+        "steady_torque_cv",
+        "steady_rpm_mean",
+        "steady_rpm_std",
+        "steady_rpm_cv",
+        "steady_penetration_mean",
+        "steady_penetration_std",
+        "steady_penetration_cv",
+        "steady_cutterhead_power_proxy",
+        "steady_thrust_per_penetration",
+        "steady_torque_per_penetration",
+        "steady_threshold_value",
+        "steady_median_signal_value",
+        "steady_candidate_segment_count",
         "RAI",
     ]:
         if key in response:
@@ -562,10 +590,22 @@ def _response_metrics(response: dict[str, Any]) -> dict[str, Any]:
         "RAI_formula_text",
         "stop_interpretation_warning",
         "working_mask_warning",
+        "steady_state_fallback_reason",
+        "steady_detection_signal",
+        "plc_preprocessing_quality_grade",
+        "plc_preprocessing_quality_reason",
+        "plc_preprocessing_method",
+        "plc_preprocessing_boundary",
     ]:
         if key in response:
             out[key] = _text(response.get(key))
-    for key in ["stop_reason_available", "planned_stop_distinguishable", "insufficient_working_samples"]:
+    for key in [
+        "stop_reason_available",
+        "planned_stop_distinguishable",
+        "insufficient_working_samples",
+        "steady_state_available",
+        "steady_state_fallback_used",
+    ]:
         if key in response:
             out[key] = bool(response.get(key))
     return {key: value for key, value in out.items() if value is not None}
