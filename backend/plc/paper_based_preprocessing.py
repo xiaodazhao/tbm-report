@@ -328,12 +328,16 @@ def _annotate_steady_state(df: pd.DataFrame, intervals: pd.DataFrame, config: PL
 
 
 def _choose_detection_signal(part: pd.DataFrame) -> tuple[str | None, str | None]:
-    penetration = pd.to_numeric(part.get("__penetration"), errors="coerce")
-    if penetration.notna().any() and penetration.gt(0).any():
-        return "__penetration", "penetration"
     speed = pd.to_numeric(part.get("__speed"), errors="coerce")
     if speed.notna().any() and speed.gt(0).any():
         return "__speed", "advance_speed"
+    # The project PLC field named "penetration" is the machine-reported
+    # penetration value (typically mm/r), not a confirmed penetration-rate
+    # signal. Use it only as a last-resort monotonic signal for steady-state
+    # segmentation when advance speed is unavailable.
+    penetration = pd.to_numeric(part.get("__penetration"), errors="coerce")
+    if penetration.notna().any() and penetration.gt(0).any():
+        return "__penetration", "penetration_value_fallback_not_rate"
     return None, None
 
 

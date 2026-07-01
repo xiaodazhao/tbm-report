@@ -104,8 +104,8 @@ def test_evidence_pack_from_twin_keeps_forward_out_of_grci_and_adds_governance()
     assert "GRCI" in pack["evidence_governance"]["role_rules"]["forward_attention"]["cannot_use"]
     assert pack["daily_review_evidence"]["daily_review_cells"][0]["plc_enhanced_metrics"]["working_sample_count"] == 20
     forward_cell = pack["forward_attention_evidence"]["forward_attention_cells"][0]
-    assert forward_cell["GRCI"] is None
-    assert forward_cell["GRCI_available"] is False
+    assert "GRCI" not in forward_cell
+    assert "GRCI_available" not in forward_cell
     assert "plc_enhanced_metrics" not in forward_cell
     for field in [
         "speed_mean",

@@ -187,7 +187,9 @@ def project_plc_response_to_cells(
             }
         )
 
-    return pd.DataFrame(records)
+    out = pd.DataFrame(records)
+    out.attrs["plc_preprocessing_daily_summary"] = preprocessing.get("daily_summary") or {}
+    return out
 
 
 RAI_FORMULA_TEXT = (

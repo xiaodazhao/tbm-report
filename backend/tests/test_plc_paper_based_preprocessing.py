@@ -77,6 +77,17 @@ def test_shan_style_steady_state_extraction_outputs_cell_metrics() -> None:
     assert "plc_preprocessing_quality_grade" in cells.columns
 
 
+def test_steady_state_detection_prefers_advance_speed_over_penetration_value() -> None:
+    frame = _base_frame(80)
+    frame["__penetration"] = [1.0] * 40 + [20.0] * 40
+    frame["__speed"] = [15.0] * 80
+
+    result = apply_paper_based_preprocessing(frame)
+    cells = result["cell_metrics"]
+
+    assert set(cells["steady_detection_signal"].dropna()) == {"advance_speed"}
+
+
 def test_steady_state_falls_back_when_detection_signal_missing() -> None:
     frame = _base_frame(40)
     frame["__penetration"] = pd.NA

@@ -609,10 +609,6 @@ def _twin_cell_for_pack(cell: TwinCellView, role: str) -> dict[str, Any]:
 def _twin_cell_for_forward_pack(cell: TwinCellView, role: str) -> dict[str, Any]:
     payload = _twin_cell_for_pack(cell, role)
     _strip_forward_plc_response_fields(payload)
-    payload["GRCI"] = None
-    payload["GRCI_available"] = False
-    payload["GRCI_source"] = "not_applicable_forward_attention"
-    payload["GRCI_unavailable_reason"] = "forward_attention_uses_grs_not_grci"
     payload["boundary"] = "Forward attention cells use GRS/source_trace only, not GRCI or PLC response evidence."
     return payload
 
@@ -622,6 +618,15 @@ def _strip_forward_plc_response_fields(payload: dict[str, Any]) -> None:
     for key in [
         "RAI",
         "RAI_formula_text",
+        "GRCI",
+        "GRCI_available",
+        "GRCI_source",
+        "GRCI_unavailable_reason",
+        "grs_term",
+        "rai_term",
+        "interaction_term",
+        "GRCI_formula_text",
+        "coupling_level",
         "speed_mean",
         "thrust_mean",
         "torque_mean",

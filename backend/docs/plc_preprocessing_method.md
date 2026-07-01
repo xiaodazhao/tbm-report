@@ -149,9 +149,17 @@ min_interval_duration_seconds = 30
 检测信号优先级：
 
 ```text
-penetration
-→ advance_speed fallback
+advance_speed
+→ penetration value fallback, only if advance_speed is unavailable
 ```
+
+说明：当前 PLC 表头中的“贯入度”字段语义更接近贯入度值（如 mm/r），不是已经确认的 penetration rate。因此稳态段检测不再优先使用 `penetration`，而是优先使用推进速度 `advance_speed`。只有当推进速度缺失或不可用时，才把 `penetration` 作为辅助 fallback 信号，并在输出中标记为：
+
+```text
+steady_detection_signal = penetration_value_fallback_not_rate
+```
+
+该 fallback 不能解释为 penetration rate，也不能用于推导严格物理比能。
 
 在每个 valid working interval 内计算 rolling mean：
 
@@ -256,4 +264,3 @@ plc_preprocessing_quality_grade_summary.csv
 plc_preprocessing_overall_summary.json
 plc_preprocessing_report.md
 ```
-
