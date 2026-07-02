@@ -19,7 +19,7 @@ import routes.report as report_routes
 from schemas.pipeline import ConstructionStateCell
 
 
-def test_cell_response_reads_motion_cols_and_exports_working_only_metrics():
+def test_cell_response_reads_motion_cols_and_exports_paper_based_working_aliases():
     rows = []
     for idx in range(25):
         is_work = idx >= 5
@@ -48,16 +48,17 @@ def test_cell_response_reads_motion_cols_and_exports_working_only_metrics():
     assert row["working_sample_count"] == 20
     assert row["working_ratio"] == 20 / 25
     assert bool(row["insufficient_working_samples"]) is False
-    assert row["working_speed_cv"] is not None
-    assert row["working_thrust_cv"] is not None
-    assert row["working_torque_cv"] is not None
-    assert row["penetration_mean"] is not None
-    assert row["cutterhead_power_proxy"] is not None
-    assert row["thrust_per_penetration"] is not None
-    assert row["torque_per_penetration"] is not None
+    assert str(row["working_metrics_source"]).startswith("paper_based_preprocessing")
+    if bool(row["steady_state_available"]):
+        assert row["working_speed_cv"] == row["steady_speed_cv"]
+        assert row["cutterhead_power_proxy"] == row["steady_cutterhead_power_proxy"]
+    else:
+        assert bool(row["steady_state_fallback_used"]) is True
+        assert pd.isna(row["working_speed_cv"])
+        assert pd.isna(row["cutterhead_power_proxy"])
     metrics = row["response_metrics"]
     assert metrics["working_sample_count"] == 20
-    assert metrics["cutterhead_power_proxy"] == row["cutterhead_power_proxy"]
+    assert metrics["working_metrics_source"] == row["working_metrics_source"]
 
 
 def test_cell_response_marks_insufficient_working_samples_and_safe_ratios():

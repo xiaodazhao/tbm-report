@@ -589,7 +589,7 @@ def _response_metrics(response: dict[str, Any]) -> dict[str, Any]:
         "dominant_component",
         "RAI_formula_text",
         "stop_interpretation_warning",
-        "working_mask_warning",
+        "working_metrics_source",
         "steady_state_fallback_reason",
         "steady_detection_signal",
         "plc_preprocessing_quality_grade",

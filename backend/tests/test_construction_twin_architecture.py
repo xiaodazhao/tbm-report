@@ -43,11 +43,19 @@ def _cell(
         plc_metrics={
             "working_sample_count": 20,
             "working_ratio": 0.8,
+            "working_metrics_source": "paper_based_preprocessing_steady_state_alias",
             "working_speed_cv": 0.1,
             "working_torque_cv": 0.2,
             "penetration_mean": 0.5,
             "thrust_per_penetration": 1000.0,
             "torque_per_penetration": 200.0,
+            "steady_state_available": True,
+            "steady_sample_count": 18,
+            "steady_ratio": 0.72,
+            "steady_speed_cv": 0.1,
+            "steady_torque_cv": 0.2,
+            "steady_thrust_per_penetration": 1000.0,
+            "steady_torque_per_penetration": 200.0,
         } if role == "daily_review" else {},
         trace_completeness=1.0,
     )
@@ -102,7 +110,12 @@ def test_evidence_pack_from_twin_keeps_forward_out_of_grci_and_adds_governance()
     assert pack["evidence_pack_source"] == "daily_construction_twin"
     assert pack["geology_evidence"]["key_cells"] == pack["geology_evidence"]["selected_cells"]
     assert "GRCI" in pack["evidence_governance"]["role_rules"]["forward_attention"]["cannot_use"]
-    assert pack["daily_review_evidence"]["daily_review_cells"][0]["plc_enhanced_metrics"]["working_sample_count"] == 20
+    daily_metrics = pack["daily_review_evidence"]["daily_review_cells"][0]["plc_enhanced_metrics"]
+    assert daily_metrics["working_sample_count"] == 20
+    assert daily_metrics["working_metrics_source"] == "paper_based_preprocessing_steady_state_alias"
+    assert daily_metrics["steady_sample_count"] == 18
+    assert "thrust_per_penetration" not in daily_metrics
+    assert "steady_thrust_per_penetration" in daily_metrics
     forward_cell = pack["forward_attention_evidence"]["forward_attention_cells"][0]
     assert "GRCI" not in forward_cell
     assert "GRCI_available" not in forward_cell

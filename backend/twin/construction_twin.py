@@ -132,6 +132,7 @@ def _cell_to_twin_view(cell: ConstructionStateCell) -> TwinCellView:
             "working_sample_count": plc_metrics.get("working_sample_count"),
             "working_ratio": plc_metrics.get("working_ratio"),
             "insufficient_working_samples": plc_metrics.get("insufficient_working_samples"),
+            "working_metrics_source": plc_metrics.get("working_metrics_source"),
             "working_speed_cv": plc_metrics.get("working_speed_cv"),
             "working_thrust_cv": plc_metrics.get("working_thrust_cv"),
             "working_torque_cv": plc_metrics.get("working_torque_cv"),
@@ -211,7 +212,6 @@ def _cell_to_twin_view(cell: ConstructionStateCell) -> TwinCellView:
             "warnings": [
                 item for item in [
                     cell.stop_interpretation_warning,
-                    plc_metrics.get("working_mask_warning"),
                     plc_metrics.get("steady_state_fallback_reason"),
                     cell.GRCI_unavailable_reason,
                     cell.GRS_unavailable_reason,
