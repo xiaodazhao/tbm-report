@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from schemas.pipeline import ConstructionStateCell
+from schemas.pipeline import ConstructionStateCell, EvidenceUnit
 from schemas.twin import DailyConstructionTwin, TwinCellView
 
 
@@ -77,10 +77,17 @@ def build_prompt_evidence_pack(
             "meaning": "10m-cell aligned excavated review scope; not the actual PLC advance distance.",
         }
     priority_cells = priority_cells or {}
+    evidence_units = _build_evidence_units(
+        excavated_pack_cells,
+        forward_pack_cells,
+        background_pack_cells,
+        scope=scope,
+    )
     return {
         "schema_version": "prompt_evidence_pack_v1",
         "report_scope": scope,
         "scope_summary": scope,
+        "evidence_units": evidence_units,
         "operation_evidence": operation_summary,
         "cluster_evidence": cluster_summary,
         "gas_evidence": gas_summary,
@@ -186,11 +193,18 @@ def build_evidence_pack_from_twin(
     priority_cells = priority_cells or {}
     governance = twin.governance.model_dump()
 
+    evidence_units = _build_evidence_units(
+        excavated_cells,
+        forward_cells,
+        background_cells,
+        scope=scope,
+    )
     pack = {
         "schema_version": "twin_evidence_pack_v1",
         "evidence_pack_source": "daily_construction_twin",
         "report_scope": scope,
         "scope_summary": scope,
+        "evidence_units": evidence_units,
         "operation_evidence": operation_summary or twin.summaries.operation_summary,
         "cluster_evidence": cluster_summary or (twin.summaries.response_summary or {}).get("cluster_summary", {}),
         "gas_evidence": gas_summary or twin.summaries.gas_summary,
@@ -926,6 +940,122 @@ def _merge_pack_cells(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
             out.append(cell)
             seen.add(cell_id)
     return out
+
+
+def _build_evidence_units(
+    daily_review_cells: list[dict[str, Any]],
+    forward_attention_cells: list[dict[str, Any]],
+    local_background_cells: list[dict[str, Any]],
+    *,
+    scope: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Build a stable atomic evidence view without changing legacy pack fields."""
+    units: list[dict[str, Any]] = []
+    for role, cells in [
+        ("daily_review", daily_review_cells),
+        ("forward_attention", forward_attention_cells),
+        ("local_background", local_background_cells),
+    ]:
+        for cell in cells:
+            units.append(_evidence_unit_from_cell(cell, role=role, scope=scope))
+    return units
+
+
+def _evidence_unit_from_cell(
+    cell: dict[str, Any],
+    *,
+    role: str,
+    scope: dict[str, Any],
+) -> dict[str, Any]:
+    cell_id = str(cell.get("cell_id") or f"{role}_{len(str(cell))}")
+    source_trace = cell.get("source_trace") if isinstance(cell.get("source_trace"), list) else []
+    source_types = [
+        str(trace.get("source_type"))
+        for trace in source_trace
+        if isinstance(trace, dict) and trace.get("source_type")
+    ]
+    if role == "daily_review":
+        entity = "excavated_cell"
+        state = cell.get("coupling_level") or cell.get("fused_grade") or "review_cell"
+        support_value = {
+            "GRS_geo_base": cell.get("GRS_geo_base"),
+            "RAI": cell.get("RAI"),
+            "GRCI": cell.get("GRCI") if cell.get("GRCI_available") else None,
+            "GRCI_available": cell.get("GRCI_available"),
+        }
+        allowed_expression = [
+            "daily excavated review",
+            "GRCI as coupling attention index when available",
+            "PLC response evidence only for excavated review cells",
+        ]
+    elif role == "forward_attention":
+        entity = "forward_cell"
+        state = "forward_attention"
+        support_value = {
+            "GRS_geo_base": cell.get("GRS_geo_base"),
+            "main_hazards": cell.get("main_hazards"),
+            "distance_to_face_m": cell.get("distance_to_face_m"),
+        }
+        allowed_expression = [
+            "forward attention indication",
+            "GRS/source trace only",
+            "not occurred fact and not GRCI risk",
+        ]
+    else:
+        entity = "local_background_cell"
+        state = "local_background"
+        support_value = {
+            "GRS_geo_base": cell.get("GRS_geo_base"),
+            "main_hazards": cell.get("main_hazards"),
+        }
+        allowed_expression = [
+            "local geological background context",
+            "not daily response conclusion",
+        ]
+    unit = EvidenceUnit(
+        evidence_id=f"{role}:{cell_id}",
+        source_type=",".join(sorted(set(source_types))) if source_types else "cell_state",
+        time_scope={
+            "date": scope.get("date"),
+            "time_available": True,
+        },
+        spatial_scope={
+            "cell_id": cell_id,
+            "cell_start": cell.get("cell_start"),
+            "cell_end": cell.get("cell_end"),
+            "cell_center": cell.get("cell_center"),
+            "distance_to_face_m": cell.get("distance_to_face_m"),
+        },
+        role=role,
+        entity=entity,
+        state=str(state) if state is not None else None,
+        certainty=_evidence_certainty(cell),
+        support_value=support_value,
+        allowed_expression=allowed_expression,
+        source_ref={
+            "supporting_evidence_ids": cell.get("supporting_evidence_ids") or cell.get("evidence_ids") or [],
+            "trace_refs": cell.get("trace_refs") or [],
+            "source_trace": source_trace[:3],
+        },
+    )
+    return unit.model_dump()
+
+
+def _evidence_certainty(cell: dict[str, Any]) -> str:
+    confidence = cell.get("confidence_score")
+    if confidence is None:
+        confidence = cell.get("evidence_confidence")
+    try:
+        value = float(confidence)
+    except Exception:
+        value = None
+    if value is None:
+        return "unknown"
+    if value >= 0.7:
+        return "high"
+    if value >= 0.4:
+        return "medium"
+    return "low"
 
 
 def _selection_score(cell: ConstructionStateCell, role: str) -> tuple[float | None, str, str]:

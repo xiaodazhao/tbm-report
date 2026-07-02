@@ -21,9 +21,13 @@ def build_revision_prompt(
     quality_payload = {
         "score": quality_before_revision.get("score") or quality_before_revision.get("quality_score"),
         "error_type_counts": quality_before_revision.get("error_type_counts", {}),
+        "error_severity_distribution": quality_before_revision.get("error_severity_distribution", {}),
+        "weighted_error_penalty": quality_before_revision.get("weighted_error_penalty"),
+        "engineering_significant_error_count": quality_before_revision.get("engineering_significant_error_count"),
         "violations_by_error_type": quality_before_revision.get("violations_by_error_type", {}),
         "unsupported_claim_count": quality_before_revision.get("unsupported_claim_count"),
         "grounding_rate": quality_before_revision.get("grounding_rate"),
+        "required_fact_coverage": quality_before_revision.get("required_fact_coverage", {}),
         "unsupported_claims": [
             item
             for item in (quality_before_revision.get("claim_results") or [])
@@ -32,6 +36,8 @@ def build_revision_prompt(
     }
     trace_payload = {
         "support_type_distribution": trace_before_revision.get("support_type_distribution", {}),
+        "support_status_distribution": trace_before_revision.get("support_status_distribution", {}),
+        "mismatch_type_distribution": trace_before_revision.get("mismatch_type_distribution", {}),
         "unsupported_by_claim_type": trace_before_revision.get("unsupported_by_claim_type", {}),
         "trace_coverage": trace_before_revision.get("trace_coverage"),
     }

@@ -5,6 +5,49 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 
+class EvidenceUnit(BaseModel):
+    """Atomic evidence view used for claim grounding and audit exports."""
+
+    evidence_id: str
+    source_type: str | None = None
+    time_scope: dict[str, Any] = Field(default_factory=dict)
+    spatial_scope: dict[str, Any] = Field(default_factory=dict)
+    role: str = "unknown"
+    entity: str | None = None
+    state: str | None = None
+    certainty: str = "unknown"
+    support_value: Any = None
+    allowed_expression: list[str] = Field(default_factory=list)
+    source_ref: dict[str, Any] = Field(default_factory=dict)
+
+
+class ReportClaim(BaseModel):
+    """Structured claim extracted from a generated report sentence."""
+
+    claim_id: str
+    claim_text: str
+    claim_type: str = "unknown"
+    entity: str | None = None
+    value: Any = None
+    unit: str | None = None
+    time_scope: dict[str, Any] = Field(default_factory=dict)
+    spatial_scope: dict[str, Any] | str = "unknown"
+    claim_role: str = "unknown"
+    certainty: str = "asserted"
+    source_sentence_index: int | None = None
+
+
+class ClaimEvidenceTrace(BaseModel):
+    """Detailed claim-to-evidence alignment result."""
+
+    claim_id: str
+    aligned_evidence_ids: list[str] = Field(default_factory=list)
+    support_status: str = "unsupported"
+    mismatch_type: str = "missing_evidence"
+    confidence: float = 0.0
+    reason: str | None = None
+
+
 class ConstructionStateCell(BaseModel):
     """Unified cell-level state used by Evidence Pack, report, and trace."""
 

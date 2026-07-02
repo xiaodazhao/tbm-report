@@ -706,11 +706,24 @@ def _build_claim_result(claim: dict[str, Any]) -> dict[str, Any]:
     return {
         "claim_id": _safe_text(claim.get("claim_id")),
         "claim_type": normalize_claim_type(claim.get("claim_type")),
-        "claim_text": _safe_text(claim.get("text")),
+        "claim_text": _safe_text(claim.get("claim_text") or claim.get("text")),
+        "entity": claim.get("entity"),
+        "value": claim.get("value"),
+        "unit": claim.get("unit"),
+        "time_scope": _as_dict(claim.get("time_scope")),
+        "spatial_scope": claim.get("spatial_scope_detail") or claim.get("spatial_scope") or "unknown",
+        "claim_role": _safe_text(claim.get("claim_role")) or "unknown",
+        "certainty": _safe_text(claim.get("certainty")) or "asserted",
+        "source_sentence_index": claim.get("source_sentence_index", claim.get("sentence_index")),
         "grounded": False,
         "support_type": "none",
         "trace_support_type": "none",
         "supporting_evidence_ids": [],
+        "aligned_evidence_ids": [],
+        "support_status": "unsupported",
+        "mismatch_type": "missing_evidence",
+        "confidence": 0.0,
+        "reason": None,
         "source_trace": [],
         "messages": [],
         "suggestions": [],
@@ -785,6 +798,68 @@ def _trace_support_type(
     if support_type == "key_cell":
         return "cell_evidence_support"
     return support_type or "none"
+
+
+def _finalize_claim_alignment(result: dict[str, Any]) -> dict[str, Any]:
+    """Add detailed alignment fields while preserving legacy grounded/support_type fields."""
+    evidence_ids = _dedup(
+        [
+            _safe_text(item)
+            for item in _as_list(result.get("supporting_evidence_ids"))
+            if _safe_text(item)
+        ]
+    )
+    if not evidence_ids:
+        evidence_ids = _dedup(
+            [
+                _safe_text(trace.get("evidence_id"))
+                for trace in _as_list(result.get("source_trace"))
+                if isinstance(trace, dict) and _safe_text(trace.get("evidence_id"))
+            ]
+        )
+    result["aligned_evidence_ids"] = evidence_ids
+
+    messages = [_safe_text(item) for item in _as_list(result.get("messages")) if _safe_text(item)]
+    result["reason"] = "; ".join(messages) if messages else None
+
+    if result.get("grounded"):
+        if result.get("severity") == "warning" or _as_list(result.get("suggestions")):
+            result["support_status"] = "partially_supported"
+            result["confidence"] = 0.6
+        else:
+            result["support_status"] = "supported"
+            result["confidence"] = 1.0
+        result["mismatch_type"] = _infer_mismatch_type(result, supported=True)
+    else:
+        result["support_status"] = "unsupported"
+        result["confidence"] = 0.0
+        result["mismatch_type"] = _infer_mismatch_type(result, supported=False)
+
+    return result
+
+
+def _infer_mismatch_type(result: dict[str, Any], *, supported: bool) -> str:
+    text = _safe_text(result.get("claim_text"))
+    messages = " ".join(_safe_text(item) for item in _as_list(result.get("messages")))
+    suggestions = " ".join(_safe_text(item) for item in _as_list(result.get("suggestions")))
+    combined = f"{text} {messages} {suggestions}"
+    lowered = combined.lower()
+
+    if supported and not suggestions and result.get("severity") != "warning":
+        return "none"
+    if result.get("trace_support_type") == "policy_support" or result.get("claim_type") == CLAIM_TYPE_METHOD_BOUNDARY:
+        return "policy_boundary"
+    if "dk" in lowered or "range" in lowered or "cell" in lowered:
+        return "scope_mismatch" if not supported else "scope_warning"
+    if any(token in combined for token in ["GRCI", "RAI", "GRS", "%"]):
+        return "numeric_or_metric_mismatch" if not supported else "numeric_or_metric_warning"
+    if any(token in lowered for token in ["value", "numeric", "score", "advance"]):
+        return "numeric_or_metric_mismatch" if not supported else "numeric_or_metric_warning"
+    if any(token in lowered for token in ["forward", "background", "local_background", "daily_review"]):
+        return "role_mismatch" if not supported else "role_warning"
+    if any(token in lowered for token in ["unsupported", "missing", "not found", "none"]):
+        return "missing_evidence"
+    return "overclaim" if not supported else "partial_support"
 
 
 def check_claim_grounding(
@@ -1145,6 +1220,7 @@ def check_claim_grounding(
             else:
                 result["trace_support_type"] = "none"
 
+            result = _finalize_claim_alignment(result)
             claim_results.append(result)
 
         grounded_claim_count = sum(1 for item in claim_results if item.get("grounded"))

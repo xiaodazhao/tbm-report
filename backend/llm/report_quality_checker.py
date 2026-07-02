@@ -750,6 +750,109 @@ def _filter_grounding_violations(
     return filtered
 
 
+def _build_required_facts(prompt_evidence_pack: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build lightweight required facts for coverage auditing only."""
+    pack = _as_dict(prompt_evidence_pack)
+    scope = _as_dict(pack.get("report_scope") or pack.get("scope_summary"))
+    facts: list[dict[str, Any]] = []
+
+    if scope.get("date"):
+        facts.append({"fact_id": "report_date", "label": "report date", "value": scope.get("date")})
+
+    raw = _as_dict(scope.get("daily_plc_range") or scope.get("daily_chainage_raw"))
+    if raw.get("daily_advance_m") is not None:
+        facts.append(
+            {
+                "fact_id": "daily_advance_m",
+                "label": "PLC measured daily advance",
+                "value": raw.get("daily_advance_m"),
+            }
+        )
+    if raw.get("start_chainage") is not None and raw.get("end_chainage") is not None:
+        facts.append(
+            {
+                "fact_id": "daily_plc_range",
+                "label": "PLC measured range",
+                "value": [raw.get("start_chainage"), raw.get("end_chainage")],
+            }
+        )
+
+    if scope.get("current_chainage") is not None:
+        facts.append({"fact_id": "current_chainage", "label": "current face chainage", "value": scope.get("current_chainage")})
+
+    geology = _as_dict(pack.get("geology_evidence"))
+    if _as_list(geology.get("forward_attention_cells")):
+        facts.append(
+            {
+                "fact_id": "forward_attention_available",
+                "label": "forward attention cells available",
+                "value": len(_as_list(geology.get("forward_attention_cells"))),
+            }
+        )
+    if _as_list(geology.get("excavated_review_cells")):
+        facts.append(
+            {
+                "fact_id": "daily_review_cells_available",
+                "label": "daily review cells available",
+                "value": len(_as_list(geology.get("excavated_review_cells"))),
+            }
+        )
+
+    return facts
+
+
+def _check_required_fact_coverage(
+    report_text: str,
+    prompt_evidence_pack: dict[str, Any],
+) -> dict[str, Any]:
+    facts = _build_required_facts(prompt_evidence_pack)
+    if not facts:
+        return {
+            "required_fact_count": 0,
+            "covered_required_fact_count": 0,
+            "missing_required_fact_count": 0,
+            "required_fact_coverage": None,
+            "missing_required_facts": [],
+            "facts": [],
+        }
+
+    text = _safe_text(report_text)
+    checked: list[dict[str, Any]] = []
+    for fact in facts:
+        values = fact.get("value")
+        if not isinstance(values, list):
+            values = [values]
+        covered = all(_fact_value_in_text(text, item) for item in values if item is not None)
+        checked.append({**fact, "covered": bool(covered)})
+
+    covered_count = sum(1 for item in checked if item.get("covered"))
+    missing = [item for item in checked if not item.get("covered")]
+    return {
+        "required_fact_count": len(checked),
+        "covered_required_fact_count": covered_count,
+        "missing_required_fact_count": len(missing),
+        "required_fact_coverage": round(covered_count / len(checked), 4) if checked else None,
+        "missing_required_facts": missing,
+        "facts": checked,
+    }
+
+
+def _fact_value_in_text(text: str, value: Any) -> bool:
+    if value is None:
+        return True
+    raw = _safe_text(value)
+    if raw and raw in text:
+        return True
+    try:
+        number = float(value)
+    except Exception:
+        return False
+    candidates = {f"{number:g}", f"{number:.1f}"}
+    if abs(number - round(number)) < 1e-6:
+        candidates.add(str(int(round(number))))
+    return any(item in text for item in candidates if item)
+
+
 # ============================================================
 # Main checker
 # ============================================================
@@ -1045,6 +1148,7 @@ def check_report_quality(
 
         grounding_rate = float(grounding.get("grounding_rate") or 0.0)
         unsupported_claim_count = int(grounding.get("unsupported_claim_count") or 0)
+        required_fact_coverage = _check_required_fact_coverage(text, prompt_evidence_pack)
 
         if unsupported_claim_count > 0:
             warnings.append(f"存在 {unsupported_claim_count} 条主张未获得结构化证据支撑。")
@@ -1089,6 +1193,10 @@ def check_report_quality(
                 "grounding_rate": grounding_rate,
                 "section_count": len(section_titles),
                 "missing_section_count": len(missing_sections),
+                "required_fact_count": required_fact_coverage["required_fact_count"],
+                "covered_required_fact_count": required_fact_coverage["covered_required_fact_count"],
+                "missing_required_fact_count": required_fact_coverage["missing_required_fact_count"],
+                "required_fact_coverage": required_fact_coverage["required_fact_coverage"],
                 "error_count": error_count,
                 "warning_count": warning_count,
             },
@@ -1100,6 +1208,7 @@ def check_report_quality(
                 "grounding_rate": grounding_rate,
                 "unsupported_claim_count": unsupported_claim_count,
             },
+            "required_fact_coverage": required_fact_coverage,
             "claim_results": _as_list(grounding.get("claim_results")) if include_claim_results else None,
         }
         return annotate_quality_result(result)
@@ -1127,6 +1236,10 @@ def check_report_quality(
                 "grounding_rate": 0.0,
                 "section_count": 0,
                 "missing_section_count": 0,
+                "required_fact_count": 0,
+                "covered_required_fact_count": 0,
+                "missing_required_fact_count": 0,
+                "required_fact_coverage": None,
                 "error_count": 0,
                 "warning_count": 0,
             },
@@ -1137,6 +1250,14 @@ def check_report_quality(
                 "grounded_claim_count": 0,
                 "grounding_rate": 0.0,
                 "unsupported_claim_count": 0,
+            },
+            "required_fact_coverage": {
+                "required_fact_count": 0,
+                "covered_required_fact_count": 0,
+                "missing_required_fact_count": 0,
+                "required_fact_coverage": None,
+                "missing_required_facts": [],
+                "facts": [],
             },
             "claim_results": [] if include_claim_results else None,
         }

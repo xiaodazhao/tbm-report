@@ -34,6 +34,15 @@ def _safe_text(value: Any) -> str:
     return str(value).strip()
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
 def _claim_text(claim: Any) -> str:
     if isinstance(claim, dict):
         return _safe_text(
@@ -307,12 +316,30 @@ def build_report_trace(
                     "claim_id": _safe_text(item.get("claim_id")) or None,
                     "claim_text": _safe_text(item.get("claim_text")),
                     "claim_type": _safe_text(item.get("claim_type")),
+                    "entity": item.get("entity"),
+                    "value": item.get("value"),
+                    "unit": item.get("unit"),
+                    "time_scope": item.get("time_scope") or {},
+                    "spatial_scope": item.get("spatial_scope") or {},
+                    "claim_role": _safe_text(item.get("claim_role")) or "unknown",
+                    "certainty": _safe_text(item.get("certainty")) or "asserted",
+                    "source_sentence_index": item.get("source_sentence_index"),
                     "grounded": bool(item.get("grounded")),
+                    "support_status": _safe_text(item.get("support_status")) or (
+                        "supported" if item.get("grounded") else "unsupported"
+                    ),
+                    "mismatch_type": _safe_text(item.get("mismatch_type")) or (
+                        "none" if item.get("grounded") else "missing_evidence"
+                    ),
+                    "confidence": _safe_float(item.get("confidence"), 1.0 if item.get("grounded") else 0.0),
                     "support_type": _safe_text(item.get("support_type")) or None,
                     "trace_support_type": _infer_trace_support_type(item, traces),
                     "supporting_evidence_ids": _as_list(item.get("supporting_evidence_ids")),
+                    "aligned_evidence_ids": _as_list(item.get("aligned_evidence_ids"))
+                    or _as_list(item.get("supporting_evidence_ids")),
                     "source_trace": traces,
-                    "support_note": "; ".join(
+                    "reason": _safe_text(item.get("reason")) or None,
+                    "support_note": _safe_text(item.get("reason")) or "; ".join(
                         _safe_text(message)
                         for message in _as_list(item.get("messages"))
                         if _safe_text(message)
@@ -374,5 +401,7 @@ def summarize_report_trace(trace: dict | None) -> dict:
         "source_role_distribution": trace.get("source_role_distribution") or {},
         "source_type_distribution": trace.get("source_type_distribution") or {},
         "unsupported_by_claim_type": trace.get("unsupported_by_claim_type") or {},
+        "support_status_distribution": trace.get("support_status_distribution") or {},
+        "mismatch_type_distribution": trace.get("mismatch_type_distribution") or {},
         "warnings": _as_list(trace.get("warnings")),
     }

@@ -26,6 +26,9 @@ from llm.report_policy import split_sentences
 
 
 SCHEMA_VERSION = "report_claim_extractor_v1"
+_VALUE_UNIT_RE = re.compile(
+    r"(?<![\d.])(-?\d+(?:\.\d+)?)\s*(m|M|%|min|kN|KN|kN\.m|rpm|r/min|鍒嗛挓|绫硘)?(?![\d.])"
+)
 
 _DK_RANGE_RE = re.compile(
     r"((?:D?y?K)\d+\+\d+(?:\.\d+)?)\s*(?:～|~|-|—|－)\s*((?:D?y?K)\d+\+\d+(?:\.\d+)?)",
@@ -55,6 +58,75 @@ def _dedup_keep_order(items: list[str]) -> list[str]:
         out.append(text)
         seen.add(text)
     return out
+
+
+def _extract_value_unit(sentence: str) -> tuple[float | None, str | None]:
+    match = _VALUE_UNIT_RE.search(sentence)
+    if not match:
+        return None, None
+    try:
+        value = float(match.group(1))
+    except Exception:
+        value = None
+    return value, _safe_text(match.group(2)) or None
+
+
+def _detect_entity(sentence: str, *, hazards: list[str], metrics: list[str], gases: list[str]) -> str | None:
+    if gases:
+        return gases[0]
+    if metrics:
+        return metrics[0]
+    if hazards:
+        return hazards[0]
+    for token in ["GRCI", "RAI", "GRS", "PLC"]:
+        if token in sentence:
+            return token
+    return None
+
+
+def _detect_claim_role(claim_type: str, spatial_scope: str) -> str:
+    if claim_type == CLAIM_TYPE_METHOD_BOUNDARY:
+        return "method_boundary"
+    if spatial_scope == SPATIAL_SCOPE_FORWARD:
+        return "forward_attention"
+    if spatial_scope == SPATIAL_SCOPE_EXCAVATED:
+        return "daily_review"
+    if claim_type in {CLAIM_TYPE_OPERATION, CLAIM_TYPE_GAS}:
+        return "statistical_summary"
+    if claim_type == CLAIM_TYPE_RECOMMENDATION:
+        return "recommendation"
+    return "general_report_claim"
+
+
+def _detect_certainty(sentence: str, claim_type: str) -> str:
+    if claim_type == CLAIM_TYPE_METHOD_BOUNDARY:
+        return "policy_boundary"
+    if any(word in sentence for word in ["鎻愮ず", "鍏虫敞", "寤鸿", "闇€", "澶嶆牳"]):
+        return "cautious"
+    return "asserted"
+
+
+def _build_time_scope(sentence: str) -> dict[str, Any]:
+    if re.search(r"\d{4}-\d{2}-\d{2}", sentence):
+        return {"scope_type": "report_date"}
+    if "褰撴棩" in sentence or "鏈棩" in sentence:
+        return {"scope_type": "daily"}
+    if "鍓嶆柟" in sentence:
+        return {"scope_type": "forward_available_evidence"}
+    return {"scope_type": "unspecified"}
+
+
+def _build_spatial_scope_detail(
+    spatial_scope: str,
+    *,
+    range_dk: str | None,
+    relative_range: str | None,
+) -> dict[str, Any]:
+    return {
+        "scope_type": spatial_scope,
+        "range_dk": range_dk,
+        "relative_range": relative_range,
+    }
 
 
 def _normalize_dk(text: str) -> str:
@@ -158,18 +230,33 @@ def extract_report_claims(report_text: str) -> list[dict]:
                 warnings.append("当前掌子面表述中同时出现前方范围，存在空间语义混用。")
             if "低风险" in sentence or "无风险" in sentence:
                 warnings.append("句子包含低风险/无风险表述，建议做 grounded 复核。")
+            value, unit = _extract_value_unit(sentence)
+            claim_role = _detect_claim_role(claim_type, spatial_scope)
             claims.append(
                 {
                     "claim_id": f"claim_{index + 1:04d}",
                     "text": sentence,
+                    "claim_text": sentence,
                     "claim_type": claim_type,
+                    "entity": _detect_entity(sentence, hazards=hazards, metrics=metrics, gases=gases),
+                    "value": value,
+                    "unit": unit,
+                    "time_scope": _build_time_scope(sentence),
                     "range_dk": range_dk,
                     "relative_range": relative_range,
                     "hazards": hazards,
                     "metrics": metrics,
                     "gases": gases,
                     "spatial_scope": spatial_scope,
+                    "spatial_scope_detail": _build_spatial_scope_detail(
+                        spatial_scope,
+                        range_dk=range_dk,
+                        relative_range=relative_range,
+                    ),
+                    "claim_role": claim_role,
+                    "certainty": _detect_certainty(sentence, claim_type),
                     "sentence_index": index,
+                    "source_sentence_index": index,
                     "warnings": warnings,
                 }
             )

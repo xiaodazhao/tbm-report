@@ -21,6 +21,23 @@ ERROR_TYPES = [
     "E14_ALIGNED_SCOPE_AS_ACTUAL_ADVANCE",
 ]
 
+ERROR_TYPE_META = {
+    "E1_UNSUPPORTED_CLAIM": {"severity": "medium", "penalty": 6, "engineering_significant": True},
+    "E2_FORECAST_AS_FACT": {"severity": "high", "penalty": 12, "engineering_significant": True},
+    "E3_GRCI_AS_PROBABILITY": {"severity": "high", "penalty": 12, "engineering_significant": True},
+    "E4_FORWARD_AS_EXCAVATED_REVIEW": {"severity": "high", "penalty": 12, "engineering_significant": True},
+    "E5_BACKGROUND_AS_DAILY_RESPONSE": {"severity": "medium", "penalty": 8, "engineering_significant": True},
+    "E6_GAS_FIELD_MISUSE": {"severity": "high", "penalty": 12, "engineering_significant": True},
+    "E7_UNSUPPORTED_RECOMMENDATION": {"severity": "medium", "penalty": 8, "engineering_significant": True},
+    "E8_MISSING_REQUIRED_SECTION": {"severity": "low", "penalty": 3, "engineering_significant": False},
+    "E9_SOURCE_ROLE_CONFUSION": {"severity": "medium", "penalty": 8, "engineering_significant": True},
+    "E10_NUMERIC_VALUE_UNGROUNDED": {"severity": "medium", "penalty": 8, "engineering_significant": True},
+    "E11_HEADING_FALSE_POSITIVE": {"severity": "low", "penalty": 1, "engineering_significant": False},
+    "E12_METHOD_BOUNDARY_STATEMENT": {"severity": "low", "penalty": 0, "engineering_significant": False},
+    "E13_STOP_REASON_OVERINTERPRETATION": {"severity": "medium", "penalty": 8, "engineering_significant": True},
+    "E14_ALIGNED_SCOPE_AS_ACTUAL_ADVANCE": {"severity": "high", "penalty": 12, "engineering_significant": True},
+}
+
 SUPPORT_TYPES = [
     "statistical_support",
     "daily_review_support",
@@ -114,11 +131,22 @@ def annotate_quality_result(quality: dict[str, Any]) -> dict[str, Any]:
 
     violation_groups: dict[str, list[dict[str, Any]]] = {key: [] for key in ERROR_TYPES}
     counts = Counter({key: 0 for key in ERROR_TYPES})
+    severity_counts = Counter({"high": 0, "medium": 0, "low": 0})
+    weighted_error_penalty = 0
+    engineering_significant_error_count = 0
 
     for item in violations:
         error_type = classify_violation(item)
         item["error_type"] = error_type
+        meta = ERROR_TYPE_META.get(error_type, {"severity": "medium", "penalty": 6, "engineering_significant": True})
+        item.setdefault("taxonomy_severity", meta["severity"])
+        item.setdefault("taxonomy_penalty", meta["penalty"])
+        item.setdefault("engineering_significant", meta["engineering_significant"])
         counts[error_type] += 1
+        severity_counts[meta["severity"]] += 1
+        weighted_error_penalty += int(meta["penalty"])
+        if meta["engineering_significant"]:
+            engineering_significant_error_count += 1
         violation_groups[error_type].append(item)
 
     unsupported_by_claim_type: Counter[str] = Counter()
@@ -126,10 +154,20 @@ def annotate_quality_result(quality: dict[str, Any]) -> dict[str, Any]:
         error_type = classify_claim_result(item)
         if error_type:
             item["error_type"] = error_type
+            meta = ERROR_TYPE_META.get(error_type, {"severity": "medium", "penalty": 6, "engineering_significant": True})
+            item.setdefault("taxonomy_severity", meta["severity"])
+            item.setdefault("taxonomy_penalty", meta["penalty"])
+            item.setdefault("engineering_significant", meta["engineering_significant"])
             if _bool(item.get("grounded")) and error_type == "E12_METHOD_BOUNDARY_STATEMENT":
                 counts[error_type] += 1
         if not _bool(item.get("grounded")):
-            counts[error_type or "E1_UNSUPPORTED_CLAIM"] += 1
+            counted_type = error_type or "E1_UNSUPPORTED_CLAIM"
+            counts[counted_type] += 1
+            meta = ERROR_TYPE_META.get(counted_type, {"severity": "medium", "penalty": 6, "engineering_significant": True})
+            severity_counts[meta["severity"]] += 1
+            weighted_error_penalty += int(meta["penalty"])
+            if meta["engineering_significant"]:
+                engineering_significant_error_count += 1
             unsupported_by_claim_type[_text(item.get("claim_type")) or "unknown"] += 1
 
     quality["violations"] = violations
@@ -137,6 +175,9 @@ def annotate_quality_result(quality: dict[str, Any]) -> dict[str, Any]:
     quality["error_type_counts"] = dict(counts)
     quality["violations_by_error_type"] = violation_groups
     quality["unsupported_by_claim_type"] = dict(unsupported_by_claim_type)
+    quality["error_severity_distribution"] = dict(severity_counts)
+    quality["weighted_error_penalty"] = weighted_error_penalty
+    quality["engineering_significant_error_count"] = engineering_significant_error_count
     return quality
 
 
@@ -149,12 +190,16 @@ def build_trace_distributions(trace: dict[str, Any]) -> dict[str, Any]:
     source_role_counts = Counter({key: 0 for key in SOURCE_ROLES})
     source_type_counts: Counter[str] = Counter()
     unsupported_by_claim_type: Counter[str] = Counter()
+    support_status_counts: Counter[str] = Counter()
+    mismatch_type_counts: Counter[str] = Counter()
 
     for claim in claims:
         claim_type = _text(claim.get("claim_type")) or "unknown"
         claim_type_counts[claim_type] += 1
         if not _bool(claim.get("grounded")):
             unsupported_by_claim_type[claim_type] += 1
+        support_status_counts[_text(claim.get("support_status")) or "unknown"] += 1
+        mismatch_type_counts[_text(claim.get("mismatch_type")) or "unknown"] += 1
 
         support_type = normalize_support_type(claim.get("trace_support_type") or claim.get("support_type"))
         support_counts[support_type] += 1
@@ -173,6 +218,8 @@ def build_trace_distributions(trace: dict[str, Any]) -> dict[str, Any]:
         "source_role_distribution": dict(source_role_counts),
         "source_type_distribution": dict(source_type_counts),
         "unsupported_by_claim_type": dict(unsupported_by_claim_type),
+        "support_status_distribution": dict(support_status_counts),
+        "mismatch_type_distribution": dict(mismatch_type_counts),
     }
 
 
