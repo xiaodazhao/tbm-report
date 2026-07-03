@@ -1,0 +1,6 @@
+﻿mode,generation setting 中文解释,quality mean,grounding mean,unsupported total,numeric total,E14 total,boundary total,missing sections total
+M0_template_only,确定性模板基线,100.0,1.0,0,0,0,0,0
+M1_direct_llm,直接 LLM 生成,70.76,0.7295,1143,445,0,10,182
+M2_raw_evidence_llm,原始证据输入 LLM,72.96,0.7253,1221,334,0,23,182
+M3_twin_evidence_pack_llm,ConstructionStateCell + Evidence Pack,68.93,0.7592,1256,226,0,2,184
+M4_full_twin_governance_trace_boundary_reviser,完整治理链路：Twin + Evidence Pack + Planning + Boundary + Structured Trace + Reviser,94.18,0.9153,376,78,0,0,0

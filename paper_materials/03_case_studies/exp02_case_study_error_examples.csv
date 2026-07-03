@@ -1,0 +1,30 @@
+﻿error_type,claim_type,claim_text,mismatch_type,reason,date,mode
+E10_NUMERIC_VALUE_UNGROUNDED,unknown,**日期：** 2023年12月13日,overclaim,,2023-12-13,M1_direct_llm
+E10_NUMERIC_VALUE_UNGROUNDED,unknown,*   **掘进里程范围：** DK1014+390 ~ DK1014+410,scope_mismatch,,2023-12-13,M1_direct_llm
+E10_NUMERIC_VALUE_UNGROUNDED,unknown,*   数据采样间隔中位数为 20 秒，数据连续性较好。,overclaim,,2023-12-13,M1_direct_llm
+E10_NUMERIC_VALUE_UNGROUNDED,unknown,*   **均值：** 167.11,overclaim,,2023-12-13,M1_direct_llm
+E1_UNSUPPORTED_CLAIM,unknown,好的，作为一名 TBM 施工日报撰写助手，我将根据您提供的输入数据，生成一份符合要求的中文 TBM 施工日报。,overclaim,,2023-12-13,M2_raw_evidence_llm
+E10_NUMERIC_VALUE_UNGROUNDED,unknown,*   **掘进里程：** 起始里程 DK1014+390，结束里程 DK1014+410。,scope_mismatch,,2023-12-13,M2_raw_evidence_llm
+E12_METHOD_BOUNDARY_STATEMENT,method_boundary,当前 PLC 数据未区分计划停机与非计划停机，该指标仅作为施工响应关注信号，不直接归因于设备故障。,none,方法边界/生成约束说明，按 policy_support 支撑。,2023-12-13,M2_raw_evidence_llm
+E10_NUMERIC_VALUE_UNGROUNDED,unknown,*   **DK1014+390 ~ DK1014+400 区段：**,scope_mismatch,,2023-12-13,M2_raw_evidence_llm
+E1_UNSUPPORTED_CLAIM,unknown,好的，作为一名受 Evidence Pack 约束的 TBM 施工状态报告撰写助手，我将严格依据您提供的 Twin Evidence Pack 生成中文 TBM 施工日报。,overclaim,,2023-12-13,M3_twin_evidence_pack_llm
+E1_UNSUPPORTED_CLAIM,geology_cell,已掘区段（DK1014+390 ~ DK1014+410）的地质-施工响应耦合复核显示：DK1014+390 ~ DK1014+400 区段耦合关注度为中等（GRCI=0.51），主要地质关注为围岩极破碎、掉块、裂隙密集；,scope_mismatch,未找到与该 DK 区段对应的 key_cell。,2023-12-13,M3_twin_evidence_pack_llm
+E1_UNSUPPORTED_CLAIM,geology_cell,DK1014+400 ~ DK1014+410 区段耦合关注度为低（GRCI=0.45），主要地质关注为软硬不均、围岩极破碎。,scope_mismatch,未找到与该 DK 区段对应的 key_cell。,2023-12-13,M3_twin_evidence_pack_llm
+E10_NUMERIC_VALUE_UNGROUNDED,unknown,- **DK1014+390 ~ DK1014+400 区段**：地质-施工响应耦合关注度为中等。,scope_mismatch,,2023-12-13,M3_twin_evidence_pack_llm
+E10_NUMERIC_VALUE_UNGROUNDED,unknown,当日 PLC 数据聚类识别出 3 个施工状态：,overclaim,,2023-12-13,M4_full_twin_governance_trace_boundary_reviser
+E10_NUMERIC_VALUE_UNGROUNDED,unknown,**日期：** 2023年09月29日,overclaim,,2023-09-29,M1_direct_llm
+E10_NUMERIC_VALUE_UNGROUNDED,unknown,**报告范围：** DK1013+260 至 DK1013+400,scope_mismatch,,2023-09-29,M1_direct_llm
+E10_NUMERIC_VALUE_UNGROUNDED,unknown,*   **掘进里程范围：** DK1013+366 至 DK1013+367,scope_mismatch,,2023-09-29,M1_direct_llm
+E10_NUMERIC_VALUE_UNGROUNDED,unknown,*   **数据概况：** 共采集 317 条有效数据，采样间隔中位数为 20 秒。,overclaim,,2023-09-29,M1_direct_llm
+E1_UNSUPPORTED_CLAIM,unknown,好的，作为 TBM 施工日报撰写助手，我将根据您提供的输入数据，生成一份符合要求的中文 TBM 施工日报。,overclaim,,2023-09-29,M2_raw_evidence_llm
+E1_UNSUPPORTED_CLAIM,forward_segment,前方 0-30 米预报为Ⅴ级围岩，围岩极破碎、稳定性差，需重点关注。,overclaim,未找到对应的前方分段结构化证据。,2023-09-29,M2_raw_evidence_llm
+E10_NUMERIC_VALUE_UNGROUNDED,unknown,*   **掘进里程：** 起始里程 DK1013+366，结束里程 DK1013+367。,scope_mismatch,,2023-09-29,M2_raw_evidence_llm
+E12_METHOD_BOUNDARY_STATEMENT,method_boundary,该指标反映了施工过程中的非连续状态，但根据数据源，当前无法区分计划停机与非计划停机，因此该数值仅作为施工响应关注信号，不直接归因于设备故障。,none,方法边界/生成约束说明，按 policy_support 支撑。,2023-09-29,M2_raw_evidence_llm
+E1_UNSUPPORTED_CLAIM,unknown,好的，作为受 Evidence Pack 约束的 TBM 施工状态报告撰写助手，我将严格依据您提供的 Twin Evidence Pack 生成中文 TBM 施工日报。,overclaim,,2023-09-29,M3_twin_evidence_pack_llm
+E1_UNSUPPORTED_CLAIM,geology_cell,已掘区段（DK1013+360~DK1013+370）地质-施工响应耦合关注度（GRCI）为 0.58，属中等水平，表明在该区段掘进时，施工响应与地质预报揭示的围岩极破碎、稳定性较差等特征相符。,scope_mismatch,未找到与该 DK 区段对应的 key_cell。,2023-09-29,M3_twin_evidence_pack_llm
+E1_UNSUPPORTED_CLAIM,forward_segment,*   **前方范围：** DK1013+367 ~ DK1013+397（掌子面前方 0-30 米）,scope_mismatch,未找到对应的前方分段结构化证据。,2023-09-29,M3_twin_evidence_pack_llm
+E1_UNSUPPORTED_CLAIM,geology_cell,*   **0-10 米（DK1013+367~DK1013+377）：** 基于 HSP 预报，该段围岩等级为Ⅴ级，主要风险为围岩极破碎、稳定性较差、掉块、裂隙密集。,scope_mismatch,未找到与该 DK 区段对应的 key_cell。,2023-09-29,M3_twin_evidence_pack_llm
+E10_NUMERIC_VALUE_UNGROUNDED,unknown,本日报覆盖2023年9月29日TBM施工状态。,overclaim,,2023-09-29,M4_full_twin_governance_trace_boundary_reviser
+E10_NUMERIC_VALUE_UNGROUNDED,unknown,过渡时长占比约0.9%；,numeric_or_metric_mismatch,,2023-09-29,M4_full_twin_governance_trace_boundary_reviser
+E10_NUMERIC_VALUE_UNGROUNDED,unknown,最长连续掘进段出现在01:17:50至01:56:40。,overclaim,,2023-09-29,M4_full_twin_governance_trace_boundary_reviser
+E1_UNSUPPORTED_CLAIM,forward_segment,前方30米范围整体围岩条件较差，以Ⅴ级围岩为主，围岩极破碎、稳定性较差、掉块等地质迹象突出，建议在掘进过程中加强超前支护和初期支护参数控制，关注支护时效，对不确定证据进行人工复核。,overclaim,未找到对应的前方分段结构化证据。,2023-09-29,M4_full_twin_governance_trace_boundary_reviser

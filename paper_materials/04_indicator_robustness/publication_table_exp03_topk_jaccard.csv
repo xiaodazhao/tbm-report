@@ -1,0 +1,16 @@
+﻿variant,variant 中文解释,k,baseline_topk_count,variant_topk_count,overlap_count,jaccard
+V1_percentile_equal,V1 分位数标准化 + 均权,10,10,10,7,0.5384615384615384
+V1_percentile_equal,V1 分位数标准化 + 均权,20,20,20,16,0.6666666666666666
+V1_percentile_equal,V1 分位数标准化 + 均权,50,50,50,42,0.7241379310344828
+V2_percentile_interaction,V2 分位数标准化 + 交互耦合,10,10,10,6,0.4285714285714285
+V2_percentile_interaction,V2 分位数标准化 + 交互耦合,20,20,20,14,0.5384615384615384
+V2_percentile_interaction,V2 分位数标准化 + 交互耦合,50,50,50,35,0.5384615384615384
+V3_percentile_entropy,V3 分位数标准化 + 熵权,10,10,10,6,0.4285714285714285
+V3_percentile_entropy,V3 分位数标准化 + 熵权,20,20,20,14,0.5384615384615384
+V3_percentile_entropy,V3 分位数标准化 + 熵权,50,50,50,35,0.5384615384615384
+V4_percentile_critic,V4 分位数标准化 + CRITIC,10,10,10,6,0.4285714285714285
+V4_percentile_critic,V4 分位数标准化 + CRITIC,20,20,20,14,0.5384615384615384
+V4_percentile_critic,V4 分位数标准化 + CRITIC,50,50,50,37,0.5873015873015873
+V5_strict_min,V5 严格 min 耦合,10,10,10,4,0.25
+V5_strict_min,V5 严格 min 耦合,20,20,20,10,0.3333333333333333
+V5_strict_min,V5 严格 min 耦合,50,50,50,30,0.4285714285714285

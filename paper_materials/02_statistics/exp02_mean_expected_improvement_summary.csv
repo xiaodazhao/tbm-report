@@ -1,0 +1,4 @@
+﻿baseline_mode,grounding,numeric,quality,unsupported,baseline_short
+M1_direct_llm,0.1858,4.033,23.4176,8.4286,M1
+M2_raw_evidence_llm,0.1899,2.8132,21.2198,9.2857,M2
+M3_twin_evidence_pack_llm,0.156,1.6264,25.2418,9.6703,M3

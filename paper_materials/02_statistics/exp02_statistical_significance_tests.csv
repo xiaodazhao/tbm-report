@@ -1,0 +1,13 @@
+﻿comparison,baseline_mode,metric,direction_expected,n_pairs,baseline_mean,M4_mean,mean_expected_improvement,median_expected_improvement,improved_days,worse_days,tie_days,wilcoxon_statistic,p_value_one_sided,rank_biserial_effect_size,interpretation
+M4 vs M1,M1_direct_llm,quality,M4 higher,91,70.7582,94.1758,23.4176,26.0,86,5,0,4133.0,2.027508493380538e-16,0.9747,显著；效应量极强
+M4 vs M1,M1_direct_llm,grounding,M4 higher,91,0.7295,0.9153,0.1858,0.187,90,1,0,4185.0,6.160652405361009e-17,0.9995,显著；效应量极强
+M4 vs M1,M1_direct_llm,unsupported,M4 lower,91,12.5604,4.1319,8.4286,8.0,86,3,2,3993.5,1.7901383945161091e-16,0.9943,显著；效应量极强
+M4 vs M1,M1_direct_llm,numeric,M4 lower,91,4.8901,0.8571,4.033,4.0,87,1,3,3911.5,1.7187182628185735e-16,0.9977,显著；效应量极强
+M4 vs M2,M2_raw_evidence_llm,quality,M4 higher,91,72.956,94.1758,21.2198,26.0,85,6,0,4042.0,4.172946636785701e-15,0.9312,显著；效应量极强
+M4 vs M2,M2_raw_evidence_llm,grounding,M4 higher,91,0.7253,0.9153,0.1899,0.2011,90,1,0,4183.0,6.585224401331893e-17,0.9986,显著；效应量极强
+M4 vs M2,M2_raw_evidence_llm,unsupported,M4 lower,91,13.4176,4.1319,9.2857,9.0,84,4,3,3888.5,4.602466809039205e-16,0.986,显著；效应量极强
+M4 vs M2,M2_raw_evidence_llm,numeric,M4 lower,91,3.6703,0.8571,2.8132,2.0,72,9,10,3147.0,1.0415064649855784e-12,0.8952,显著；效应量极强
+M4 vs M3,M3_twin_evidence_pack_llm,quality,M4 higher,91,68.9341,94.1758,25.2418,26.0,85,6,0,4056.0,3.3026775708135813e-15,0.9379,显著；效应量极强
+M4 vs M3,M3_twin_evidence_pack_llm,grounding,M4 higher,91,0.7592,0.9153,0.156,0.1574,89,2,0,4153.0,1.770713866883853e-16,0.9842,显著；效应量极强
+M4 vs M3,M3_twin_evidence_pack_llm,unsupported,M4 lower,91,13.8022,4.1319,9.6703,10.0,89,2,0,4176.5,7.613804429155499e-17,0.9955,显著；效应量极强
+M4 vs M3,M3_twin_evidence_pack_llm,numeric,M4 lower,91,2.4835,0.8571,1.6264,1.0,72,9,10,2995.5,1.047578818834246e-10,0.804,显著；效应量极强

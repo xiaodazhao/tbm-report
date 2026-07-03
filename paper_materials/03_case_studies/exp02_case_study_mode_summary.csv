@@ -1,0 +1,9 @@
+﻿date,mode,quality_score,grounding_rate,unsupported_claim_count,numeric_error_count,E14_count,boundary_violation_count,missing_section_count,trace_coverage,support_status_distribution
+2023-12-13,M1_direct_llm,74,0.7091,16,6,0,0,2,0.8611,"{'supported': 29, 'unsupported': 5, 'partially_supported': 2}"
+2023-12-13,M2_raw_evidence_llm,74,0.7333,16,3,0,0,2,0.8478,"{'supported': 36, 'unsupported': 7, 'partially_supported': 3}"
+2023-12-13,M3_twin_evidence_pack_llm,74,0.7037,16,2,0,0,2,0.7727,"{'supported': 32, 'unsupported': 10, 'partially_supported': 2}"
+2023-12-13,M4_full_twin_governance_trace_boundary_reviser,100,0.9783,1,1,0,0,0,1.0,"{'supported': 37, 'partially_supported': 7}"
+2023-09-29,M1_direct_llm,64,0.725,11,4,0,0,2,0.8387,"{'unsupported': 5, 'supported': 22, 'partially_supported': 4}"
+2023-09-29,M2_raw_evidence_llm,64,0.5833,20,4,0,0,2,0.6667,"{'supported': 24, 'unsupported': 13, 'partially_supported': 2}"
+2023-09-29,M3_twin_evidence_pack_llm,69,0.74,13,1,0,0,2,0.7895,"{'supported': 28, 'unsupported': 8, 'partially_supported': 2}"
+2023-09-29,M4_full_twin_governance_trace_boundary_reviser,45,0.8864,5,3,0,0,0,0.9459,"{'supported': 29, 'partially_supported': 6, 'unsupported': 2}"

@@ -1,0 +1,6 @@
+﻿variant,variant 中文解释,common_cell_count,spearman_correlation
+V1_percentile_equal,V1 分位数标准化 + 均权,175,0.9316955506582016
+V2_percentile_interaction,V2 分位数标准化 + 交互耦合,175,0.8772340333823774
+V3_percentile_entropy,V3 分位数标准化 + 熵权,175,0.8786574996165467
+V4_percentile_critic,V4 分位数标准化 + CRITIC,175,0.8885954369657891
+V5_strict_min,V5 严格 min 耦合,175,0.8168456974038187
