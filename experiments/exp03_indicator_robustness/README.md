@@ -17,7 +17,7 @@ Exp03 用于评估当前 RAI / GRS / GRCI 启发式关注指标的排序稳健�
 默认读取：
 
 ```text
-experiments/exp01_twin_full_run/outputs/date_exports/*/construction_state_cells.json
+experiments/exp01_twin_full_run/outputs_fix02/date_exports/*/construction_state_cells.json
 ```
 
 这些文件是已导出的 ConstructionStateCell 结果，包含：
@@ -58,7 +58,7 @@ python experiments\exp03_indicator_robustness\run_exp03_indicator_robustness.py
 
 ```powershell
 python experiments\exp03_indicator_robustness\run_exp03_indicator_robustness.py `
-  --input-dir experiments\exp01_twin_full_run\outputs\date_exports `
+  --input-dir experiments\exp01_twin_full_run\outputs_fix02\date_exports `
   --out-dir experiments\exp03_indicator_robustness\outputs
 ```
 

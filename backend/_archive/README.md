@@ -7,7 +7,7 @@
 - 根目录 `_archive/`：旧前端、旧根目录文档、旧实验脚本和本地快照。
 - `backend/_archive/`：后端旧 route、旧 Agent、旧 services、旧 schema、旧地质链路、旧测试和旧调试脚本。
 
-更完整的当前项目结构说明见根目录 `PROJECT_STRUCTURE.md`。
+更完整的当前项目说明见根目录 `PROJECT_FULL_EXPLANATION.md`。
 
 当前主流程仍然是：
 

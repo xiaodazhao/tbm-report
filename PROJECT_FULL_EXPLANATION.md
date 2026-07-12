@@ -1473,7 +1473,7 @@ Exp03 不改主流程，只旁路复算 RAI / GRS / GRCI 变体。
 ```text
 先读本文档
 再读 README.md
-再读 paper_materials/00_project_overview/
+再读 paper_materials/README.md 和 paper_materials/06_full_paper_draft/full_paper_draft_v2_autcon_style.md
 ```
 
 如果要写论文：

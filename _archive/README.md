@@ -2,7 +2,7 @@
 
 本目录保存当前主线以外的旧版本材料。它们不参与当前后端主流程，也不应被当前后端 import。
 
-更完整的当前目录说明见根目录 [PROJECT_STRUCTURE.md](../PROJECT_STRUCTURE.md)。根目录 `_archive/` 主要保存旧前端、旧论文草稿、旧实验脚本和本地快照；后端旧模块统一保存在 `backend/_archive/`。
+更完整的当前项目说明见根目录 [PROJECT_FULL_EXPLANATION.md](../PROJECT_FULL_EXPLANATION.md)。根目录 `_archive/` 主要保存旧前端和本地历史快照；后端旧模块统一保存在 `backend/_archive/`。
 
 当前有效主线在：
 
@@ -24,8 +24,7 @@ routes.report
 ## 归档目录
 
 - `old_frontend/`：旧前端工程，仍依赖旧接口、Agent、旧报表页面，当前不作为主线维护。
-- `root_old_docs/`：旧论文草稿、旧技术路线、旧 Agent 说明和旧实验教程。
-- `root_old_experiments/`：旧论文实验脚本和配置，当前不作为主线实验入口。
+- `root_old_experiments/`：旧实验文档已清空，当前不作为主线实验入口。
 - `local_ignored_snapshots/`：本地代码快照或草稿文件，不建议提交到 GitHub。
 
 ## 使用约束

@@ -23,9 +23,9 @@ routes.report
 
 旧 Agent、旧 `routes/tbm.py`、旧 segment 级 GRCI、旧 history memory 和 `_archive/` 中的历史代码不参与当前主流程。
 
-完整文档入口见：[docs/README.md](docs/README.md)。
+完整文档入口见：[docs/README.md](docs/README.md)。更完整的项目全貌说明见根目录 [PROJECT_FULL_EXPLANATION.md](../PROJECT_FULL_EXPLANATION.md)。
 
-代码清理与归档边界见：[docs/cleanup_audit.md](docs/cleanup_audit.md)。其中需要特别注意：`analysis/` 当前仍是 PLC 响应分析依赖，不是可整体归档的旧目录。
+需要特别注意：`analysis/` 当前仍是 PLC 响应分析依赖，不是可整体归档的旧目录；`_archive/` 和 `backend/_archive/` 仅作历史参考，主流程禁止 import。
 
 ## 1. 当前目录说明
 
