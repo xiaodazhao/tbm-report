@@ -43,6 +43,7 @@ backend/geology_pretty.json
 backend/tempCodeRunnerFile.py
 
 # Local snapshots and scratch files
+nature-skills/
 all_python_code.txt
 backend/all_python_code.txt
 apply_geology_v2_main_integration_patch.py

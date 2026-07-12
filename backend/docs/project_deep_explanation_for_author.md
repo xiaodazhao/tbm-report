@@ -615,4 +615,3 @@ GRCI 权重敏感性，是看启发式权重变化时，关注排序是否稳定
 | `llm/report_quality_checker.py` | Quality 检查 |
 | `llm/report_trace_builder.py` | Trace 构建 |
 | `geology_text/` | P3 旁路候选证据模块 |
-

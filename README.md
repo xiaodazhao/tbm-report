@@ -24,6 +24,7 @@ PLC 施工响应证据治理
 | 前端工作台 | [`frontend/`](frontend/) |
 | 实验目录 | [`experiments/`](experiments/) |
 | 论文材料 | [`paper_materials/`](paper_materials/) |
+| 项目全貌说明书 | [`PROJECT_FULL_EXPLANATION.md`](PROJECT_FULL_EXPLANATION.md) |
 | 项目结构说明 | [`PROJECT_STRUCTURE.md`](PROJECT_STRUCTURE.md) |
 | 后端文档入口 | [`backend/docs/README.md`](backend/docs/README.md) |
 | 本轮瘦身归档记录 | [`docs/project_slimming_archive_2026-07-06.md`](docs/project_slimming_archive_2026-07-06.md) |
@@ -227,4 +228,3 @@ docs/project_slimming_archive_2026-07-06.md
 4. 典型案例分析；
 5. 人工复核材料准备；
 6. 参考文献补齐。
-
